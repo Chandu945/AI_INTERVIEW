@@ -29,6 +29,8 @@ export default function Home() {
   const [error, setError] = useState('');
   const [failedDraft, setFailedDraft] = useState<string | null>(null);
   const [language, setLanguage] = useState('en-IN');
+  // Hands-free: send the question as soon as the mic stops after a pause. Off by default, so you review first.
+  const [autoSend, setAutoSend] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
   const [fontSize, setFontSize] = useState(20);
   const [sessionInfoOpen, setSessionInfoOpen] = useState(false);
@@ -39,7 +41,11 @@ export default function Home() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
-  const speech = useSpeechRecognition({ language, appendWords, busyRef, setError });
+  const speech = useSpeechRecognition({
+    language, appendWords, busyRef, setError,
+    // Runs after a later render, by which time sendMessage (defined below) exists.
+    onSilenceStop: () => { if (autoSend) void sendMessage(); },
+  });
   const { haltRecognition, startListening, stopListening, updateInterim, isListening } = speech;
   const { bodyRef, bottomRef, onPanelScroll, followNewest } = useStickToBottom(messages, busy);
 
@@ -248,6 +254,7 @@ export default function Home() {
         <div className={`workspace ${focusMode ? 'focus-workspace' : ''}`}>
           <Composer draft={draft} onDraftChange={updateDraft} textareaRef={textareaRef} speech={speech} busy={busy}
             answerMode={answerMode} onAnswerModeChange={changeAnswerMode} language={language} onLanguageChange={setLanguage}
+            autoSend={autoSend} onAutoSendChange={setAutoSend}
             error={error} failedDraft={failedDraft} onClear={clearDraft} onSend={() => void sendMessage()} />
           <ConversationPanel messages={messages} busy={busy} focusMode={focusMode} onToggleFocus={() => setFocusMode(on => !on)}
             fontSize={fontSize} onFontSizeChange={setFontSize} copiedKey={copiedKey} onCopy={copyMessage}

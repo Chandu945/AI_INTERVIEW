@@ -104,6 +104,7 @@ kbd{font-size:11px;border:1px solid #52617b;border-radius:4px;padding:1px 5px}
 .answer-mode-button:disabled{opacity:.55;cursor:not-allowed}
 .options-row{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}
 .options-row select{background:#1b2b43;color:var(--text);border:1px solid #385070;border-radius:9px;padding:9px;max-width:55%}
+.options-row label:has(input:disabled){opacity:.55}
 .tips{font-size:12px;line-height:1.7;color:var(--muted)}
 .error-banner{padding:12px;background:#5d263544;color:#ffb7c6;border:1px solid #a64a65;border-radius:10px;font-size:12px;overflow-wrap:anywhere}
 

@@ -10,7 +10,7 @@ for (const [name, size] of Object.entries(SIZES)) {
   test(`main screens look as expected (${name})`, async ({ page }) => {
     await page.setViewportSize(size);
     await openApp(page);
-    // Cover the "last updated" dates, which change from day to day.
+    // Whole-page shots, so they don't depend on scroll position. Cover the "last updated" dates, which change from day to day.
     const mask = [page.locator('.history-card-open small')];
 
     await expect(page).toHaveScreenshot(`${name}-new-interview.png`, { fullPage: true, mask });
@@ -20,9 +20,9 @@ for (const [name, size] of Object.entries(SIZES)) {
     await expect(page).toHaveScreenshot(`${name}-history.png`, { fullPage: true, mask });
 
     await openInterview(page, 'Markdown showcase');
-    await expect(page).toHaveScreenshot(`${name}-interview.png`, { mask });
+    await expect(page).toHaveScreenshot(`${name}-interview.png`, { fullPage: true, mask });
 
     await page.getByRole('button', { name: 'Focus Mode' }).click();
-    await expect(page).toHaveScreenshot(`${name}-focus-mode.png`, { mask });
+    await expect(page).toHaveScreenshot(`${name}-focus-mode.png`, { fullPage: true, mask });
   });
 }

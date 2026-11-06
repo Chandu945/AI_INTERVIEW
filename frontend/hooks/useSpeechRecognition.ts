@@ -22,6 +22,8 @@ type Options = {
   /** The mic won't start while an answer is being generated. */
   busyRef: { current: boolean };
   setError: (message: string) => void;
+  /** Called after the mic stops by itself because of a pause (the "stop after silence" option). */
+  onSilenceStop?: () => void;
 };
 
 export type Speech = ReturnType<typeof useSpeechRecognition>;
@@ -32,7 +34,7 @@ export type Speech = ReturnType<typeof useSpeechRecognition>;
  * its own now and then, so it is reopened until stopListening() is called. Every start gets a
  * new session number, and callbacks from an older session are ignored.
  */
-export function useSpeechRecognition({ language, appendWords, busyRef, setError }: Options) {
+export function useSpeechRecognition({ language, appendWords, busyRef, setError, onSilenceStop }: Options) {
   const [listening, setListening] = useState(false);
   const [supported, setSupported] = useState(true);
   const [status, setStatus] = useState('Ready to type or speak');
@@ -54,6 +56,9 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError 
   const restartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopWaitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopFinalizeRef = useRef<(() => void) | null>(null);
+  // Always the latest callback, since the silence timer outlives the render that started it.
+  const onSilenceStopRef = useRef(onSilenceStop);
+  useEffect(() => { onSilenceStopRef.current = onSilenceStop; });
 
   const updateInterim = useCallback((value: string) => {
     interimRef.current = value;
@@ -101,7 +106,10 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError 
   // Stops the mic once no new words have arrived for 2.2s (the "stop after silence" option).
   const scheduleSilenceStop = useCallback(() => {
     if (silenceRef.current) clearTimeout(silenceRef.current);
-    silenceRef.current = setTimeout(() => { if (shouldListenRef.current) void stopListeningRef.current?.(); }, 2200);
+    silenceRef.current = setTimeout(() => {
+      const stop = stopListeningRef.current;
+      if (shouldListenRef.current && stop) void stop().then(() => onSilenceStopRef.current?.());
+    }, 2200);
   }, []);
 
   const startListening = useCallback(() => {

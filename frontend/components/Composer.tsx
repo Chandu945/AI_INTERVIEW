@@ -20,6 +20,8 @@ type Props = {
   onAnswerModeChange: (mode: AnswerMode) => void;
   language: string;
   onLanguageChange: (code: string) => void;
+  autoSend: boolean;
+  onAutoSendChange: (on: boolean) => void;
   error: string;
   failedDraft: string | null;
   onClear: () => void;
@@ -29,7 +31,7 @@ type Props = {
 /** The left panel: the question box, Speak / Clear / Send, and the answer-length and voice settings. */
 export function Composer({
   draft, onDraftChange, textareaRef, speech, busy, answerMode, onAnswerModeChange,
-  language, onLanguageChange, error, failedDraft, onClear, onSend,
+  language, onLanguageChange, autoSend, onAutoSendChange, error, failedDraft, onClear, onSend,
 }: Props) {
   const { listening, status, elapsed, interim, supported, autoPause, changeAutoPause, startListening, stopListening } = speech;
   const time = `${Math.floor(elapsed / 60).toString().padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}`;
@@ -63,7 +65,8 @@ export function Composer({
           ))}
         </div>
       </div>
-      <div className="options-row"><label><input type="checkbox" checked={autoPause} onChange={e => changeAutoPause(e.target.checked)}/> Stop listening after 2.2s of silence (review before sending)</label></div>
+      <div className="options-row"><label><input type="checkbox" checked={autoPause} onChange={e => changeAutoPause(e.target.checked)}/> Stop listening after 2.2s of silence</label></div>
+      <div className="options-row"><label><input type="checkbox" checked={autoSend} disabled={!autoPause} onChange={e => onAutoSendChange(e.target.checked)}/> …and send the question automatically (no review)</label></div>
       <div className="options-row">
         <label htmlFor="language">Recognition language</label>
         <select id="language" value={language} onChange={e => onLanguageChange(e.target.value)} disabled={listening}>{LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}</select>
