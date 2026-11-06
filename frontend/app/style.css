@@ -446,26 +446,53 @@ kbd {
 .pulse {
   animation: pulse 1.2s infinite;
 }
+/* One line, so a long message can't push the box and its buttons down. */
+.status-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .duration {
   margin-left: auto;
   color: #e3b7c3;
   font-variant-numeric: tabular-nums;
 }
+/* Words still being recognized: always two lines tall, so nothing below moves as they come and
+   go. The newest words stay in view at the bottom; older ones slide off the top. */
 .interim {
-  padding: 12px 16px;
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 8px 16px;
   background: #152b43;
   border-top: 1px dashed #4b688c;
   color: #b3d5ff;
   font-size: 14px;
   line-height: 1.5;
 }
+.interim.idle {
+  background: transparent;
+  color: #5f7391;
+}
 .interim-label {
+  flex-shrink: 0;
   font-size: 10px;
+  line-height: 21px;
   text-transform: uppercase;
   color: #79e0ce;
   letter-spacing: 1px;
-  margin-right: 8px;
   font-weight: 700;
+}
+.interim-words {
+  flex: 1;
+  min-width: 0;
+  height: 3em;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
 }
 .over-limit {
   color: #ffb7c6;
@@ -492,6 +519,12 @@ kbd {
 .mic-btn.recording {
   background: #6e253d;
   border-color: #c75472;
+}
+/* The emoji icons are taller than "■"; this keeps the button one height, so Clear and Send
+   don't shift when listening starts or stops. */
+.mic-icon {
+  display: inline-block;
+  line-height: 1;
 }
 .controls .mic-btn {
   grid-column: 1/-1;
@@ -930,7 +963,7 @@ kbd {
   }
   .focus-workspace textarea {
     flex: none;
-    height: 120px;
+    height: 90px;
     min-height: 0;
   }
   .focus-workspace .controls {

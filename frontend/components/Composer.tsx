@@ -98,7 +98,9 @@ export function Composer({
       <div className={`editor-wrap ${listening ? 'active' : ''}`}>
         <div className="editor-top">
           <span className={`status-dot ${listening ? 'pulse' : ''}`} />
-          <span>{shownStatus}</span>
+          <span className="status-text" title={shownStatus}>
+            {shownStatus}
+          </span>
           {listening && <span className="duration">{time}</span>}
         </div>
         <textarea
@@ -112,11 +114,15 @@ export function Composer({
           value={draft}
           onChange={e => onDraftChange(e.target.value)}
           spellCheck
-          rows={10}
+          rows={8}
         />
-        {interim && (
-          <div className="interim" aria-live="off">
-            <span className="interim-label">Recognizing</span> {interim}
+        {/* Always shown at the same height, so the buttons below never move as words come and go. */}
+        {supported && (
+          <div className={`interim ${interim ? '' : 'idle'}`} aria-live="off">
+            {interim && <span className="interim-label">Recognizing</span>}
+            <span className="interim-words">
+              <span>{interim || 'Live words show here'}</span>
+            </span>
           </div>
         )}
         <div className="editor-foot">
@@ -133,13 +139,16 @@ export function Composer({
           disabled={!supported || busy}
           aria-pressed={listening}
         >
-          <span aria-hidden="true">{listening ? '■' : fromTab ? '🔊' : '🎙'}</span>{' '}
+          <span className="mic-icon" aria-hidden="true">
+            {listening ? '■' : fromTab ? '🔊' : '🎙'}
+          </span>{' '}
           {listening ? 'Stop listening' : fromTab ? 'Listen to tab' : 'Start speaking'}
         </button>
         <button className="btn subtle" onClick={onClear} disabled={busy} title="Clear draft, keep listening">
           Clear
         </button>
-        <button className="btn primary" onClick={onSend} disabled={busy || (!draft.trim() && !interim.trim())}>
+        {/* Pressable while listening, even before any words: sending waits for the last of them. */}
+        <button className="btn primary" onClick={onSend} disabled={busy || (!listening && !draft.trim())}>
           {' '}
           {busy ? 'Sending…' : 'Send ↗'}
         </button>

@@ -58,6 +58,45 @@ test('with hands-free sending on, a pause sends the question', async ({ page }) 
   expect(await chatRequests(page)).toBe(1);
 });
 
+test('the buttons stay put while live words come and go', async ({ page }) => {
+  // Narrow enough for the longer status messages to need cutting short.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const strip = page.locator('.interim');
+  // Where Start/Stop and Send are on the page, and whether the newest live words are in view.
+  const layout = () =>
+    page.evaluate(() => {
+      const top = (selector: string) =>
+        Math.round(document.querySelector(selector)!.getBoundingClientRect().top + scrollY);
+      return { mic: top('.mic-btn'), send: top('.btn.primary') };
+    });
+  const newestWordsShown = () =>
+    page.evaluate(() => {
+      const box = document.querySelector('.interim-words')!.getBoundingClientRect();
+      const words = document.querySelector('.interim-words > span')!.getBoundingClientRect();
+      return Math.abs(words.bottom - box.bottom) <= 1;
+    });
+  await expect(strip).toContainText('Live words show here');
+  const before = await layout();
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await expect(page.getByRole('button', { name: /Send/ })).toBeEnabled(); // even before any words
+  await page.evaluate(() => window.__sayInterim('so like this'));
+  expect(await layout()).toEqual(before);
+  await page.evaluate(() =>
+    window.__sayInterim(
+      'so like this with those I mean on the other hand when you use the rest operator in a function you collect the remaining arguments into an array and loop over them',
+    ),
+  );
+  expect(await layout()).toEqual(before);
+  expect(await newestWordsShown()).toBe(true);
+  await page.evaluate(() => window.__say('so I come with a name'));
+  expect(await layout()).toEqual(before);
+  await page.waitForTimeout(500); // let the recorder capture some audio
+  await mic.click(); // the test backend has no Gemini key, so this ends with a long message
+  await expect(page.locator('.editor-top')).toContainText("Couldn't improve the transcript");
+  expect(await layout()).toEqual(before);
+});
+
 // Polishing: the recording is transcribed again by Gemini when dictation stops.
 
 test("when you stop, Gemini's transcript replaces the live words", async ({ page }) => {
