@@ -1,4 +1,4 @@
-import type { RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 'react';
 import type { Speech } from '../hooks/useSpeechRecognition';
 import type { ImproveStatus } from '../hooks/useTranscriptImprover';
 import { MAX_QUESTION_CHARS } from '../lib/api';
@@ -82,6 +82,53 @@ export function Composer({
   const { listening, status, elapsed, interim, supported, autoPause, changeAutoPause } = speech;
   const shownStatus = !listening && improveStatus !== 'idle' ? IMPROVE_MESSAGES[improveStatus] : status;
   const fromTab = source === 'tab';
+  // Words still being recognized are shown in gray right after the text, on a see-through copy of
+  // the box's text laid over it: the same size, the same wrapping, and scrolled with it.
+  const ghostRef = useRef<HTMLDivElement | null>(null);
+  const fitGhost = useCallback(() => {
+    const box = textareaRef.current;
+    const ghost = ghostRef.current;
+    if (!box) return;
+    if (!ghost) {
+      box.style.paddingBottom = '';
+      return;
+    }
+    ghost.style.width = `${box.clientWidth}px`;
+    ghost.style.height = `${box.clientHeight}px`;
+    // Room under the text for gray words that run past it, so the box scrolls just as far as the
+    // copy and can bring them into view: grown or shrunk, never removed first, which would snap
+    // the box's scroll position back.
+    const base = parseFloat(getComputedStyle(box).paddingTop);
+    let padding = parseFloat(box.style.paddingBottom) || base;
+    for (let i = 0; i < 3; i++) {
+      const missing = ghost.scrollHeight - box.scrollHeight;
+      if (missing === 0 || (missing < 0 && padding <= base)) break;
+      padding = Math.max(base, padding + missing);
+      box.style.paddingBottom = padding > base ? `${padding}px` : '';
+    }
+  }, [textareaRef]);
+  const scrollGhost = useCallback(() => {
+    if (ghostRef.current && textareaRef.current) ghostRef.current.scrollTop = textareaRef.current.scrollTop;
+  }, [textareaRef]);
+  useEffect(() => {
+    const box = textareaRef.current;
+    if (!box) return;
+    const observer = new ResizeObserver(() => {
+      fitGhost();
+      scrollGhost();
+    });
+    observer.observe(box, { box: 'border-box' }); // not its padding, which fitGhost changes
+    return () => observer.disconnect();
+  }, [fitGhost, scrollGhost, textareaRef]);
+  // While listening, the newest words stay in view, unless you're editing elsewhere in the text.
+  useLayoutEffect(() => {
+    const box = textareaRef.current;
+    if (!box) return;
+    fitGhost();
+    if (listening && (document.activeElement !== box || box.selectionStart === box.value.length))
+      box.scrollTop = box.scrollHeight;
+    scrollGhost();
+  }, [draft, interim, listening, fitGhost, scrollGhost, textareaRef]);
   const time = `${Math.floor(elapsed / 60)
     .toString()
     .padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}`;
@@ -103,28 +150,28 @@ export function Composer({
           </span>
           {listening && <span className="duration">{time}</span>}
         </div>
-        <textarea
-          ref={textareaRef}
-          aria-label="Your message"
-          placeholder={
-            fromTab
-              ? 'Type a question, or press Listen to tab to write down what a tab is saying...'
-              : 'Type a question, or tap the microphone to speak...'
-          }
-          value={draft}
-          onChange={e => onDraftChange(e.target.value)}
-          spellCheck
-          rows={8}
-        />
-        {/* Always shown at the same height, so the buttons below never move as words come and go. */}
-        {supported && (
-          <div className={`interim ${interim ? '' : 'idle'}`} aria-live="off">
-            {interim && <span className="interim-label">Recognizing</span>}
-            <span className="interim-words">
-              <span>{interim || 'Live words show here'}</span>
-            </span>
-          </div>
-        )}
+        <div className="editor-text">
+          <textarea
+            ref={textareaRef}
+            aria-label="Your message"
+            placeholder={
+              fromTab
+                ? 'Type a question, or press Listen to tab to write down what a tab is saying...'
+                : 'Type a question, or tap the microphone to speak...'
+            }
+            value={draft}
+            onChange={e => onDraftChange(e.target.value)}
+            onScroll={scrollGhost}
+            spellCheck
+            rows={10}
+          />
+          {interim && (
+            <div className="ghost-text" ref={ghostRef} aria-hidden="true">
+              {draft}
+              <span className="ghost-words">{(draft && !/\s$/.test(draft) ? ' ' : '') + interim}</span>
+            </div>
+          )}
+        </div>
         <div className="editor-foot">
           <span className={draft.length > MAX_QUESTION_CHARS ? 'over-limit' : undefined}>
             {draft.length.toLocaleString()} / {MAX_QUESTION_CHARS.toLocaleString()} characters
@@ -229,7 +276,7 @@ export function Composer({
           ? 'Live speech recognition is unavailable in this browser. Try Chrome.'
           : fromTab
             ? 'Listen to tab: pick the tab in Chrome\'s list and keep "Also share tab audio" on. You still hear the tab as usual.'
-            : 'Live words appear below the editable text until finalized. You can edit the text at any time.'}
+            : 'Words appear in the box as they are heard, in gray until they are final. You can edit the text at any time.'}
         <br />
         Shortcut: <kbd>⌘ / Ctrl</kbd> + <kbd>Enter</kbd> to send.
       </div>

@@ -459,40 +459,35 @@ kbd {
   color: #e3b7c3;
   font-variant-numeric: tabular-nums;
 }
-/* Words still being recognized: always two lines tall, so nothing below moves as they come and
-   go. The newest words stay in view at the bottom; older ones slide off the top. */
-.interim {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 8px 16px;
-  background: #152b43;
-  border-top: 1px dashed #4b688c;
-  color: #b3d5ff;
-  font-size: 14px;
-  line-height: 1.5;
-}
-.interim.idle {
-  background: transparent;
-  color: #5f7391;
-}
-.interim-label {
-  flex-shrink: 0;
-  font-size: 10px;
-  line-height: 21px;
-  text-transform: uppercase;
-  color: #79e0ce;
-  letter-spacing: 1px;
-  font-weight: 700;
-}
-.interim-words {
-  flex: 1;
-  min-width: 0;
-  height: 3em;
-  overflow: hidden;
+/* The text box, and words still being recognized drawn in gray after its text: a see-through copy
+   of the text in the same font and wrapping lies over the box (sized and scrolled with it by the
+   Composer). The box has a fixed height, so the room it makes under the text for gray words that
+   run past it never pushes the buttons down. */
+.editor-text {
+  position: relative;
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
+  flex: 1;
+}
+.editor-text textarea {
+  flex: 1 1 auto; /* from its own height, not its content's */
+  height: calc(10 * 1.7 * 16px + 36px);
+}
+.ghost-text {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  pointer-events: none;
+  padding: 18px;
+  font-size: 16px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  color: transparent;
+}
+.ghost-words {
+  color: #8093ad;
 }
 .over-limit {
   color: #ffb7c6;
@@ -961,9 +956,9 @@ kbd {
   .focus-workspace .editor-wrap {
     min-height: 0;
   }
-  .focus-workspace textarea {
+  .focus-workspace .editor-text textarea {
     flex: none;
-    height: 90px;
+    height: 120px;
     min-height: 0;
   }
   .focus-workspace .controls {
