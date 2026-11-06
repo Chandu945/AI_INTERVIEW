@@ -1,44 +1,91 @@
-# AI Interact V4 (development build)
+# AI Interact
 
-Next.js frontend + FastAPI backend + Gemini. Separate **New Interview**, **Interview**, and **History** views. No bookmark feature.
+Interview practice with Gemini: type or say an interview question and get an answer you could
+give out loud. Next.js frontend, FastAPI backend, Google Gemini.
 
-## Setup on macOS
+- **New Interview:** target role, interview type (Technical, HR or Mixed), answer length, and an
+  optional resume (PDF or DOCX) and job description for answers to draw on.
+- **Interview:** type or dictate questions (Chrome's speech recognition) and watch the answers
+  stream in. Optional auto-stop after a 2.2-second pause, with optional hands-free sending.
+  Focus Mode, font sizes and copy buttons.
+- **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
+
+## First-time setup (macOS)
 
 Backend:
+
 ```bash
 cd backend
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-cp .env.example .env
-# Edit .env to set GEMINI_API_KEY and a valid GEMINI_MODEL
-uvicorn main:app --reload --port 8000
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env   # then edit .env: set GEMINI_API_KEY and GEMINI_MODEL
 ```
 
-Frontend (second terminal):
+Frontend:
+
 ```bash
 cd frontend
-cp .env.local.example .env.local
 npm install
-npm run dev
 ```
 
-Visit http://localhost:3000. Set `NEXT_PUBLIC_API_URL=http://localhost:8000` if necessary.
+## Running it
 
-## V4 changes
+From the project folder:
 
-- Streaming Gemini answers; recent-message context and relevant resume extraction to reduce unnecessary prompt size.
-- More natural candidate-style answers and question-type-specific formatting for code, architecture, and comparisons.
-- Better follow-up context; the last 10 messages are sent to Gemini.
-- Optional job description pasted during new interview setup; resume upload remains optional and session-specific.
-- Optional 2.2-second voice-pause stop (does **not** automatically send; review transcript first); technical transcription vocabulary guidance.
-- Focus Mode, larger font options, retry button after failed streaming, microphone permission errors.
-- Local SQLite session history, session rename/delete, and optional `INTERACT_ACCESS_TOKEN` backend gate.
+- `./start.sh`: for everyday use. Builds the optimized frontend, then serves it at
+  http://localhost:3000 with the backend on port 8000.
+- `./dev.sh`: while changing code. Both servers reload when you save (the frontend uses Turbopack).
+
+Ctrl+C stops both servers. The frontend calls the backend at http://localhost:8000; to change
+that, set `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (see `frontend/.env.local.example`).
+
+## Settings (`backend/.env`)
+
+| Setting | What it does |
+| --- | --- |
+| `GEMINI_API_KEY` | Your Gemini API key (required). |
+| `GEMINI_MODEL` | The model that writes the answers. |
+| `GEMINI_THINKING_LEVEL` | Optional, for Gemini 3 models: `minimal`, `low`, `medium` or `high`. Less thinking is faster; leave unset for the model's default. |
+| `GEMINI_THINKING_BUDGET` | Optional, the same for older models as a token budget (`0` turns thinking off). |
+| `FRONTEND_ORIGIN` | Where the frontend runs, for CORS (default `http://localhost:3000`). |
+| `INTERACT_ACCESS_TOKEN` | Optional: require an `X-Interact-Token` header on API calls. The bundled frontend doesn't send one. |
+| `INTERACT_DB` | Optional: a database file to use instead of `backend/chat.db`. |
+
+## Tests and code checks
+
+Backend, from `backend/` (install the dev tools once with `.venv/bin/python -m pip install -r requirements-dev.txt`):
+
+- `.venv/bin/python -m pytest`: API tests, using a fake Gemini and a throwaway database.
+- `.venv/bin/ruff check .` and `.venv/bin/ruff format .`: lint and format.
+
+Frontend, from `frontend/`:
+
+- `npm test`: browser tests with Playwright, including screenshot comparisons of the main
+  screens. Needs Google Chrome. The tests start their own servers on ports 3100 and 8100 with a
+  throwaway database, so your interviews are never touched. After an intended visual change,
+  refresh the saved screenshots with `npm run test:update-screenshots`.
+- `npm run lint`, `npm run format` and `npm run typecheck`.
+
+## Project layout
+
+- `backend/main.py`: the API. Interviews, resume parsing, prompts, and answers streamed from Gemini.
+- `frontend/app/page.tsx`: the app's state and the actions that connect the screens.
+- `frontend/components/`: the screens and panels (New Interview, History, the question box,
+  the answers).
+- `frontend/hooks/`: speech recognition, the question draft and answer scrolling.
+- `frontend/lib/`: the API client and shared types. Styles are in `frontend/app/style.css`.
 
 ## Security and limitations
 
-**Single-user local development only by default.** SQLite history and extracted resume text are not encrypted at rest; there is no account login or per-user authorization. Do not expose the backend publicly without authentication, TLS, access controls, and secure storage. The optional `INTERACT_ACCESS_TOKEN` requires a client that sends `X-Interact-Token`; the bundled browser UI does not implement token login. Do not place secrets in `NEXT_PUBLIC_` environment variables.
+**Single-user local use only by default.** SQLite history and extracted resume text are not
+encrypted at rest, and there is no account login or per-user authorization. Do not expose the
+backend publicly without authentication, TLS, access controls and secure storage. The optional
+`INTERACT_ACCESS_TOKEN` needs a client that sends `X-Interact-Token`; the bundled frontend does
+not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
 
-The voice pause detector uses the browser's SpeechRecognition events, so its accuracy and browser availability vary. Gemini model names in `.env.example` may need updating to models available to your API key. The implementation has not been validated end-to-end against a live Gemini API.
+The voice pause detection relies on the browser's SpeechRecognition events, so its accuracy and
+availability vary by browser. Model names in `.env.example` may need updating to models
+available to your API key.
 
-Before updating an existing installation, back up `backend/chat.db`. Existing database columns are migrated at startup.
+Before updating an existing installation, back up `backend/chat.db`. Database columns are
+migrated at startup.
