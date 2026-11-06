@@ -17,9 +17,10 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   if Gemini is unavailable or its text doesn't match what was heard, the live words stay. Turn it
   off with "Improve the transcript with Gemini when you stop".
 - **Quick answers:** Gemini usually starts answering in 1 to 3 seconds, but now and then takes
-  10 to 30. If an answer (or a transcription) hasn't started after about twice the usual time,
-  the backend sends the request again and uses whichever replies first. The connection to Gemini
-  stays open between questions, so each question doesn't wait for a new one.
+  10 to 30. If an answer hasn't started within a few seconds (twice as long as a quick reply,
+  at least 3 seconds), the backend sends the request again and uses whichever replies first; the
+  same goes for transcriptions. The connection to Gemini stays open between questions, so each
+  question doesn't wait for a new one.
 - **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
 
 ## First-time setup (macOS)

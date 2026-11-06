@@ -384,11 +384,15 @@ def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
     assert (fake.calls, fake.cancelled) == (2, 1)
 
 
-def test_the_retry_waits_twice_the_typical_time():
-    hedge = main.Hedge("test", minimum=3.0)
-    assert hedge.delay() == 3.0
+def test_the_retry_waits_twice_a_quick_reply():
+    hedge = main.Hedge("test", minimum=3.0, maximum=10.0)
+    assert hedge.delay() == 3.0  # no replies yet
     hedge.recent.extend([1.0, 1.2, 1.4])
-    assert hedge.delay() == 3.0  # twice the typical 1.2 s is under the minimum
+    assert hedge.delay() == 3.0  # twice 1 s is under the minimum
+    hedge.recent.extend([5.0, 6.0, 7.0])
+    assert hedge.delay() == 3.0  # a slow spell doesn't make it wait longer
     hedge.recent.clear()
-    hedge.recent.extend([2.0, 2.5, 30.0])
-    assert hedge.delay() == 5.0  # twice the typical (median) 2.5 s; one very slow reply barely counts
+    hedge.recent.extend([4.0, 4.5, 5.0, 6.0])
+    assert hedge.delay() == 9.0  # a model that always thinks a while: twice 4.5 s
+    hedge.recent.extend([20.0] * 8)
+    assert hedge.delay() == 10.0  # never more than the maximum

@@ -6,7 +6,6 @@ import os
 import re
 import secrets
 import sqlite3
-import statistics
 import time
 import uuid
 from collections import deque
@@ -70,20 +69,25 @@ class Hedge:
     """
     Sends a request again when Gemini is slow. Gemini usually replies within 1-3 seconds, but now
     and then takes 10-30 seconds or fails, and a second try is then usually quick. If an attempt
-    hasn't succeeded after twice the recent typical time (and at least `minimum` seconds), or it
-    fails with a server or network error, a second attempt starts and whichever succeeds first is
-    used; the other is cancelled. Errors caused by the request itself, like the per-minute rate
-    limit, aren't retried.
+    hasn't succeeded after twice the time of a quick recent reply (between `minimum` and `maximum`
+    seconds), or it fails with a server or network error, a second attempt starts and whichever
+    succeeds first is used; the other is cancelled. Errors caused by the request itself, like the
+    per-minute rate limit, aren't retried.
     """
 
-    def __init__(self, name: str, minimum: float):
+    def __init__(self, name: str, minimum: float, maximum: float):
         self.name = name
         self.minimum = minimum
+        self.maximum = maximum
         self.recent: deque[float] = deque(maxlen=20)  # how long recent successful attempts took
 
     def delay(self) -> float:
-        typical = statistics.median(self.recent) if self.recent else 0.0
-        return max(self.minimum, 2 * typical)
+        if not self.recent:
+            return self.minimum
+        # A quick reply: the fastest quarter of recent ones, so a slow spell doesn't make the
+        # retry wait longer, while a model that always thinks for a while isn't retried every time.
+        quick = sorted(self.recent)[len(self.recent) // 4]
+        return min(self.maximum, max(self.minimum, 2 * quick))
 
     async def run(self, attempt, discard=None):
         """Returns what attempt() returns. discard() is given a second result, if both succeed, to close it."""
@@ -128,8 +132,9 @@ class Hedge:
 
 
 # Time to the first text of an answer, and time for a whole transcription.
-ANSWER_HEDGE = Hedge("Gemini answer", minimum=3.0)
-TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=2.5)
+ANSWER_HEDGE = Hedge("Gemini answer", minimum=3.0, maximum=10.0)
+# At most 4 s, so the second try still has time before the app gives up after 8 s.
+TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=2.5, maximum=4.0)
 
 
 def connect():
