@@ -25,7 +25,8 @@ HERE = Path(__file__).parent
 load_dotenv(dotenv_path=HERE / ".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-chatbot")
-DB = HERE / "chat.db"
+# INTERACT_DB lets tests run against a throwaway database.
+DB = Path(os.getenv("INTERACT_DB") or HERE / "chat.db")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 # Optional: how much the model "thinks" before answering; less is faster. Gemini 3 models take a
 # level (minimal, low, medium or high); older models take a token budget instead (0 turns it off).
