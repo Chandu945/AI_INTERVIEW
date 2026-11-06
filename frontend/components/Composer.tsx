@@ -155,9 +155,12 @@ export function Composer({
             ref={textareaRef}
             aria-label="Your message"
             placeholder={
-              fromTab
-                ? 'Type a question, or press Listen to tab to write down what a tab is saying...'
-                : 'Type a question, or tap the microphone to speak...'
+              // Not while gray words are shown, which would be drawn over it.
+              interim
+                ? ''
+                : fromTab
+                  ? 'Type a question, or press Listen to tab to write down what a tab is saying...'
+                  : 'Type a question, or tap the microphone to speak...'
             }
             value={draft}
             onChange={e => onDraftChange(e.target.value)}

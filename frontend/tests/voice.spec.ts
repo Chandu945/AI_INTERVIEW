@@ -84,6 +84,7 @@ test('words still being recognized show in gray in the box, and the buttons stay
   await page.evaluate(() => window.__sayInterim('so like this'));
   await expect(gray).toHaveText('so like this');
   await expect(box).toHaveValue(''); // gray words aren't part of the text until they're final
+  await expect(box).toHaveAttribute('placeholder', ''); // nor drawn over the box's hint
   expect(await layout()).toEqual(before);
   // A long dictation: the box scrolls to keep the newest gray words in view.
   await page.evaluate(() => {
