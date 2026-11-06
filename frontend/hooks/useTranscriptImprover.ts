@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 
-export type ImproveStatus = 'idle' | 'improving' | 'improved' | 'kept-edits' | 'failed';
+export type ImproveStatus = 'idle' | 'improving' | 'improved' | 'kept-edits' | 'failed' | 'too-long';
 
 // If Gemini takes longer than this, the live transcript is simply kept.
 const TIMEOUT_MS = 8_000;
+// A tab can talk on and on (a class, say), so only recordings up to 2 minutes, a long question,
+// are improved. The recorder makes 16 kHz 16-bit audio: 32,000 bytes a second.
+const MAX_TAB_BYTES = 120 * 32_000;
+/** Stands in for a transcript when the recording is too long to improve. */
+const TOO_LONG = Symbol('too long');
 
-/** Gemini's transcript: its text (maybe empty), undefined if it failed, or null if nothing was recorded. */
-type Transcript = Promise<string | undefined | null>;
+/**
+ * Gemini's transcript: its text (maybe empty), undefined if it failed, null if nothing was
+ * recorded, or TOO_LONG.
+ */
+type Transcript = Promise<string | undefined | null | typeof TOO_LONG>;
 
 type Options = {
   draftRef: { current: string };
@@ -22,6 +30,8 @@ type Segment = {
   expected: string;
   /** Whether the draft was typed in meanwhile. */
   typed: boolean;
+  /** Listening to a shared tab rather than the mic. */
+  fromTab: boolean;
   /** Started at the last pause, for the words dictated by then. */
   early?: { expected: string; transcript: Transcript };
   /** Started when listening stopped, for the whole recording. */
@@ -30,9 +40,10 @@ type Segment = {
   audio?: Promise<Blob | null>;
 };
 
-async function transcribe(id: string, audio: Promise<Blob | null>): Transcript {
+async function transcribe(id: string, audio: Promise<Blob | null>, maxBytes = Infinity): Transcript {
   const blob = await audio;
   if (!blob) return null;
+  if (blob.size > maxBytes) return TOO_LONG;
   try {
     const response = await api.transcribe(id, blob, AbortSignal.timeout(TIMEOUT_MS));
     if (!response.ok) return undefined;
@@ -59,9 +70,11 @@ function believable(live: string, transcript: string) {
 /**
  * After dictation, swaps the dictated part of the draft for Gemini's transcription of the
  * recording, which gets technical terms and punctuation right far more often than live
- * recognition. To save time, the recording is already sent at each pause; if no words follow,
- * that transcript is used. It never overwrites typing: if the draft changed after the last
- * dictated words, the draft is left as it is.
+ * recognition. To save time, the mic's recording is already sent at each pause; if no words
+ * follow, that transcript is used. A tab's recording is sent once, when listening stops: a tab
+ * (a class, say) pauses after nearly every sentence, and a request at each would use up the
+ * Gemini quota. It never overwrites typing: if the draft changed after the last dictated words,
+ * the draft is left as it is.
  */
 export function useTranscriptImprover({ draftRef, updateDraft, conversationId }: Options) {
   const [enabled, setEnabledState] = useState(true);
@@ -80,12 +93,15 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     setEnabledState(on);
   }, []);
 
-  /** Call when dictation starts. */
-  const begin = useCallback(() => {
-    dictationRef.current += 1;
-    segmentRef.current = { prefix: draftRef.current, expected: draftRef.current, typed: false };
-    setStatus('idle');
-  }, [draftRef]);
+  /** Call when dictation starts, saying whether it listens to a shared tab rather than the mic. */
+  const begin = useCallback(
+    (fromTab = false) => {
+      dictationRef.current += 1;
+      segmentRef.current = { prefix: draftRef.current, expected: draftRef.current, typed: false, fromTab };
+      setStatus('idle');
+    },
+    [draftRef],
+  );
 
   /** Call after recognized words are added to the draft. */
   const noteDictated = useCallback(() => {
@@ -104,12 +120,12 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     return segment && !segment.typed && id && enabledRef.current ? { segment, id } : null;
   }, []);
 
-  /** Call at a pause in dictation, with the recording so far, to start transcribing it early. */
+  /** Call at a pause in dictation, with a way to get the recording so far, to start transcribing it early. */
   const prefetch = useCallback(
-    (audio: Promise<Blob | null>) => {
+    (recording: () => Promise<Blob | null>) => {
       const current = usable();
-      if (current)
-        current.segment.early = { expected: current.segment.expected, transcript: transcribe(current.id, audio) };
+      if (current && !current.segment.fromTab)
+        current.segment.early = { expected: current.segment.expected, transcript: transcribe(current.id, recording()) };
     },
     [usable],
   );
@@ -122,7 +138,8 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
       const { segment, id } = current;
       segment.audio = audio;
       // The transcript from the last pause will do, unless more words came after it.
-      if (wordsPending || segment.early?.expected !== segment.expected) segment.final = transcribe(id, audio);
+      if (wordsPending || segment.early?.expected !== segment.expected)
+        segment.final = transcribe(id, audio, segment.fromTab ? MAX_TAB_BYTES : Infinity);
     },
     [usable],
   );
@@ -148,6 +165,7 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     const draft = draftRef.current;
     if (text === null || (changed() && !draft.trim())) return setStatus('idle'); // nothing recorded, or sent/cleared
     if (text === undefined) return setStatus('failed');
+    if (text === TOO_LONG) return setStatus('too-long');
     if (changed()) return setStatus('kept-edits');
     if (!text) return setStatus('idle');
     const { prefix } = segment;

@@ -9,9 +9,13 @@ import { TopBar } from '../components/TopBar';
 import { useDraft } from '../hooks/useDraft';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useStickToBottom } from '../hooks/useStickToBottom';
+import { useTabAudio } from '../hooks/useTabAudio';
 import { useTranscriptImprover } from '../hooks/useTranscriptImprover';
 import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
-import type { AnswerMode, Message, Session, StreamMetrics, View } from '../lib/types';
+import type { AnswerMode, Message, Session, StreamMetrics, View, VoiceSource } from '../lib/types';
+
+// Remembers in this browser whether dictation listens to the mic or a tab.
+const SOURCE_KEY = 'ai-interact.voice-source';
 
 /** The whole app: New Interview, History and the interview itself, plus the actions that connect them. */
 export default function Home() {
@@ -30,6 +34,7 @@ export default function Home() {
   const [error, setError] = useState('');
   const [failedDraft, setFailedDraft] = useState<string | null>(null);
   const [language, setLanguage] = useState('en-IN');
+  const [source, setSource] = useState<VoiceSource>('mic');
   // Hands-free: send the question as soon as the mic stops after a pause. Off by default, so you review first.
   const [autoSend, setAutoSend] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
@@ -77,11 +82,39 @@ export default function Home() {
   });
   const { haltRecognition, startListening, stopListening, updateInterim, isListening } = speech;
   const { bodyRef, bottomRef, onPanelScroll, followNewest } = useStickToBottom(messages, busy);
+  // Stop sharing, pressed in Chrome's sharing bar, stops listening as if Stop was pressed.
+  const tabAudio = useTabAudio(() => {
+    if (isListening()) void finish(stopListening());
+  });
+  const { connect: connectTab, disconnect: disconnectTab } = tabAudio;
+  const fromTab = tabAudio.supported && source === 'tab';
 
-  const startDictation = useCallback(() => {
+  const startDictation = useCallback(async () => {
     if (busyRef.current) return;
-    if (startListening()) beginDictation();
-  }, [beginDictation, startListening]);
+    let track: MediaStreamTrack | undefined;
+    if (fromTab) {
+      try {
+        track = await connectTab(); // the first time, Chrome asks which tab to share
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Couldn't share the tab.");
+        return;
+      }
+    }
+    if (startListening(track)) beginDictation(fromTab);
+  }, [beginDictation, connectTab, fromTab, startListening]);
+
+  const changeSource = useCallback(
+    (next: VoiceSource) => {
+      setSource(next);
+      try {
+        localStorage.setItem(SOURCE_KEY, next);
+      } catch {
+        /* storage is blocked: the choice lasts until the page is reloaded */
+      }
+      if (next === 'mic') disconnectTab();
+    },
+    [disconnectTab],
+  );
 
   // The dictation being finished (the mic stopping, then the transcript being polished), so
   // that Send can wait for it.
@@ -115,7 +148,7 @@ export default function Home() {
       haltRecognition(false);
       // Restart on the next tick after disposing the old recognition instance.
       setTimeout(() => {
-        if (mountedRef.current) startDictation();
+        if (mountedRef.current) void startDictation();
       }, 80);
     }
     textareaRef.current?.focus();
@@ -364,6 +397,14 @@ export default function Home() {
   }, [refreshSessions]);
 
   useEffect(() => {
+    try {
+      if (localStorage.getItem(SOURCE_KEY) === 'tab') setSource('tab');
+    } catch {
+      /* storage is blocked: start with the mic */
+    }
+  }, []);
+
+  useEffect(() => {
     // The shortcut sends a question, so it only works on the interview page.
     if (view !== 'interview') return;
     function onKey(event: KeyboardEvent) {
@@ -409,7 +450,12 @@ export default function Home() {
             onDraftChange={typeInDraft}
             textareaRef={textareaRef}
             speech={speech}
-            onStartDictation={startDictation}
+            source={fromTab ? 'tab' : 'mic'}
+            onSourceChange={changeSource}
+            tabSupported={tabAudio.supported}
+            tabShared={tabAudio.shared}
+            onStopSharing={disconnectTab}
+            onStartDictation={() => void startDictation()}
             onStopDictation={() => void finishDictation()}
             improve={improver.enabled}
             onImproveChange={improver.setEnabled}

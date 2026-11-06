@@ -13,12 +13,18 @@ declare global {
     __sayInterim: (text: string) => void;
     __transcript: string | null;
     __transcriptDelayMs: number;
+    __recognitionTrack: MediaStreamTrack | null;
+    __tabShare: 'share' | 'cancel' | 'no-audio';
+    __tabShares: number;
+    __sharedTracks: MediaStreamTrack[];
+    __stopSharing: () => void;
   }
 }
 
 /**
  * Runs in the page before the app loads. Records every fetch, can fake a streamed answer and
- * an empty History list, and replaces speech recognition with a fake the tests can "speak" into.
+ * an empty History list, and replaces speech recognition and Chrome's tab-sharing picker with
+ * fakes the tests can control.
  */
 function pageFakes() {
   window.__requests = [];
@@ -86,7 +92,10 @@ function pageFakes() {
     constructor() {
       recognitions.push(this);
     }
-    start() {}
+    // Given a track, recognition listens to it (a shared tab's sound) instead of the mic.
+    start(track?: MediaStreamTrack) {
+      window.__recognitionTrack = track ?? null;
+    }
     stop() {
       setTimeout(() => this.onend?.(), 30);
     }
@@ -107,6 +116,35 @@ function pageFakes() {
       resultIndex: rec.results.length,
       results: [...rec.results, { isFinal: false, 0: { transcript: text } }],
     });
+  };
+
+  // Chrome's share picker. `__tabShare` sets what it does: share a tab (its sound is a test
+  // tone), close without sharing, or share a tab without its sound.
+  window.__recognitionTrack = null;
+  window.__tabShare = 'share';
+  window.__tabShares = 0;
+  window.__sharedTracks = [];
+  navigator.mediaDevices.getDisplayMedia = async () => {
+    window.__tabShares += 1;
+    if (window.__tabShare === 'cancel') throw new DOMException('Permission denied by user', 'NotAllowedError');
+    const tracks = document.createElement('canvas').captureStream().getVideoTracks();
+    if (window.__tabShare === 'share') {
+      const context = new AudioContext();
+      const tone = context.createOscillator();
+      const sound = context.createMediaStreamDestination();
+      tone.connect(sound);
+      tone.start();
+      tracks.push(...sound.stream.getAudioTracks());
+    }
+    window.__sharedTracks = tracks;
+    return new MediaStream(tracks);
+  };
+  // Like pressing Stop sharing in Chrome's sharing bar.
+  window.__stopSharing = () => {
+    for (const track of window.__sharedTracks) {
+      track.stop();
+      track.dispatchEvent(new Event('ended'));
+    }
   };
 }
 

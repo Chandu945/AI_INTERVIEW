@@ -553,6 +553,15 @@ kbd {
 .options-row label:has(input:disabled) {
   opacity: 0.55;
 }
+/* "Listen to": the mic or a tab, with Stop sharing beside it while a tab is shared */
+.source-pick {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.options-row .source-pick select {
+  max-width: none;
+}
 .tips {
   font-size: 12px;
   line-height: 1.7;

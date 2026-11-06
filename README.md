@@ -16,6 +16,16 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   text is usually ready by the time you stop. Anything you typed meanwhile is never overwritten;
   if Gemini is unavailable or its text doesn't match what was heard, the live words stay. Turn it
   off with "Improve the transcript with Gemini when you stop".
+- **Listen to a browser tab:** instead of the microphone, the app can listen to another Chrome
+  tab, such as a YouTube video or a Google Meet call. Set "Listen to" to "A browser tab", press
+  **Listen to tab**, pick the tab in Chrome's list and keep "Also share tab audio" on. Live words
+  and the Gemini transcript work as with the mic, and you still hear the tab. The tab stays shared
+  (Chrome shows its sharing bar), so the next Listen to tab doesn't ask again, until you press
+  Stop sharing or switch back to the microphone. A tab's recording goes to Gemini once, when
+  listening stops, and only if it is up to 2 minutes long: a class pauses after nearly every
+  sentence, and a request at each pause would use up the Gemini quota. Only Chrome tabs are
+  covered: for sound from desktop apps (the Zoom app, say), share your whole screen instead,
+  where Chrome may offer the computer's sound.
 - **Quick answers:** Gemini usually starts answering in 1 to 3 seconds, but now and then stalls
   for 10 to 30. If an answer hasn't started within a few seconds (twice as long as a quick
   reply, at least 3 seconds), or Gemini returns an error, the backend also sends the question to
@@ -89,8 +99,8 @@ Frontend, from `frontend/`:
 - `frontend/app/page.tsx`: the app's state and the actions that connect the screens.
 - `frontend/components/`: the screens and panels (New Interview, History, the question box,
   the answers).
-- `frontend/hooks/`: speech recognition, the microphone recording and transcript improvement,
-  the question draft and answer scrolling.
+- `frontend/hooks/`: speech recognition, sharing a tab's sound, the recording and transcript
+  improvement, the question draft and answer scrolling.
 - `frontend/lib/`: the API client and shared types. Styles are in `frontend/app/style.css`.
 
 ## Security and limitations
@@ -104,9 +114,9 @@ not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
 The voice pause detection relies on the browser's SpeechRecognition events, so its accuracy and
 availability vary by browser. With transcript improvement on, each dictated question's recording
 is sent to Gemini (Chrome's live recognition also sends audio to Google). Each dictation makes one
-or more extra Gemini requests (one per pause), and slow requests are sent twice; these count
-toward your API key's rate limits. Model names in `.env.example` may need updating to models
-available to your API key.
+or more extra Gemini requests (one per pause with the mic, one in all with a tab), and slow
+requests are sent twice; these count toward your API key's rate limits. Model names in
+`.env.example` may need updating to models available to your API key.
 
 Before updating an existing installation, back up `backend/chat.db`. Database columns are
 migrated at startup.

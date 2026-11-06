@@ -5,7 +5,7 @@ const SAMPLE_RATE = 16000; // plenty for speech, and small to upload
 const MAX_SECONDS = 300;
 // How long to wait for a mic that is still opening (say, its permission prompt is still showing).
 const OPEN_WAIT_MS = 1000;
-// Runs on the audio thread and passes each block of microphone samples back to the page.
+// Runs on the audio thread and passes each block of samples back to the page.
 const TAP = `registerProcessor('tap', class extends AudioWorkletProcessor {
   process(inputs) {
     const samples = inputs[0] && inputs[0][0];
@@ -17,15 +17,16 @@ const TAP = `registerProcessor('tap', class extends AudioWorkletProcessor {
 type Recording = { stream: MediaStream; context: AudioContext; chunks: Float32Array[]; length: number };
 
 /**
- * Records the microphone as 16 kHz mono WAV with the browser's noise suppression, echo
- * cancellation and automatic volume, for a second, more accurate transcription. If the mic
- * can't be opened, recording quietly does nothing and the live transcript is used as before.
+ * Records the microphone (with the browser's noise suppression, echo cancellation and automatic
+ * volume) or a shared tab's sound as 16 kHz mono WAV, for a second, more accurate transcription.
+ * If the mic can't be opened, recording quietly does nothing and the live transcript is used as before.
  */
 export function useAudioRecorder() {
   const recordingRef = useRef<Promise<Recording | null> | null>(null);
 
-  const start = useCallback(() => {
-    if (!recordingRef.current) recordingRef.current = openRecording().catch(() => null);
+  /** Starts recording the mic, or `track` (a shared tab's sound) if given. */
+  const start = useCallback((track?: MediaStreamTrack) => {
+    if (!recordingRef.current) recordingRef.current = openRecording(track).catch(() => null);
   }, []);
 
   /** Stops recording and returns the audio, or null if nothing was recorded. */
@@ -78,7 +79,7 @@ function toWav(recording: Recording) {
   return encodeWav(samples, SAMPLE_RATE);
 }
 
-async function openRecording(): Promise<Recording> {
+async function openRecording(track?: MediaStreamTrack): Promise<Recording> {
   // Created right away (still inside the click that started dictation, so the browser lets it
   // play), and set up while the browser opens the mic, so recording starts as soon as it can.
   const context = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -86,13 +87,21 @@ async function openRecording(): Promise<Recording> {
   tapReady.catch(() => {}); // handled below; this only stops an early failure being reported as unhandled
   let stream: MediaStream | null = null;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-    });
+    stream = track
+      ? // A copy of the tab's track, so that closing the recording leaves the tab shared.
+        new MediaStream([track.clone()])
+      : await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+        });
     await tapReady;
     if (context.state === 'suspended') await context.resume();
     const recording: Recording = { stream, context, chunks: [], length: 0 };
-    const tap = new AudioWorkletNode(context, 'tap', { numberOfOutputs: 0 });
+    // One channel in: a tab's stereo sound is mixed down to mono.
+    const tap = new AudioWorkletNode(context, 'tap', {
+      numberOfOutputs: 0,
+      channelCount: 1,
+      channelCountMode: 'explicit',
+    });
     tap.port.onmessage = (event: MessageEvent<Float32Array>) => {
       if (recording.length >= SAMPLE_RATE * MAX_SECONDS) return;
       recording.chunks.push(event.data);

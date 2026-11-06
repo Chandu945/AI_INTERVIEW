@@ -1,6 +1,8 @@
 export type View = 'setup' | 'interview' | 'history';
 export type AnswerMode = 'quick' | 'balanced' | 'detailed';
 export type InterviewType = 'Technical' | 'HR' | 'Mixed';
+/** What dictation listens to: the microphone, or the sound of a shared browser tab. */
+export type VoiceSource = 'mic' | 'tab';
 export type Message = { role: 'user' | 'assistant'; content: string };
 
 /** An interview as listed by the backend. */

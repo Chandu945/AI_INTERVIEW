@@ -411,7 +411,7 @@ COMMON_TERMS = [
     "microservices", "SQL", "NoSQL", "API",
 ]  # fmt: skip
 TRANSCRIBE_PROMPT = (
-    "Transcribe this recording of a job candidate saying an interview question.\n"
+    "Transcribe this recording. It is usually an interview question, said by the candidate or played from a video or call.\n"
     "Write exactly the words spoken, in normal sentence case with punctuation.\n"
     "The interview is for the role: {role} ({interview_type} interview). Spell technical terms the standard way; "
     "terms that may come up include: {terms}.\n"

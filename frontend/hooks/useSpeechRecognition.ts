@@ -11,7 +11,8 @@ type Recognition = {
   onresult: ((event: SpeechEvent) => void) | null;
   onerror: ((event: SpeechError) => void) | null;
   onend: (() => void) | null;
-  start: () => void;
+  /** Listens to the mic, or to `track` if given (Chrome). */
+  start: (track?: MediaStreamTrack) => void;
   stop: () => void;
   abort: () => void;
 };
@@ -29,8 +30,11 @@ type Options = {
   setError: (message: string) => void;
   /** Also record the audio, so it can be transcribed again more accurately. */
   record?: boolean;
-  /** Called at a pause, when every word heard so far is final, with the recording so far. */
-  onPhraseEnd?: (audio: Promise<Blob | null>) => void;
+  /**
+   * Called at a pause, when every word heard so far is final, with a way to get the recording so
+   * far (it must be called at once).
+   */
+  onPhraseEnd?: (recording: () => Promise<Blob | null>) => void;
   /** Called as listening stops, with the whole recording and whether words were still being recognized. */
   onRecordingEnd?: (audio: Promise<Blob | null>, wordsPending: boolean) => void;
   /**
@@ -43,10 +47,11 @@ type Options = {
 export type Speech = ReturnType<typeof useSpeechRecognition>;
 
 /**
- * Live dictation with the browser's speech recognition (Chrome). Finalized words go into the
- * draft; words still being recognized are shown as `interim`. The browser ends recognition on
- * its own now and then, so it is reopened until stopListening() is called. Every start gets a
- * new session number, and callbacks from an older session are ignored.
+ * Live dictation with the browser's speech recognition (Chrome), from the mic or from a shared
+ * tab's sound. Finalized words go into the draft; words still being recognized are shown as
+ * `interim`. The browser ends recognition on its own now and then, so it is reopened until
+ * stopListening() is called. Every start gets a new session number, and callbacks from an older
+ * session are ignored.
  */
 export function useSpeechRecognition({
   language,
@@ -69,6 +74,8 @@ export function useSpeechRecognition({
   const autoPauseRef = useRef(false);
 
   const recognitionRef = useRef<Recognition | null>(null);
+  // The shared tab's sound being listened to, or null for the mic.
+  const trackRef = useRef<MediaStreamTrack | null>(null);
   const stopListeningRef = useRef<(() => Promise<void>) | null>(null);
   const sessionRef = useRef(0);
   const shouldListenRef = useRef(false);
@@ -137,7 +144,7 @@ export function useSpeechRecognition({
       disposeRecognition();
       cancelRecording();
       setListening(false);
-      setStatus('Microphone off');
+      setStatus(trackRef.current ? 'Stopped listening to the tab' : 'Microphone off');
       finishStop();
     },
     [appendWords, cancelRecording, clearTimers, disposeRecognition, finishStop, updateInterim],
@@ -152,106 +159,126 @@ export function useSpeechRecognition({
     }, 2200);
   }, []);
 
-  /** Returns whether listening started. It won't while already listening or still stopping. */
-  const startListening = useCallback((): boolean => {
-    const w = window as SpeechWindow;
-    const Constructor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Constructor) {
-      setError('Live speech recognition is not supported in this browser. Try Chrome.');
-      return false;
-    }
-    if (shouldListenRef.current || stoppingRef.current || busyRef.current) return false;
-    setError('');
-    const token = ++sessionRef.current;
-    shouldListenRef.current = true;
-    stoppingRef.current = false;
-    recognitionFinalRef.current = '';
-    updateInterim('');
-    setElapsed(0);
-    setListening(true);
-    setStatus('Connecting microphone...');
-    timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
-    if (optionsRef.current.record) startRecording();
-
-    const openRecognition = () => {
-      if (sessionRef.current !== token || !shouldListenRef.current || stoppingRef.current) return;
-      const rec = new Constructor();
-      rec.continuous = true;
-      rec.interimResults = true;
-      rec.lang = language;
-      recognitionFinalRef.current = '';
-      recognitionRef.current = rec;
-      rec.onresult = event => {
-        if (sessionRef.current !== token) return;
-        let final = '';
-        let temporary = '';
-        for (let i = 0; i < event.results.length; i++) {
-          const result = event.results[i];
-          if (result.isFinal) final += result[0].transcript + ' ';
-          else temporary += result[0].transcript + ' ';
-        }
-        // Browser results represent the current recognition session, not just new words.
-        // Append only the newly finalized suffix, keeping manual textarea edits intact.
-        if (final.length < recognitionFinalRef.current.length || !final.startsWith(recognitionFinalRef.current)) {
-          recognitionFinalRef.current = '';
-        }
-        const addition = final.slice(recognitionFinalRef.current.length).trim();
-        if (addition) appendWords(addition);
-        recognitionFinalRef.current = final;
-        updateInterim(temporary.trim());
-        // A pause: every word heard so far is final, so the recording so far can be transcribed early.
-        if (addition && !temporary.trim() && !stoppingRef.current && optionsRef.current.record)
-          optionsRef.current.onPhraseEnd?.(peekRecording());
-        setStatus(stoppingRef.current ? 'Finishing transcription...' : 'Listening live');
-        if (autoPauseRef.current && (final.trim() || temporary.trim())) scheduleSilenceStop();
-      };
-      rec.onerror = event => {
-        if (sessionRef.current !== token) return;
-        const fatal = ['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'];
-        if (fatal.includes(event.error)) {
-          setError(`Microphone recognition error: ${event.error}. Check browser permissions.`);
-          haltRecognition(true);
-        } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
-          setStatus(`Recognition interrupted: ${event.error}`);
-        }
-      };
-      rec.onend = () => {
-        if (sessionRef.current !== token) return;
-        recognitionRef.current = null;
-        if (stoppingRef.current) {
-          // Keep a last interim phrase if the browser never marked it final.
-          appendWords(interimRef.current);
-          updateInterim('');
-          finishStop();
-          return;
-        }
-        if (shouldListenRef.current) {
-          setStatus('Reconnecting microphone...');
-          restartRef.current = setTimeout(openRecognition, 300);
-        }
-      };
-      try {
-        rec.start();
-        setStatus('Listening live');
-      } catch {
-        setError('Unable to start speech recognition. Check microphone permissions.');
-        haltRecognition(true);
+  /**
+   * Starts listening to the mic, or to `track` (a shared tab's sound) if given. Returns whether
+   * listening started. It won't while already listening or still stopping.
+   */
+  const startListening = useCallback(
+    (track?: MediaStreamTrack): boolean => {
+      const w = window as SpeechWindow;
+      const Constructor = w.SpeechRecognition || w.webkitSpeechRecognition;
+      if (!Constructor) {
+        setError('Live speech recognition is not supported in this browser. Try Chrome.');
+        return false;
       }
-    };
-    openRecognition();
-    return true;
-  }, [
-    appendWords,
-    busyRef,
-    finishStop,
-    haltRecognition,
-    language,
-    peekRecording,
-    scheduleSilenceStop,
-    setError,
-    startRecording,
-    updateInterim,
-  ]);
+      if (shouldListenRef.current || stoppingRef.current || busyRef.current) return false;
+      setError('');
+      const token = ++sessionRef.current;
+      shouldListenRef.current = true;
+      stoppingRef.current = false;
+      trackRef.current = track ?? null;
+      // Once a shared tab stops being shared, its track ends; the page then stops listening.
+      const tabGone = () => track?.readyState === 'ended';
+      const listeningText = track ? 'Listening to the tab' : 'Listening live';
+      recognitionFinalRef.current = '';
+      updateInterim('');
+      setElapsed(0);
+      setListening(true);
+      setStatus(track ? 'Connecting to the tab...' : 'Connecting microphone...');
+      timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
+      if (optionsRef.current.record) startRecording(track);
+
+      const openRecognition = () => {
+        if (sessionRef.current !== token || !shouldListenRef.current || stoppingRef.current || tabGone()) return;
+        const rec = new Constructor();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = language;
+        recognitionFinalRef.current = '';
+        recognitionRef.current = rec;
+        rec.onresult = event => {
+          if (sessionRef.current !== token) return;
+          let final = '';
+          let temporary = '';
+          for (let i = 0; i < event.results.length; i++) {
+            const result = event.results[i];
+            if (result.isFinal) final += result[0].transcript + ' ';
+            else temporary += result[0].transcript + ' ';
+          }
+          // Browser results represent the current recognition session, not just new words.
+          // Append only the newly finalized suffix, keeping manual textarea edits intact.
+          if (final.length < recognitionFinalRef.current.length || !final.startsWith(recognitionFinalRef.current)) {
+            recognitionFinalRef.current = '';
+          }
+          const addition = final.slice(recognitionFinalRef.current.length).trim();
+          if (addition) appendWords(addition);
+          recognitionFinalRef.current = final;
+          updateInterim(temporary.trim());
+          // A pause: every word heard so far is final, so the recording so far can be transcribed early.
+          if (addition && !temporary.trim() && !stoppingRef.current && optionsRef.current.record)
+            optionsRef.current.onPhraseEnd?.(peekRecording);
+          setStatus(stoppingRef.current ? 'Finishing transcription...' : listeningText);
+          if (autoPauseRef.current && (final.trim() || temporary.trim())) scheduleSilenceStop();
+        };
+        rec.onerror = event => {
+          // Errors after the tab stopped being shared don't matter: the page stops listening.
+          if (sessionRef.current !== token || tabGone()) return;
+          const fatal = ['not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported'];
+          if (fatal.includes(event.error)) {
+            setError(
+              track
+                ? `Couldn't listen to the tab (${event.error}).`
+                : `Microphone recognition error: ${event.error}. Check browser permissions.`,
+            );
+            haltRecognition(true);
+          } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
+            setStatus(`Recognition interrupted: ${event.error}`);
+          }
+        };
+        rec.onend = () => {
+          if (sessionRef.current !== token) return;
+          recognitionRef.current = null;
+          if (stoppingRef.current) {
+            // Keep a last interim phrase if the browser never marked it final.
+            appendWords(interimRef.current);
+            updateInterim('');
+            finishStop();
+            return;
+          }
+          if (shouldListenRef.current && !tabGone()) {
+            setStatus(track ? 'Reconnecting to the tab...' : 'Reconnecting microphone...');
+            restartRef.current = setTimeout(openRecognition, 300);
+          }
+        };
+        try {
+          if (track) rec.start(track);
+          else rec.start();
+          setStatus(listeningText);
+        } catch {
+          setError(
+            track
+              ? "Couldn't listen to the tab. Try sharing it again."
+              : 'Unable to start speech recognition. Check microphone permissions.',
+          );
+          haltRecognition(true);
+        }
+      };
+      openRecognition();
+      return true;
+    },
+    [
+      appendWords,
+      busyRef,
+      finishStop,
+      haltRecognition,
+      language,
+      peekRecording,
+      scheduleSilenceStop,
+      setError,
+      startRecording,
+      updateInterim,
+    ],
+  );
 
   /** Stops listening. Resolves once the last words are final. */
   const stopListening = useCallback(async (): Promise<void> => {
