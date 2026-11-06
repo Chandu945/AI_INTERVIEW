@@ -3,7 +3,7 @@ import { encodeWav } from '../lib/wav';
 
 const SAMPLE_RATE = 16000; // plenty for speech, and small to upload
 const MAX_SECONDS = 300;
-// How long stop() waits for a mic that is still opening (say, its permission prompt is still showing).
+// How long to wait for a mic that is still opening (say, its permission prompt is still showing).
 const OPEN_WAIT_MS = 1000;
 // Runs on the audio thread and passes each block of microphone samples back to the page.
 const TAP = `registerProcessor('tap', class extends AudioWorkletProcessor {
@@ -33,22 +33,21 @@ export function useAudioRecorder() {
     const pending = recordingRef.current;
     recordingRef.current = null;
     if (!pending) return null;
-    const timeout = new Promise<null>(resolve => setTimeout(() => resolve(null), OPEN_WAIT_MS));
-    const recording = await Promise.race([pending, timeout]);
+    const recording = await openedSoon(pending);
     if (!recording) {
       // Still opening, so nothing was recorded. Close it once it opens.
       void pending.then(late => late && closeRecording(late));
       return null;
     }
     closeRecording(recording);
-    if (!recording.length) return null;
-    const samples = new Float32Array(recording.length);
-    let offset = 0;
-    for (const chunk of recording.chunks) {
-      samples.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return encodeWav(samples, SAMPLE_RATE);
+    return toWav(recording);
+  }, []);
+
+  /** The audio recorded so far, without stopping. */
+  const peek = useCallback(async () => {
+    const pending = recordingRef.current;
+    const recording = pending && (await openedSoon(pending));
+    return recording ? toWav(recording) : null;
   }, []);
 
   /** Stops recording and throws the audio away. */
@@ -59,7 +58,24 @@ export function useAudioRecorder() {
   }, []);
 
   useEffect(() => cancel, [cancel]);
-  return { start, stop, cancel };
+  return { start, stop, peek, cancel };
+}
+
+/** The recording, or null if the mic is still opening (say, its permission prompt is still showing). */
+function openedSoon(pending: Promise<Recording | null>) {
+  const timeout = new Promise<null>(resolve => setTimeout(() => resolve(null), OPEN_WAIT_MS));
+  return Promise.race([pending, timeout]);
+}
+
+function toWav(recording: Recording) {
+  if (!recording.length) return null;
+  const samples = new Float32Array(recording.length);
+  let offset = 0;
+  for (const chunk of recording.chunks) {
+    samples.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return encodeWav(samples, SAMPLE_RATE);
 }
 
 async function openRecording(): Promise<Recording> {

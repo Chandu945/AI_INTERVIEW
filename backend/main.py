@@ -6,18 +6,21 @@ import os
 import re
 import secrets
 import sqlite3
+import statistics
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pydantic import BaseModel, Field
 
 HERE = Path(__file__).parent
@@ -42,8 +45,91 @@ def get_client():
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
     return genai.Client(
         api_key=key,
-        http_options=types.HttpOptions(timeout=45000, retry_options=types.HttpRetryOptions(attempts=1)),
+        http_options=types.HttpOptions(
+            timeout=45000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+            # Keep the connection to Gemini open between questions (by default it's closed after 5
+            # idle seconds), so a question doesn't first wait for a new connection. Google keeps
+            # idle connections open for at least 150 seconds.
+            async_client_args={
+                "limits": httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=120)
+            },
+        ),
     )
+
+
+async def warm_up(client):
+    """Connects to Gemini at startup, so the first question doesn't wait for it."""
+    try:
+        await client.aio.models.get(model=MODEL)
+    except Exception as exc:
+        logger.warning("Couldn't reach Gemini model %s at startup: %s", MODEL, exc)
+
+
+class Hedge:
+    """
+    Sends a request again when Gemini is slow. Gemini usually replies within 1-3 seconds, but now
+    and then takes 10-30 seconds or fails, and a second try is then usually quick. If an attempt
+    hasn't succeeded after twice the recent typical time (and at least `minimum` seconds), or it
+    fails with a server or network error, a second attempt starts and whichever succeeds first is
+    used; the other is cancelled. Errors caused by the request itself, like the per-minute rate
+    limit, aren't retried.
+    """
+
+    def __init__(self, name: str, minimum: float):
+        self.name = name
+        self.minimum = minimum
+        self.recent: deque[float] = deque(maxlen=20)  # how long recent successful attempts took
+
+    def delay(self) -> float:
+        typical = statistics.median(self.recent) if self.recent else 0.0
+        return max(self.minimum, 2 * typical)
+
+    async def run(self, attempt, discard=None):
+        """Returns what attempt() returns. discard() is given a second result, if both succeed, to close it."""
+
+        async def timed():
+            started = time.perf_counter()
+            result = await attempt()
+            return result, time.perf_counter() - started
+
+        tasks = [asyncio.create_task(timed())]
+        winner = None
+        try:
+            delay = self.delay()
+            done, _ = await asyncio.wait(tasks, timeout=delay)
+            error = tasks[0].exception() if done else None
+            if done and error is None:
+                winner = tasks[0]
+            else:
+                if isinstance(error, errors.ClientError):
+                    raise error
+                reason = f"failed ({error})" if error else f"no reply after {delay:.1f}s"
+                logger.warning("%s %s; sending the request again", self.name, reason)
+                tasks.append(asyncio.create_task(timed()))
+                while winner is None:
+                    pending = [task for task in tasks if not task.done()]
+                    if not pending:
+                        raise tasks[-1].exception()
+                    await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    winner = next((t for t in tasks if t.done() and t.exception() is None), None)
+                logger.info("%s: attempt %s of 2 replied first", self.name, tasks.index(winner) + 1)
+            result, seconds = winner.result()
+            self.recent.append(seconds)
+            return result
+        finally:
+            for task in tasks:
+                if task is winner:
+                    continue
+                if not task.done():
+                    task.cancel()
+                elif task.exception() is None and discard:
+                    await discard(task.result()[0])
+
+
+# Time to the first text of an answer, and time for a whole transcription.
+ANSWER_HEDGE = Hedge("Gemini answer", minimum=3.0)
+TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=2.5)
 
 
 def connect():
@@ -73,9 +159,12 @@ async def lifespan(app: FastAPI):
             except sqlite3.OperationalError:
                 pass
     app.state.chat_client = get_client() if os.getenv("GEMINI_API_KEY") else None
+    warming = asyncio.create_task(warm_up(app.state.chat_client)) if app.state.chat_client else None
     try:
         yield
     finally:
+        if warming:
+            warming.cancel()
         if app.state.chat_client is not None:
             await app.state.chat_client.aio.aclose()
 
@@ -305,8 +394,8 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
     prompt = TRANSCRIBE_PROMPT.format(
         role=row["target_role"], interview_type=row["interview_type"], terms=", ".join(terms)
     )
-    started = time.perf_counter()
-    try:
+
+    async def attempt():
         response = await client.aio.models.generate_content(
             model=MODEL,
             contents=[
@@ -315,13 +404,17 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
                     parts=[types.Part.from_text(text=prompt), types.Part.from_bytes(data=audio, mime_type="audio/wav")],
                 )
             ],
-            # A short timeout: if Gemini is slow, the app keeps the live transcript instead of waiting.
-            config=types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=15000)),
+            # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
+            config=types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=8000)),
         )
+        return (response.text or "").strip()
+
+    started = time.perf_counter()
+    try:
+        text = await TRANSCRIBE_HEDGE.run(attempt)
     except Exception as exc:
         logger.exception("Gemini transcription failed")
         raise HTTPException(502, "Transcription failed; the live transcript was kept") from exc
-    text = (response.text or "").strip()
     logger.info(
         "transcribe model=%s bytes=%s total_ms=%s chars=%s",
         MODEL, len(audio), round((time.perf_counter() - started) * 1000), len(text),
@@ -453,6 +546,22 @@ def save_turn(cid: str, question: str, answer: str):
         )
 
 
+async def start_answer(client, contents, config):
+    """Starts a streamed answer and reads it up to the first text. Returns the stream and the chunks read."""
+    stream = await client.aio.models.generate_content_stream(model=MODEL, contents=contents, config=config)
+    head = []
+    async for chunk in stream:
+        head.append(chunk)
+        if chunk.text:
+            break
+    return stream, head
+
+
+async def close_answer(started):
+    stream, _ = started
+    await stream.aclose()
+
+
 @app.post("/api/chat/stream")
 async def stream_chat(request: ChatRequest):
     cid = request.conversation_id or str(uuid.uuid4())
@@ -470,17 +579,27 @@ async def stream_chat(request: ChatRequest):
         finish_reason = None
         yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
         try:
-            stream = await client.aio.models.generate_content_stream(model=MODEL, contents=contents, config=config)
-            async for chunk in stream:
-                if chunk.candidates and chunk.candidates[0].finish_reason:
-                    finish_reason = chunk.candidates[0].finish_reason
-                delta = chunk.text or ""
-                if not delta:
-                    continue
-                if first_token is None:
-                    first_token = time.perf_counter()
-                chunks.append(delta)
-                yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
+            stream, head = await ANSWER_HEDGE.run(lambda: start_answer(client, contents, config), discard=close_answer)
+
+            async def all_chunks():
+                for chunk in head:
+                    yield chunk
+                async for chunk in stream:
+                    yield chunk
+
+            try:
+                async for chunk in all_chunks():
+                    if chunk.candidates and chunk.candidates[0].finish_reason:
+                        finish_reason = chunk.candidates[0].finish_reason
+                    delta = chunk.text or ""
+                    if not delta:
+                        continue
+                    if first_token is None:
+                        first_token = time.perf_counter()
+                    chunks.append(delta)
+                    yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
+            finally:
+                await stream.aclose()
             if finish_reason == types.FinishReason.MAX_TOKENS:
                 logger.warning("Answer hit the %s-token limit (mode=%s)", MODE_TOKENS[request.mode], request.mode)
                 if not "".join(chunks).strip():

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 from docx import Document
-from google.genai import types
+from google.genai import errors, types
 from pypdf import PdfWriter
 
 import main
@@ -325,3 +325,70 @@ def test_transcription_problems_are_reported(client, gemini):
     assert send_recording(client, cid).status_code == 503  # no API key
     gemini().transcript = RuntimeError("Gemini is busy")
     assert send_recording(client, cid).status_code == 502
+
+
+# Slow or failed Gemini requests are sent again (see main.Hedge).
+
+SERVER_ERROR = errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
+RATE_LIMIT = errors.ClientError(429, {"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}})
+
+
+def timed_ask(client, cid):
+    started = time.perf_counter()
+    events = ask(client, cid, "Question?")
+    return events, time.perf_counter() - started
+
+
+def test_a_slow_answer_is_requested_again_and_the_quicker_one_is_used(client, gemini, monkeypatch):
+    monkeypatch.setattr(main.ANSWER_HEDGE, "minimum", 0.3)
+    cid = new_interview(client)
+    fake = gemini(("Quick answer.", "STOP"))
+    fake.delays = [10, 0]  # the first request hangs
+    events, seconds = timed_ask(client, cid)
+    assert seconds < 5
+    assert "".join(e["text"] for e in events if e["type"] == "delta") == "Quick answer."
+    assert events[-1]["type"] == "done"
+    assert (fake.calls, fake.cancelled) == (2, 1)
+
+
+def test_a_failed_answer_is_retried_at_once(client, gemini, monkeypatch):
+    monkeypatch.setattr(main.ANSWER_HEDGE, "minimum", 30)  # so only the failure can trigger the retry
+    cid = new_interview(client)
+    fake = gemini(("Answer.", "STOP"))
+    fake.errors = [SERVER_ERROR]
+    events, seconds = timed_ask(client, cid)
+    assert seconds < 5
+    assert events[-1]["type"] == "done"
+    assert fake.calls == 2
+
+
+def test_a_rate_limited_answer_is_not_retried(client, gemini):
+    cid = new_interview(client)
+    fake = gemini(("Answer.", "STOP"))
+    fake.errors = [RATE_LIMIT]
+    events, _ = timed_ask(client, cid)
+    assert events[-1]["type"] == "error"
+    assert fake.calls == 1
+
+
+def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
+    monkeypatch.setattr(main.TRANSCRIBE_HEDGE, "minimum", 0.3)
+    cid = new_interview(client)
+    fake = gemini()
+    fake.transcript = "What is RAG?"
+    fake.delays = [10, 0]
+    started = time.perf_counter()
+    response = send_recording(client, cid)
+    assert time.perf_counter() - started < 5
+    assert response.json() == {"text": "What is RAG?"}
+    assert (fake.calls, fake.cancelled) == (2, 1)
+
+
+def test_the_retry_waits_twice_the_typical_time():
+    hedge = main.Hedge("test", minimum=3.0)
+    assert hedge.delay() == 3.0
+    hedge.recent.extend([1.0, 1.2, 1.4])
+    assert hedge.delay() == 3.0  # twice the typical 1.2 s is under the minimum
+    hedge.recent.clear()
+    hedge.recent.extend([2.0, 2.5, 30.0])
+    assert hedge.delay() == 5.0  # twice the typical (median) 2.5 s; one very slow reply barely counts

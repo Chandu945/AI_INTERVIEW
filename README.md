@@ -12,9 +12,14 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   stop, Gemini transcribes the recording again, using the role and the technical terms in your
   resume and job description as hints, and its version replaces the live words: proper
   punctuation and terms like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or
-  "fast api". This takes a few seconds. Anything you typed meanwhile is never overwritten; if
-  Gemini is unavailable or its text doesn't match what was heard, the live words stay. Turn it
+  "fast api". To save time, the recording is already sent whenever you pause, so the corrected
+  text is usually ready by the time you stop. Anything you typed meanwhile is never overwritten;
+  if Gemini is unavailable or its text doesn't match what was heard, the live words stay. Turn it
   off with "Improve the transcript with Gemini when you stop".
+- **Quick answers:** Gemini usually starts answering in 1 to 3 seconds, but now and then takes
+  10 to 30. If an answer (or a transcription) hasn't started after about twice the usual time,
+  the backend sends the request again and uses whichever replies first. The connection to Gemini
+  stays open between questions, so each question doesn't wait for a new one.
 - **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
 
 ## First-time setup (macOS)
@@ -93,8 +98,9 @@ not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
 
 The voice pause detection relies on the browser's SpeechRecognition events, so its accuracy and
 availability vary by browser. With transcript improvement on, each dictated question's recording
-is sent to Gemini (Chrome's live recognition also sends audio to Google), and each dictation makes
-one extra Gemini request, which counts toward your API key's rate limits. Model names in `.env.example` may need updating to models
+is sent to Gemini (Chrome's live recognition also sends audio to Google). Each dictation makes one
+or more extra Gemini requests (one per pause), and slow requests are sent twice; these count
+toward your API key's rate limits. Model names in `.env.example` may need updating to models
 available to your API key.
 
 Before updating an existing installation, back up `backend/chat.db`. Database columns are

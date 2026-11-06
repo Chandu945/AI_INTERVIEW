@@ -10,6 +10,7 @@ declare global {
     __emptyHistory: boolean;
     __streams: (intervalMs?: number, count?: number) => void;
     __say: (text: string) => void;
+    __sayInterim: (text: string) => void;
     __transcript: string | null;
     __transcriptDelayMs: number;
   }
@@ -98,6 +99,14 @@ function pageFakes() {
     const rec = recognitions[recognitions.length - 1];
     rec.results.push({ isFinal: true, 0: { transcript: text } });
     rec.onresult?.({ resultIndex: rec.results.length - 1, results: rec.results });
+  };
+  // Words still being recognized (not final yet).
+  window.__sayInterim = text => {
+    const rec = recognitions[recognitions.length - 1];
+    rec.onresult?.({
+      resultIndex: rec.results.length,
+      results: [...rec.results, { isFinal: false, 0: { transcript: text } }],
+    });
   };
 }
 

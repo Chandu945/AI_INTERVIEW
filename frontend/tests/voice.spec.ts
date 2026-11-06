@@ -73,6 +73,39 @@ test("when you stop, Gemini's transcript replaces the live words", async ({ page
   await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
 });
 
+test('after a pause, the improved transcript is ready as soon as you stop', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcript = 'What is RAG in LangChain?';
+    window.__transcriptDelayMs = 1_500;
+  });
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.waitForTimeout(300); // the recorder is running
+  await page.evaluate(() => window.__say('what is rag in lang chain')); // the pause sends the recording
+  await page.waitForTimeout(1_800);
+  await mic.click();
+  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG in LangChain?', { timeout: 700 });
+  expect(await transcribeRequests(page)).toBe(1);
+});
+
+test('words still being recognized when you stop get a fresh transcript', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcript = 'First part.';
+  });
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.__say('first part'));
+  await expect.poll(() => transcribeRequests(page)).toBe(1); // sent at the pause
+  await page.evaluate(() => {
+    window.__transcript = 'First part, and more.';
+    window.__sayInterim('and more');
+  });
+  await mic.click();
+  await expect(page.getByLabel('Your message')).toHaveValue('First part, and more.');
+  expect(await transcribeRequests(page)).toBe(2);
+});
+
 test('text typed during dictation is never overwritten', async ({ page }) => {
   await page.evaluate(() => {
     window.__transcript = 'This should not appear.';
@@ -91,7 +124,6 @@ test('text typed during dictation is never overwritten', async ({ page }) => {
   await mic.click();
   await expect(page.locator('.editor-top')).toContainText('Kept your edits');
   await expect(box).toHaveValue('first words and typed words');
-  expect(await transcribeRequests(page)).toBe(0); // no point asking Gemini
 });
 
 test('a transcript far longer than the live words is not used', async ({ page }) => {

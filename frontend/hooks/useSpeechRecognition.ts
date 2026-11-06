@@ -27,13 +27,17 @@ type Options = {
   /** The mic won't start while an answer is being generated. */
   busyRef: { current: boolean };
   setError: (message: string) => void;
-  /** Also record the audio, so it can be transcribed again more accurately when listening stops. */
+  /** Also record the audio, so it can be transcribed again more accurately. */
   record?: boolean;
+  /** Called at a pause, when every word heard so far is final, with the recording so far. */
+  onPhraseEnd?: (audio: Promise<Blob | null>) => void;
+  /** Called as listening stops, with the whole recording and whether words were still being recognized. */
+  onRecordingEnd?: (audio: Promise<Blob | null>, wordsPending: boolean) => void;
   /**
    * Called when the mic stops by itself after a pause (the "stop after silence" option), with
-   * the stop in progress. It resolves with the recording, if one was made.
+   * the stop in progress. It resolves once the last words are final.
    */
-  onSilenceStop?: (stopped: Promise<Blob | null>) => void;
+  onSilenceStop?: (stopped: Promise<void>) => void;
 };
 
 export type Speech = ReturnType<typeof useSpeechRecognition>;
@@ -50,6 +54,8 @@ export function useSpeechRecognition({
   busyRef,
   setError,
   record = false,
+  onPhraseEnd,
+  onRecordingEnd,
   onSilenceStop,
 }: Options) {
   const [listening, setListening] = useState(false);
@@ -63,7 +69,7 @@ export function useSpeechRecognition({
   const autoPauseRef = useRef(false);
 
   const recognitionRef = useRef<Recognition | null>(null);
-  const stopListeningRef = useRef<(() => Promise<Blob | null>) | null>(null);
+  const stopListeningRef = useRef<(() => Promise<void>) | null>(null);
   const sessionRef = useRef(0);
   const shouldListenRef = useRef(false);
   const stoppingRef = useRef(false);
@@ -73,16 +79,17 @@ export function useSpeechRecognition({
   const restartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopWaitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopFinalizeRef = useRef<(() => void) | null>(null);
-  // Always the latest callback, since the silence timer outlives the render that started it.
-  const onSilenceStopRef = useRef(onSilenceStop);
+  // Always the latest options, since speech callbacks and timers outlive the render that started them.
+  const optionsRef = useRef({ record, onPhraseEnd, onRecordingEnd, onSilenceStop });
   useEffect(() => {
-    onSilenceStopRef.current = onSilenceStop;
+    optionsRef.current = { record, onPhraseEnd, onRecordingEnd, onSilenceStop };
   });
-  const recordRef = useRef(record);
-  useEffect(() => {
-    recordRef.current = record;
-  });
-  const { start: startRecording, stop: stopRecording, cancel: cancelRecording } = useAudioRecorder();
+  const {
+    start: startRecording,
+    stop: stopRecording,
+    peek: peekRecording,
+    cancel: cancelRecording,
+  } = useAudioRecorder();
 
   const updateInterim = useCallback((value: string) => {
     interimRef.current = value;
@@ -141,7 +148,7 @@ export function useSpeechRecognition({
     if (silenceRef.current) clearTimeout(silenceRef.current);
     silenceRef.current = setTimeout(() => {
       const stop = stopListeningRef.current;
-      if (shouldListenRef.current && stop) onSilenceStopRef.current?.(stop());
+      if (shouldListenRef.current && stop) optionsRef.current.onSilenceStop?.(stop());
     }, 2200);
   }, []);
 
@@ -164,7 +171,7 @@ export function useSpeechRecognition({
     setListening(true);
     setStatus('Connecting microphone...');
     timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
-    if (recordRef.current) startRecording();
+    if (optionsRef.current.record) startRecording();
 
     const openRecognition = () => {
       if (sessionRef.current !== token || !shouldListenRef.current || stoppingRef.current) return;
@@ -192,6 +199,9 @@ export function useSpeechRecognition({
         if (addition) appendWords(addition);
         recognitionFinalRef.current = final;
         updateInterim(temporary.trim());
+        // A pause: every word heard so far is final, so the recording so far can be transcribed early.
+        if (addition && !temporary.trim() && !stoppingRef.current && optionsRef.current.record)
+          optionsRef.current.onPhraseEnd?.(peekRecording());
         setStatus(stoppingRef.current ? 'Finishing transcription...' : 'Listening live');
         if (autoPauseRef.current && (final.trim() || temporary.trim())) scheduleSilenceStop();
       };
@@ -236,15 +246,16 @@ export function useSpeechRecognition({
     finishStop,
     haltRecognition,
     language,
+    peekRecording,
     scheduleSilenceStop,
     setError,
     startRecording,
     updateInterim,
   ]);
 
-  /** Stops listening once the last words are final. Resolves with the recording, if one was made. */
-  const stopListening = useCallback(async (): Promise<Blob | null> => {
-    if (!shouldListenRef.current) return null;
+  /** Stops listening. Resolves once the last words are final. */
+  const stopListening = useCallback(async (): Promise<void> => {
+    if (!shouldListenRef.current) return;
     stoppingRef.current = true;
     shouldListenRef.current = false;
     clearTimers();
@@ -253,6 +264,7 @@ export function useSpeechRecognition({
     // The recording ends now, while live recognition gets a moment to finalize its last words.
     // (Taking it now also keeps it from being discarded by the halt below.)
     const audio = stopRecording();
+    optionsRef.current.onRecordingEnd?.(audio, Boolean(interimRef.current.trim()));
     const rec = recognitionRef.current;
     if (rec) {
       await new Promise<void>(resolve => {
@@ -271,7 +283,6 @@ export function useSpeechRecognition({
       });
     }
     haltRecognition(!rec);
-    return audio;
   }, [appendWords, clearTimers, finishStop, haltRecognition, stopRecording, updateInterim]);
 
   stopListeningRef.current = stopListening;

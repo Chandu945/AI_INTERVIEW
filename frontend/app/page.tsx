@@ -43,7 +43,7 @@ export default function Home() {
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
   const improver = useTranscriptImprover({ draftRef, updateDraft, conversationId });
-  const { begin: beginDictation, noteDictated, noteTyped, improve } = improver;
+  const { begin: beginDictation, noteDictated, noteTyped, prefetch, prepare, improve } = improver;
   // Only real words count as dictation (stopping also flushes an often-empty last phrase).
   const appendDictated = useCallback(
     (words: string) => {
@@ -66,6 +66,8 @@ export default function Home() {
     busyRef,
     setError,
     record: improver.enabled,
+    onPhraseEnd: prefetch,
+    onRecordingEnd: prepare,
     // Runs after a later render, by which time finish and sendMessage (defined below) exist.
     onSilenceStop: stopped => {
       void finish(stopped).then(() => {
@@ -85,7 +87,7 @@ export default function Home() {
   // that Send can wait for it.
   const finishingRef = useRef<Promise<void> | null>(null);
   const finish = useCallback(
-    (stopped: Promise<Blob | null>) => {
+    (stopped: Promise<void>) => {
       const done = stopped.then(improve).finally(() => {
         if (finishingRef.current === done) finishingRef.current = null;
       });
