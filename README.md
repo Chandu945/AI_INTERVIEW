@@ -5,33 +5,38 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
 
 - **New Interview:** target role, interview type (Technical, HR or Mixed), answer length, and an
   optional resume (PDF or DOCX) and job description for answers to draw on.
-- **Interview:** type or dictate questions (Chrome's speech recognition) and watch the answers
+- **Interview:** type or dictate questions (in Chrome) and watch the answers
   stream in. Optional auto-stop after a 2.2-second pause, with optional hands-free sending.
   Focus Mode, font sizes and copy buttons.
-- **More accurate dictation:** while you dictate, the app also records the microphone, and
-  Gemini transcribes the recording again, using the role and the technical terms in your resume
-  and job description as hints. Its version replaces the live words: proper punctuation and terms
-  like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or "fast api". This happens
-  as you go: at each pause, the recording so far is sent, and about 2 seconds later Gemini's
-  version replaces those words while you keep speaking, so the text is usually final by the time
-  you stop. If you press Send before it is, the question goes with its recording instead: one
-  Gemini request writes it down and answers it, so the answer starts about 2 to 3 seconds after
-  Send rather than after a transcript and then an answer. (To check the text before sending,
-  press Stop and wait for Gemini's version.) Anything you typed meanwhile is never overwritten,
-  and a question you typed in is sent as its text; if Gemini is unavailable or its text doesn't
-  match what was heard, the live words stay. Turn it off with "Improve the transcript with Gemini
-  as it listens".
+- **Accurate dictation:** Gemini writes down what you say from a recording, using the role and
+  the technical terms in your resume and job description as hints: every word, with punctuation
+  and terms like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or "fast api".
+  Chrome's live recognition only shows a preview, in gray: on long, nonstop speech it falls
+  behind and drops words. The recording is cut into pieces at short pauses, every 3 to 8 seconds
+  (in nonstop speech, at its quietest moment), and each piece goes to Gemini with the end of the
+  text so far, so that it carries on from it. Its text joins the box about 1 to 2 seconds later,
+  while you keep speaking, and when you stop, only the last piece is left to write down. If you
+  press Send while some of the text is still on its way, the question goes with its recording
+  instead: one Gemini request writes it down and answers it, so the answer starts about 2 to 3
+  seconds after Send. (To check the text before sending, press Stop and wait for the gray words
+  to turn black.) Anything you type meanwhile is kept, and a question you typed in is sent as its
+  text. If Gemini can't write a piece down (it's unavailable, or it returns more words than anyone
+  could say in that time), the piece is tried again with the next one, and then Chrome's words
+  for it are used. Given a piece with no one speaking in it (a pause with a fan, typing or music
+  in it), Gemini makes up a likely question, so such pieces aren't sent: only those Chrome heard
+  words in, or whose sound rises and falls as speech does, and Gemini is asked first whether
+  anyone speaks. Turn it off with "Improve the transcript with Gemini as it listens" to use
+  Chrome's words alone.
 - **Listen to a browser tab:** instead of the microphone, the app can listen to another Chrome
   tab, such as a YouTube video or a Google Meet call. Set "Listen to" to "A browser tab", press
   **Listen to tab**, pick the tab in Chrome's list and keep "Also share tab audio" on. Live words
   and the Gemini transcript work as with the mic, and you still hear the tab. The tab stays shared
   (Chrome shows its sharing bar), so the next Listen to tab doesn't ask again, until you press
-  Stop sharing or switch back to the microphone. A tab's words are improved as you go too, but a
-  class pauses after nearly every sentence and the answers share Gemini's free per-minute limit,
-  so a tab sends at most 3 transcriptions at once and then one every 6 seconds, and none after 2
-  minutes of listening. Only Chrome tabs are
-  covered: for sound from desktop apps (the Zoom app, say), share your whole screen instead,
-  where Chrome may offer the computer's sound.
+  Stop sharing or switch back to the microphone. A tab is written down piece by piece for as
+  long as you listen, a whole class if need be; a question is sent with its recording only if
+  it's under 2 minutes long, and otherwise waits for its text. Only Chrome tabs are covered: for
+  sound from desktop apps (the Zoom app, say), share your whole screen instead, where Chrome may
+  offer the computer's sound.
 - **Quick answers:** the default model, Gemini 3.5 Flash-Lite, was the quickest and steadiest in
   tests (November 2026): typed questions are answered within about 1 to 2 seconds, and it stalled
   once in about 50 tries, where Gemini 3.1 Flash-Lite often did, for 5 to 30 seconds. Still,
@@ -78,7 +83,7 @@ that, set `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (see `frontend/.env.loc
 | Setting | What it does |
 | --- | --- |
 | `GEMINI_API_KEY` | Your Gemini API key (required). |
-| `GEMINI_MODEL` | The model that writes the answers and improves dictated questions (default `gemini-3.5-flash-lite`). |
+| `GEMINI_MODEL` | The model that writes the answers and writes down dictated questions (default `gemini-3.5-flash-lite`). |
 | `GEMINI_THINKING_LEVEL` | Optional, for Gemini 3 models: `minimal`, `low`, `medium` or `high`. Less thinking is faster; leave unset for the model's default. |
 | `GEMINI_THINKING_BUDGET` | Optional, the same for older models as a token budget (`0` turns thinking off). |
 | `GEMINI_BACKUP_MODEL` | Optional: the model a slow or failed request is also sent to (default `gemini-3.1-flash-lite`). It answers with minimal thinking, so it must be a Gemini 3 model. If it refuses (say, a free-tier daily limit is used up), retries go to `GEMINI_MODEL` until Google says to try again. Set it empty to always retry with `GEMINI_MODEL`. |
@@ -119,12 +124,12 @@ backend publicly without authentication, TLS, access controls and secure storage
 `INTERACT_ACCESS_TOKEN` needs a client that sends `X-Interact-Token`; the bundled frontend does
 not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
 
-The voice pause detection relies on the browser's SpeechRecognition events, so its accuracy and
-availability vary by browser. With transcript improvement on, each dictated question's recording
-is sent to Gemini (Chrome's live recognition also sends audio to Google). Each dictation makes one
-or more extra Gemini requests (one per pause; with a tab, at most one every 6 seconds after the
-first three), and slow requests are sent twice; these count toward your API key's rate limits. Model names in
-`.env.example` may need updating to models available to your API key.
+Live dictation needs the browser's SpeechRecognition (Chrome), so availability varies by
+browser. With transcript improvement on, everything you dictate is recorded and sent to Gemini
+(Chrome's live recognition also sends audio to Google): one request per piece, every 3 to 8
+seconds while you speak, and slow requests are sent twice. These count toward your API key's
+rate limits and bill. Model names in `.env.example` may need updating to models available to
+your API key.
 
 Before updating an existing installation, back up `backend/chat.db`. Database columns are
 migrated at startup.

@@ -1,11 +1,22 @@
 import { expect, test, type Page } from '@playwright/test';
-import { forgetRequests, openApp, openInterview, transcribeRequests } from './helpers';
+import {
+  chatUrls,
+  cutPiece,
+  forgetRequests,
+  openApp,
+  openInterview,
+  transcribeRequests,
+  waitForAnswer,
+} from './helpers';
 
 // Listening to a browser tab instead of the mic. Chrome's share picker and speech recognition
 // are faked (see helpers.ts): the shared tab's sound is a test tone, and window.__say() stands
-// in for what the tab says.
+// in for what the tab says. window.__transcripts gives the text Gemini writes for each piece of
+// the recording, in turn (window.__transcript, any further piece's).
 
 const shares = (page: Page) => page.evaluate(() => window.__tabShares);
+// The tab keeps talking: Chrome hears words all along.
+const keepTalking = (page: Page) => page.evaluate(() => setInterval(() => window.__sayInterim('words'), 100));
 const sharedSound = (page: Page) =>
   page.evaluate(() => window.__sharedTracks.find(track => track.kind === 'audio')?.readyState);
 
@@ -33,7 +44,7 @@ test("a tab's sound is listened to instead of the mic, and the tab stays shared"
     }),
   ).toEqual({ heard: true, picture: 'ended' });
   await page.evaluate(() => window.__say('what is a pod in cuba net is'));
-  await page.waitForTimeout(500); // let the recorder capture some audio
+  await page.waitForTimeout(1_000); // let the recorder capture some audio
   await listen.click();
   await expect(page.getByLabel('Your message')).toHaveValue('What is a pod in Kubernetes?');
   await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
@@ -44,31 +55,65 @@ test("a tab's sound is listened to instead of the mic, and the tab stays shared"
   expect(await shares(page)).toBe(1);
 });
 
-test("a tab's words are improved live, with at most 3 transcriptions at once", async ({ page }) => {
+test("a tab's sound is cut into pieces at its pauses, each written down as it comes", async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcripts = ['One.', 'One, two.', 'One, two, three.', 'One, two, three, four.'];
+    window.__tabPauses = true; // 0.6 s of sound, then 0.4 s of quiet, over and over
+    window.__pieceTimings = { min: 0.5, max: 5, quiet: 0.2, silence: 0 };
+    window.__transcripts = ['One.', 'Two.', 'Three.'];
+    window.__transcript = '';
+  });
+  const listen = page.locator('.mic-btn');
+  await listen.click();
+  await keepTalking(page);
+  // Cut at the pauses, about a second apart (cut only at the 5 s limit, they'd take 15 s).
+  await expect(page.getByLabel('Your message')).toHaveValue('One. Two. Three.', { timeout: 6_000 });
+  await expect(listen).toContainText('Stop listening'); // all while listening
+  // Each went with the text so far.
+  expect(await page.evaluate(() => window.__contexts.slice(0, 3))).toEqual(['', 'One.', 'One. Two.']);
+});
+
+test("a tab's sound with no pause in it is cut every so often", async ({ page }) => {
+  await page.evaluate(() => {
+    window.__pieceTimings = { min: 0.5, max: 1, quiet: 0.2, silence: 0 };
+    window.__transcripts = ['One.', 'Two.'];
+    window.__transcript = '';
+  });
+  const listen = page.locator('.mic-btn');
+  await listen.click();
+  await keepTalking(page);
+  await expect(page.getByLabel('Your message')).toHaveValue('One. Two.', { timeout: 5_000 });
+  await expect(listen).toContainText('Stop listening');
+});
+
+test("a piece with a steady sound and no words in it isn't sent, as Gemini would make words up", async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcripts = ['One.'];
+    window.__transcript = '';
   });
   await forgetRequests(page);
   const listen = page.locator('.mic-btn');
-  const box = page.getByLabel('Your message');
   await listen.click();
-  await page.waitForTimeout(300); // the recorder is running
-  for (const [words, shown] of [
-    ['one', 'One.'],
-    ['two', 'One, two.'],
-    ['three', 'One, two, three.'],
-  ]) {
-    await page.evaluate(text => window.__say(text), words); // a pause: sends the recording so far
-    await expect(box).toHaveValue(shown);
-  }
-  // A fourth pause right away is skipped: after 3 at once, a tab sends one every 6 seconds.
-  await page.evaluate(() => window.__say('four'));
+  await page.waitForTimeout(500); // the tab's steady tone: sound, but nothing like speech
+  await cutPiece(page);
+  await page.evaluate(() => window.__say('one'));
+  await cutPiece(page);
+  await expect(page.getByLabel('Your message')).toHaveValue('One.');
+  await page.waitForTimeout(300); // nor the last piece
+  await listen.click();
   await page.waitForTimeout(300);
-  await expect(box).toHaveValue('One, two, three. four');
-  expect(await transcribeRequests(page)).toBe(3);
-  await listen.click(); // so the last words are transcribed at Stop
-  await expect(box).toHaveValue('One, two, three, four.');
-  expect(await transcribeRequests(page)).toBe(4);
+  expect(await transcribeRequests(page)).toBe(1); // only the piece with words
+});
+
+test('a piece that sounds like speech goes even if Chrome heard no words in it', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__tabPauses = true; // sound that comes and goes, as speech does
+    window.__transcripts = ['Words Chrome missed.'];
+    window.__transcript = '';
+  });
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(1_200);
+  await cutPiece(page);
+  await expect(page.getByLabel('Your message')).toHaveValue('Words Chrome missed.');
 });
 
 test("Chrome's Stop sharing stops listening and keeps the words; the next start asks again", async ({ page }) => {
@@ -129,9 +174,11 @@ test('Stop sharing, or switching back to the microphone, stops sharing the tab',
   await expect(listen).toContainText('Start speaking');
 });
 
-test('a tab recording over 2 minutes keeps the live text', async ({ page }) => {
+test('a recording over 2 minutes is not sent with the question: its text is', async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcript = 'This should not appear.';
+    window.__streams(50, 5);
+    window.__transcript = 'A long lecture.';
+    window.__transcriptDelayMs = 1_000; // still being written down at Send
     // Make every recording look 5 minutes long (16 kHz 16-bit audio is 32,000 bytes a second).
     const size = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')!.get!;
     Object.defineProperty(Blob.prototype, 'size', {
@@ -144,12 +191,13 @@ test('a tab recording over 2 minutes keeps the live text', async ({ page }) => {
   await forgetRequests(page);
   const listen = page.locator('.mic-btn');
   await listen.click();
-  await page.evaluate(() => window.__say('a long lecture about networking'));
+  await page.evaluate(() => window.__say('a long lecture'));
   await page.waitForTimeout(500);
   await listen.click();
-  await expect(page.locator('.editor-top')).toContainText('Long recording, so the live text was kept');
-  await expect(page.getByLabel('Your message')).toHaveValue('a long lecture about networking');
-  expect(await transcribeRequests(page)).toBe(0);
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.message.user').last()).toContainText('A long lecture.');
+  await waitForAnswer(page);
+  expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]);
 });
 
 test('the choice to listen to a tab is remembered', async ({ page }) => {

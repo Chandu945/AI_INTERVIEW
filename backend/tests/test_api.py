@@ -307,6 +307,39 @@ def test_transcription_uses_the_interview_as_hints(client, gemini):
     assert audio.inline_data.mime_type == "audio/wav"
 
 
+def test_a_piece_of_a_longer_recording_carries_on_from_the_text_so_far(client, gemini):
+    cid = new_interview(client)
+    fake = gemini()
+    fake.transcript = "and when would you use each one?"
+    response = client.post(
+        f"/api/conversations/{cid}/transcribe",
+        files={"file": ("piece.wav", silence_wav(), "audio/wav")},
+        data={"context": "What is the difference between a Deployment and a StatefulSet?"},
+    )
+    assert response.json() == {"text": "and when would you use each one?"}
+    prompt, _ = fake.contents[0].parts
+    assert 'which ends: "What is the difference between a Deployment and a StatefulSet?"' in prompt.text
+    assert "Do not repeat it." in prompt.text
+    send_recording(client, cid)  # without context: no such sentence
+    assert "continues what was said" not in fake.contents[0].parts[0].text
+
+
+def test_gemini_says_first_whether_anyone_speaks(client, gemini):
+    cid = new_interview(client)
+    fake = gemini()
+    for reply, text in (
+        ("SPEECH: yes\nWhat is a pod?", "What is a pod?"),
+        ("**SPEECH: yes**\n\nWhat is a pod?", "What is a pod?"),
+        ("SPEECH: yes What is a pod?", "What is a pod?"),
+        ("SPEECH: no", ""),
+        ("Speech: No.\nWhat is a pod?", ""),  # made up: no one spoke
+        ("What is a pod?", "What is a pod?"),  # no answer to that: the reply is the transcript
+    ):
+        fake.transcript = reply
+        assert send_recording(client, cid).json() == {"text": text}
+    assert '"SPEECH: no" if it holds only silence, noise, music' in fake.contents[0].parts[0].text
+
+
 def test_vocabulary_picks_technical_words():
     text = "We use PostgreSQL, GPT-4, Node.js, C++ and AWS. Python is great; so is the team."
     assert main.vocabulary(text) == ["PostgreSQL", "GPT-4", "Node.js", "C++", "AWS"]

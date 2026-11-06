@@ -1,12 +1,32 @@
 import { expect, test, type Page } from '@playwright/test';
-import { chatRequests, forgetRequests, openApp, openInterview, transcribeRequests, waitForAnswer } from './helpers';
+import {
+  chatRequests,
+  chatUrls,
+  cutPiece,
+  forgetRequests,
+  openApp,
+  openInterview,
+  transcribeRequests,
+  waitForAnswer,
+} from './helpers';
 
-// Speech recognition is faked (see helpers.ts), so window.__say() stands in for speaking.
+// Speech recognition is faked (see helpers.ts), so window.__say() stands in for speaking. Gemini
+// writes the text down from the recording, piece by piece: cutPiece() cuts a piece off, as a pause
+// would, and window.__transcripts gives each piece's text in turn (window.__transcript, any further
+// piece's). Without them, transcription fails: the test backend has no Gemini key.
 
 test.beforeEach(async ({ page }) => {
   await openApp(page);
   await openInterview(page, 'Demo interview');
 });
+
+/** Where Start/Stop and Send are on the page. */
+const layout = (page: Page) =>
+  page.evaluate(() => {
+    const top = (selector: string) =>
+      Math.round(document.querySelector(selector)!.getBoundingClientRect().top + scrollY);
+    return { mic: top('.mic-btn'), send: top('.btn.primary') };
+  });
 
 test('turning auto-stop on while the mic is on stops it after the pause', async ({ page }) => {
   const mic = page.locator('.mic-btn');
@@ -15,6 +35,7 @@ test('turning auto-stop on while the mic is on stops it after the pause', async 
   await page.evaluate(() => window.__say('hello there'));
   await page.getByLabel(/Stop listening after 2.2s/).check();
   await expect(mic).toContainText('Start speaking', { timeout: 4_000 });
+  // Gemini can't write it down here, so Chrome's words are used.
   await expect(page.getByLabel('Your message')).toHaveValue('hello there');
 });
 
@@ -58,174 +79,145 @@ test('with hands-free sending on, a pause sends the question', async ({ page }) 
   expect(await chatRequests(page)).toBe(1);
 });
 
-test('words still being recognized show in gray in the box, and the buttons stay put', async ({ page }) => {
+test('words not written down yet show in gray in the box, and the buttons stay put', async ({ page }) => {
   // Narrow enough for the longer status messages to need cutting short.
   await page.setViewportSize({ width: 1280, height: 800 });
+  await page.evaluate(() => {
+    window.__transcripts = ['So, like this.']; // after it, transcription fails
+  });
   const box = page.getByLabel('Your message');
   const gray = page.locator('.ghost-words');
-  // Where Start/Stop and Send are on the page.
-  const layout = () =>
-    page.evaluate(() => {
-      const top = (selector: string) =>
-        Math.round(document.querySelector(selector)!.getBoundingClientRect().top + scrollY);
-      return { mic: top('.mic-btn'), send: top('.btn.primary') };
-    });
-  // Whether the gray words are within the box's visible area.
-  const grayInView = () =>
-    page.evaluate(() => {
-      const area = document.querySelector('textarea')!.getBoundingClientRect();
-      const words = document.querySelector('.ghost-words')!.getBoundingClientRect();
-      return words.top >= area.top && words.bottom <= area.bottom;
-    });
-  const before = await layout();
+  const before = await layout(page);
   const mic = page.locator('.mic-btn');
   await mic.click();
   await expect(page.getByRole('button', { name: /Send/ })).toBeEnabled(); // even before any words
   await page.evaluate(() => window.__sayInterim('so like this'));
   await expect(gray).toHaveText('so like this');
-  await expect(box).toHaveValue(''); // gray words aren't part of the text until they're final
+  await expect(box).toHaveValue(''); // gray words aren't part of the text until Gemini has written them down
   await expect(box).toHaveAttribute('placeholder', ''); // nor drawn over the box's hint
-  expect(await layout()).toEqual(before);
-  // A long dictation: the box scrolls to keep the newest gray words in view.
-  await page.evaluate(() => {
-    for (let i = 0; i < 6; i++)
-      window.__say('explain how kubernetes schedules pods across nodes and what happens when a node fails');
-    window.__sayInterim('so how would you make sure the stateful pods keep their volumes and identities');
-  });
-  await expect(gray).toHaveText(' so how would you make sure the stateful pods keep their volumes and identities');
-  expect(await grayInView()).toBe(true);
-  expect(await layout()).toEqual(before);
-  await page.evaluate(() => window.__say('so how would you make sure the stateful pods keep their volumes'));
-  await expect(gray).toHaveCount(0); // final now, so part of the text
-  await expect(box).toHaveValue(/keep their volumes$/);
-  expect(await layout()).toEqual(before);
-  await page.waitForTimeout(500); // let the recorder capture some audio
-  await mic.click(); // the test backend has no Gemini key, so this ends with a long message
-  await expect(page.locator('.editor-top')).toContainText("Couldn't improve the transcript");
-  expect(await layout()).toEqual(before);
+  expect(await layout(page)).toEqual(before);
+  await cutPiece(page);
+  await expect(box).toHaveValue('So, like this.');
+  await expect(gray).toHaveCount(0);
+  expect(await layout(page)).toEqual(before);
+  // The last piece can't be written down, so this ends with a long message.
+  await page.evaluate(() => window.__say('and the stateful pods keep their volumes'));
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText("Gemini couldn't write some of it down");
+  await expect(box).toHaveValue('So, like this. and the stateful pods keep their volumes');
+  expect(await layout(page)).toEqual(before);
   await expect(page.locator('.interim')).toHaveCount(0); // no separate strip under the box
 });
 
-// Polishing: the recording is transcribed again by Gemini when dictation stops.
+test('a long text scrolls to keep the newest gray words in view', async ({ page }) => {
+  const box = page.getByLabel('Your message');
+  const sentence = 'Explain how Kubernetes schedules pods across nodes and what happens when a node fails.';
+  await box.fill(Array(16).fill(sentence).join(' '));
+  const before = await layout(page);
+  await page.locator('.mic-btn').click();
+  await page.evaluate(() => window.__sayInterim('so how would you make sure the stateful pods keep their volumes'));
+  await expect(page.locator('.ghost-words')).toHaveText(
+    ' so how would you make sure the stateful pods keep their volumes',
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const box = document.querySelector('textarea')!;
+        const area = box.getBoundingClientRect();
+        const words = document.querySelector('.ghost-words')!.getBoundingClientRect();
+        return box.scrollTop > 0 && words.top >= area.top && words.bottom <= area.bottom;
+      }),
+    )
+    .toBe(true);
+  expect(await layout(page)).toEqual(before);
+});
 
-test("when you stop, Gemini's transcript replaces the live words", async ({ page }) => {
+test('Gemini writes each piece down as it comes, carrying on from the text so far', async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcript = 'What is RAG in LangChain?';
+    window.__transcripts = ['What is RAG?', 'How does LangChain use it?'];
+    window.__transcriptDelays = [1_500, 800]; // the second piece is cut while the first is still out
+    window.__transcript = ''; // any further piece: nothing more was said
+  });
+  const mic = page.locator('.mic-btn');
+  const box = page.getByLabel('Your message');
+  const gray = page.locator('.ghost-words');
+  await mic.click();
+  await page.evaluate(() => window.__say('what is rag'));
+  await cutPiece(page);
+  await page.waitForTimeout(800); // long enough for the second piece's words
+  await page.evaluate(() => window.__say('how does lang chain use it'));
+  await cutPiece(page);
+  await expect(gray).toHaveText('what is rag how does lang chain use it');
+  expect(await transcribeRequests(page)).toBe(1); // one piece at a time, in order
+  await expect(box).toHaveValue('What is RAG?');
+  await expect(gray).toHaveText(' how does lang chain use it');
+  await expect(box).toHaveValue('What is RAG? How does LangChain use it?');
+  await expect(gray).toHaveCount(0);
+  await expect(mic).toContainText('Stop listening'); // all while listening
+  // Each piece went with the text so far, so Gemini carries on from it.
+  expect(await page.evaluate(() => window.__contexts)).toEqual(['', 'What is RAG?']);
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
+  await expect(box).toHaveValue('What is RAG? How does LangChain use it?');
+});
+
+test("a piece Gemini can't write down goes again with the next one", async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcripts = [null, 'First part, second part.']; // the first try fails
+    window.__transcript = '';
   });
   const mic = page.locator('.mic-btn');
   await mic.click();
-  await page.evaluate(() => window.__say('what is rag in lang chain'));
-  await page.waitForTimeout(500); // let the recorder capture some audio
+  await page.evaluate(() => window.__say('first part'));
+  await cutPiece(page);
+  await page.waitForTimeout(500);
+  expect(await transcribeRequests(page)).toBe(1); // not tried again on its own
+  await expect(page.locator('.ghost-words')).toHaveText('first part');
+  await page.evaluate(() => window.__say('second part'));
+  await cutPiece(page);
+  await expect(page.getByLabel('Your message')).toHaveValue('First part, second part.');
+  expect(await transcribeRequests(page)).toBe(2);
   await mic.click();
-  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG in LangChain?');
   await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
 });
 
-test('after a pause, the improved transcript is ready as soon as you stop', async ({ page }) => {
+test('the last piece is written down when you stop', async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcript = 'What is RAG in LangChain?';
-    window.__transcriptDelayMs = 1_500;
+    window.__transcript = 'What is a closure?';
+    window.__transcriptDelayMs = 500;
   });
   const mic = page.locator('.mic-btn');
   await mic.click();
-  await page.waitForTimeout(300); // the recorder is running
-  await page.evaluate(() => window.__say('what is rag in lang chain')); // the pause sends the recording
-  await page.waitForTimeout(1_800);
+  await page.evaluate(() => window.__say('what is a closure'));
+  await page.waitForTimeout(500); // let the recorder capture some audio
   await mic.click();
-  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG in LangChain?', { timeout: 700 });
+  await expect(page.locator('.ghost-words')).toHaveText('what is a closure'); // until it's written down
+  await expect(page.locator('.editor-top')).toContainText('Improving the transcript with Gemini');
+  await expect(page.getByLabel('Your message')).toHaveValue('What is a closure?');
+  await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
   expect(await transcribeRequests(page)).toBe(1);
 });
 
-test("at each pause, Gemini's version replaces the words while still listening", async ({ page }) => {
+test('text typed during dictation is kept, with the words written down after it', async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcripts = ['What is RAG?', 'What is RAG? How does LangChain use it?'];
+    window.__transcripts = ['First words.', 'More words.'];
+    window.__transcript = '';
   });
   const mic = page.locator('.mic-btn');
   const box = page.getByLabel('Your message');
   await mic.click();
-  await page.waitForTimeout(300); // the recorder is running
-  await page.evaluate(() => window.__say('what is rag'));
-  await expect(box).toHaveValue('What is RAG?');
-  await page.evaluate(() => window.__say('how does lang chain use it'));
-  await expect(box).toHaveValue('What is RAG? How does LangChain use it?');
-  await expect(mic).toContainText('Stop listening'); // all while listening
-  await mic.click();
-  // Nothing was left to transcribe at Stop.
-  await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
-  await expect(box).toHaveValue('What is RAG? How does LangChain use it?');
-  expect(await transcribeRequests(page)).toBe(2);
-});
-
-test('a transcript that comes back while more words arrive keeps the newer words', async ({ page }) => {
-  await page.evaluate(() => {
-    window.__transcripts = ['First part.', 'First part, second part.'];
-    window.__transcriptDelays = [400, 800];
-  });
-  const box = page.getByLabel('Your message');
-  await page.locator('.mic-btn').click();
-  await page.waitForTimeout(300);
-  await page.evaluate(() => window.__say('first part'));
-  await page.waitForTimeout(100);
-  await page.evaluate(() => window.__say('second part')); // the first transcript is still on its way
-  await expect(box).toHaveValue('First part. second part'); // the first is swapped in; later words stay
-  await expect(box).toHaveValue('First part, second part.'); // then the second, which covers both
-});
-
-test('an older transcript coming back late never replaces a newer one', async ({ page }) => {
-  await page.evaluate(() => {
-    window.__transcripts = ['First part.', 'First part, second part.'];
-    window.__transcriptDelays = [1_200, 0];
-  });
-  const box = page.getByLabel('Your message');
-  await page.locator('.mic-btn').click();
-  await page.waitForTimeout(300);
-  await page.evaluate(() => window.__say('first part')); // slow to come back
-  await page.waitForTimeout(100);
-  await page.evaluate(() => window.__say('second part')); // back at once
-  await expect(box).toHaveValue('First part, second part.');
-  await page.waitForTimeout(1_400); // the first one has come back by now
-  await expect(box).toHaveValue('First part, second part.');
-});
-
-test('words still being recognized when you stop get a fresh transcript', async ({ page }) => {
-  await page.evaluate(() => {
-    window.__transcript = 'First part.';
-  });
-  const mic = page.locator('.mic-btn');
-  await mic.click();
-  await page.waitForTimeout(300);
-  await page.evaluate(() => window.__say('first part'));
-  await expect.poll(() => transcribeRequests(page)).toBe(1); // sent at the pause
-  await page.evaluate(() => {
-    window.__transcript = 'First part, and more.';
-    window.__sayInterim('and more');
-  });
-  await mic.click();
-  await expect(page.getByLabel('Your message')).toHaveValue('First part, and more.');
-  expect(await transcribeRequests(page)).toBe(2);
-});
-
-test('text typed during dictation is never overwritten', async ({ page }) => {
-  await page.evaluate(() => {
-    window.__transcript = 'This should not appear.';
-  });
-  const mic = page.locator('.mic-btn');
-  const box = page.getByLabel('Your message');
-  await mic.click();
+  await page.evaluate(() => window.__say('first words'));
+  await cutPiece(page);
+  await expect(box).toHaveValue('First words.');
   await box.focus();
-  // Something typed the instant the words arrive must not wipe them out.
-  await page.evaluate(() => {
-    window.__say('first words');
-    document.execCommand('insertText', false, ' and');
-  });
-  await box.pressSequentially(' typed words');
-  await page.waitForTimeout(500);
+  await box.press('End');
+  await box.pressSequentially(' And typed ones.');
+  await page.evaluate(() => window.__say('more words'));
   await mic.click();
-  await expect(page.locator('.editor-top')).toContainText('Kept your edits');
-  await expect(box).toHaveValue('first words and typed words');
+  await expect(box).toHaveValue('First words. And typed ones. More words.');
 });
 
-test('a transcript far longer than the live words is not used', async ({ page }) => {
+test('a transcript with far more words than were said is not used', async ({ page }) => {
   await page.evaluate(() => {
     // Gemini answering the question instead of writing it down.
     window.__transcript =
@@ -236,60 +228,101 @@ test('a transcript far longer than the live words is not used', async ({ page })
   await page.evaluate(() => window.__say('what is a closure'));
   await page.waitForTimeout(500);
   await mic.click();
-  await expect(page.locator('.editor-top')).toContainText("Couldn't improve the transcript");
+  await expect(page.locator('.editor-top')).toContainText("Gemini couldn't write some of it down");
   await expect(page.getByLabel('Your message')).toHaveValue('what is a closure');
 });
 
-test('a slow transcript is dropped once you start speaking again', async ({ page }) => {
+test("if Gemini can't write it down, Chrome's words are used", async ({ page }) => {
+  // No fake transcript: the test backend has no Gemini key, so transcription fails.
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('what is a vector database'));
+  await page.waitForTimeout(300);
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText(
+    "Gemini couldn't write some of it down, so Chrome's words were kept there",
+  );
+  await expect(page.getByLabel('Your message')).toHaveValue('what is a vector database');
+  expect(await transcribeRequests(page)).toBe(2); // it was tried twice
+});
+
+test("if Gemini hears no one where Chrome heard words, Chrome's words are used", async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcript = 'First question.';
-    window.__transcriptDelayMs = 1_500;
+    window.__transcripts = ['']; // Gemini: no one speaks in it
   });
   const mic = page.locator('.mic-btn');
-  const box = page.getByLabel('Your message');
+  await mic.click();
+  await page.evaluate(() => window.__say('quiet words'));
+  await cutPiece(page);
+  await expect(page.getByLabel('Your message')).toHaveValue('quiet words');
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText("Chrome's words were kept there");
+});
+
+test('Clear drops the words still being written down', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcripts = ['Not this.'];
+    window.__transcriptDelays = [800];
+    window.__transcript = '';
+  });
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('not this'));
+  await cutPiece(page);
+  await page.getByRole('button', { name: 'Clear' }).click();
+  await expect(page.locator('.ghost-words')).toHaveCount(0);
+  await page.waitForTimeout(1_000); // its text has come back by now
+  await expect(page.getByLabel('Your message')).toHaveValue('');
+  await expect(mic).toContainText('Stop listening'); // still listening, afresh
+});
+
+test("a slow piece from the last dictation lands before the next one's words", async ({ page }) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcripts = ['First question.', 'Second part.'];
+    window.__transcriptDelays = [1_500, 0];
+    window.__transcript = '';
+  });
+  await forgetRequests(page);
+  const mic = page.locator('.mic-btn');
   await mic.click();
   await page.evaluate(() => window.__say('first question'));
-  await page.waitForTimeout(500);
-  await mic.click(); // its transcript arrives 1.5 s later, during the next dictation
+  await page.waitForTimeout(300);
+  await mic.click(); // its text comes 1.5 s later, during the next dictation
   await expect.poll(() => transcribeRequests(page)).toBe(1);
-  await page.evaluate(() => {
-    window.__transcript = 'Second part.';
-    window.__transcriptDelayMs = 0;
-  });
   await mic.click();
-  await page.waitForTimeout(300); // the recorder is running
+  await expect(mic).toContainText('Stop listening');
   await page.evaluate(() => window.__say('second part'));
-  await page.waitForTimeout(2_000);
-  // Only this dictation's own transcript is swapped in, never the first one's.
-  await expect(box).toHaveValue('first question Second part.');
-  await mic.click();
-  await expect(box).toHaveValue('first question Second part.');
+  await cutPiece(page);
+  await expect(page.locator('.ghost-words')).toHaveText('first question second part');
+  // Sending waits for both, as text: this dictation's recording alone would miss the first part.
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.message.user').last()).toContainText('First question. Second part.');
+  await waitForAnswer(page);
+  expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]);
 });
 
 test('pressing the mic again while it is still stopping is ignored', async ({ page }) => {
-  await page.evaluate(() => {
-    window.__transcript = 'First question.';
-  });
+  // With Chrome's words as the text, stopping waits a moment for its last ones.
+  await page.getByLabel(/Improve the transcript/).uncheck();
   const mic = page.locator('.mic-btn');
   await mic.click();
   await page.evaluate(() => window.__say('first question'));
-  await page.waitForTimeout(500);
   await mic.dblclick(); // stop, then at once start again
-  await expect(page.getByLabel('Your message')).toHaveValue('First question.');
+  await expect(page.getByLabel('Your message')).toHaveValue('first question');
   await page.waitForTimeout(1_000); // past the longest wait for the last words
   await expect(mic).toContainText('Start speaking');
-  await expect(page.getByLabel('Your message')).toHaveValue('First question.');
+  await expect(page.getByLabel('Your message')).toHaveValue('first question');
 });
 
 test('a second Send while the first is still going out does not send twice', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
     window.__transcript = 'What is a closure?';
-    window.__transcriptDelayMs = 1_000;
   });
   await forgetRequests(page);
   await page.locator('.mic-btn').click();
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(300); // the recorder is running
   await page.evaluate(() => window.__say('what is a closure'));
   await page.waitForTimeout(200);
   // Two clicks at once, as a quick double-click: the first stops the mic and sends; the second is ignored.
@@ -304,39 +337,38 @@ test('a second Send while the first is still going out does not send twice', asy
   await expect(page.locator('.error-banner')).toHaveCount(0);
 });
 
-// Sending while the transcript isn't final yet: the question goes with its recording, and one
-// Gemini request writes it down and answers it.
+// Sending before all the text is in: the question goes with its recording, and one Gemini
+// request writes it down and answers it.
 
-const chatUrls = (page: Page) => page.evaluate(() => window.__requests.filter(url => url.includes('/api/chat')));
-
-test('Send before the transcript is final sends the recording, and Gemini writes the question down', async ({
+test('Send while a piece is being written down sends the recording, and Gemini writes the question down', async ({
   page,
 }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
     window.__transcript = 'What is RAG in LangChain?';
-    window.__transcriptDelayMs = 2_000; // the pause's transcript is still on its way at Send
+    window.__transcriptDelayMs = 2_000; // the piece is still out at Send
   });
   await forgetRequests(page);
   const box = page.getByLabel('Your message');
   await page.locator('.mic-btn').click();
-  await page.waitForTimeout(300); // the recorder is running
   await page.evaluate(() => window.__say('what is rag in lang chain'));
+  await page.waitForTimeout(300); // the recorder is running
+  await cutPiece(page);
   await page.getByRole('button', { name: /Send/ }).click();
   await expect(page.locator('.message.user').last()).toContainText('What is RAG in LangChain?');
   await waitForAnswer(page);
+  expect(await page.evaluate(() => window.__heard)).toBe('what is rag in lang chain');
   expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]);
   await expect(box).toHaveValue('');
-  await page.waitForTimeout(2_000); // the transcript comes back, and leaves the box alone
+  await page.waitForTimeout(2_000); // the piece's text comes back, and leaves the box alone
   await expect(box).toHaveValue('');
   await expect(page.locator('.editor-top')).not.toContainText('Transcript improved');
 });
 
-test('Send while words are still being recognized goes at once, without waiting for them', async ({ page }) => {
+test('Send while words are still being heard goes at once, without waiting for them', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
     window.__transcript = 'What is RAG, and how does LangChain use it?';
-    window.__transcriptDelayMs = 2_000; // the pause's transcript is still on its way at Send
   });
   await forgetRequests(page);
   const box = page.getByLabel('Your message');
@@ -349,26 +381,28 @@ test('Send while words are still being recognized goes at once, without waiting 
   await page.getByRole('button', { name: /Send/ }).click();
   await expect(page.locator('.message.user').last()).toContainText('What is RAG, and how does LangChain use it?');
   await waitForAnswer(page);
-  // The recording went with the live words so far, the unfinished ones included.
+  // The recording went with the words heard so far, the unfinished ones included.
   expect(await page.evaluate(() => window.__heard)).toBe('what is rag and how does lang chain');
   expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]);
-  // The recognizer was stopped at once: its late words never land in the box, nor does the
-  // transcript that comes back afterwards.
+  // Recognition was stopped at once: its late words never land in the box.
   await page.evaluate(() => window.__say('and how does lang chain use it'));
-  await page.waitForTimeout(2_000);
+  await page.waitForTimeout(500);
   await expect(box).toHaveValue('');
   await expect(page.locator('.mic-btn')).toContainText('Start speaking');
+  expect(await transcribeRequests(page)).toBe(0);
 });
 
-test('Send once the transcript is final sends its text', async ({ page }) => {
+test('Send once all the text is in sends the text', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
-    window.__transcript = 'What is RAG in LangChain?';
+    window.__transcripts = ['What is RAG in LangChain?'];
+    window.__transcript = '';
   });
   await forgetRequests(page);
   await page.locator('.mic-btn').click();
-  await page.waitForTimeout(300);
   await page.evaluate(() => window.__say('what is rag in lang chain'));
+  await page.waitForTimeout(800); // long enough for its words
+  await cutPiece(page);
   await expect(page.getByLabel('Your message')).toHaveValue('What is RAG in LangChain?');
   await page.getByRole('button', { name: /Send/ }).click();
   await expect(page.locator('.message.user').last()).toContainText('What is RAG in LangChain?');
@@ -379,55 +413,45 @@ test('Send once the transcript is final sends its text', async ({ page }) => {
 test('a dictated question that was typed in is sent as its text', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
-    window.__transcript = 'This should not be used.';
-    window.__transcriptDelayMs = 2_000;
+    window.__transcripts = ['What is a closure?', 'And why?'];
+    window.__transcript = '';
   });
   await forgetRequests(page);
   const box = page.getByLabel('Your message');
   await page.locator('.mic-btn').click();
-  await page.waitForTimeout(300);
   await page.evaluate(() => window.__say('what is a closure'));
+  await page.waitForTimeout(500); // long enough for its words
+  await cutPiece(page);
+  await expect(box).toHaveValue('What is a closure?');
   await box.focus();
   await box.press('End');
-  await box.pressSequentially(' in JavaScript');
+  await box.pressSequentially(' In JavaScript?');
+  await page.evaluate(() => window.__sayInterim('and why')); // still to be written down
   await page.getByRole('button', { name: /Send/ }).click();
-  await expect(page.locator('.message.user').last()).toContainText('what is a closure in JavaScript');
+  await expect(page.locator('.message.user').last()).toContainText('What is a closure? In JavaScript? And why?');
   await waitForAnswer(page);
   expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]);
 });
 
 test("if a recorded question can't be answered, its words come back to the box", async ({ page }) => {
   // No fake answer: the test backend has no Gemini key, so the request fails.
-  await page.evaluate(() => {
-    window.__transcriptDelayMs = 2_000;
-    window.__transcript = 'What is a pod?';
-  });
   await page.locator('.mic-btn').click();
   await page.waitForTimeout(300);
   await page.evaluate(() => window.__say('what is a pod'));
   await page.getByRole('button', { name: /Send/ }).click();
   await expect(page.locator('.error-banner')).toContainText('GEMINI_API_KEY');
+  expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]);
   await expect(page.getByLabel('Your message')).toHaveValue('what is a pod');
   await expect(page.getByRole('button', { name: 'Retry question' })).toBeVisible();
 });
 
-test("if Gemini can't transcribe, the live words stay", async ({ page }) => {
-  // No fake transcript: the test backend has no Gemini key, so transcription fails.
-  const mic = page.locator('.mic-btn');
-  await mic.click();
-  await page.evaluate(() => window.__say('what is a vector database'));
-  await page.waitForTimeout(300);
-  await mic.click();
-  await expect(page.locator('.editor-top')).toContainText("Couldn't improve the transcript");
-  await expect(page.getByLabel('Your message')).toHaveValue('what is a vector database');
-});
-
-test('polishing can be turned off', async ({ page }) => {
+test('Gemini writing the text down can be turned off', async ({ page }) => {
   await page.getByLabel(/Improve the transcript/).uncheck();
   await forgetRequests(page);
   const mic = page.locator('.mic-btn');
   await mic.click();
   await page.evaluate(() => window.__say('no polishing please'));
+  await expect(page.getByLabel('Your message')).toHaveValue('no polishing please'); // Chrome's words, at once
   await page.waitForTimeout(300);
   await mic.click();
   await expect(mic).toContainText('Start speaking');
@@ -436,7 +460,7 @@ test('polishing can be turned off', async ({ page }) => {
   await expect(page.getByLabel('Your message')).toHaveValue('no polishing please');
 });
 
-test('hands-free sending sends the polished transcript', async ({ page }) => {
+test('hands-free sending sends the question Gemini wrote down', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
     window.__transcript = 'What is a closure in JavaScript?';

@@ -25,9 +25,11 @@ export const api = {
   updateInterview: (id: string, fields: { title?: string; mode?: AnswerMode }) =>
     fetch(`${API}/api/conversations/${id}`, { method: 'PATCH', headers: JSON_HEADERS, body: JSON.stringify(fields) }),
   deleteInterview: (id: string) => fetch(`${API}/api/conversations/${id}`, { method: 'DELETE' }),
-  transcribe: (id: string, audio: Blob, signal?: AbortSignal) => {
+  /** `context`: the end of the text so far, which the recording continues. */
+  transcribe: (id: string, audio: Blob, signal?: AbortSignal, context = '') => {
     const body = new FormData();
     body.append('file', audio, 'question.wav');
+    if (context) body.append('context', context);
     return fetch(`${API}/api/conversations/${id}/transcribe`, { method: 'POST', body, signal });
   },
   askQuestion: (body: { message: string; conversation_id: string | null; mode: AnswerMode }, signal: AbortSignal) =>

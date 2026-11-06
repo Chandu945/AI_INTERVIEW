@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useAudioRecorder } from './useAudioRecorder';
+import { useAudioRecorder, type Piece } from './useAudioRecorder';
 
 type SpeechResult = { isFinal: boolean; 0: { transcript: string } };
 type SpeechEvent = { resultIndex: number; results: ArrayLike<SpeechResult> };
@@ -21,37 +21,43 @@ type SpeechWindow = Window & {
   webkitSpeechRecognition?: new () => Recognition;
 };
 
+/** A piece of the recording, with the words Chrome heard in it. */
+export type HeardPiece = Piece & { heard: string };
+
 type Options = {
   language: string;
-  /** Adds finalized words to the draft. */
+  /** Adds finalized words to the draft, when Chrome's words are the text. */
   appendWords: (words: string) => void;
   /** The mic won't start while an answer is being generated. */
   busyRef: { current: boolean };
   setError: (message: string) => void;
-  /** Also record the audio, so it can be transcribed again more accurately. */
-  record?: boolean;
   /**
-   * Called at a pause, when every word heard so far is final, with a way to get the recording so
-   * far (it must be called at once).
+   * Gemini writes the text: the audio is recorded and cut into pieces at quiet moments, each
+   * handed to onPiece with the words Chrome heard in it. Chrome's words are then only shown, as
+   * `interim`, until Gemini's version of them is in.
    */
-  onPhraseEnd?: (recording: () => Promise<Blob | null>) => void;
-  /** Called as listening stops, with the whole recording and whether words were still being recognized. */
-  onRecordingEnd?: (audio: Promise<Blob | null>, wordsPending: boolean) => void;
+  record?: boolean;
+  onPiece?: (piece: HeardPiece) => void;
+  /** Called as listening stops, with the whole recording. */
+  onRecordingEnd?: (audio: Promise<Blob | null>) => void;
   /**
    * Called when the mic stops by itself after a pause (the "stop after silence" option), with
-   * the stop in progress. It resolves once the last words are final.
+   * the stop in progress. It resolves once the last words are in.
    */
   onSilenceStop?: (stopped: Promise<void>) => void;
 };
 
 export type Speech = ReturnType<typeof useSpeechRecognition>;
 
+const join = (a: string, b: string) => [a.trim(), b.trim()].filter(Boolean).join(' ');
+
 /**
  * Live dictation with the browser's speech recognition (Chrome), from the mic or from a shared
- * tab's sound. Finalized words go into the draft; words still being recognized are shown as
- * `interim`. The browser ends recognition on its own now and then, so it is reopened until
- * stopListening() is called. Every start gets a new session number, and callbacks from an older
- * session are ignored.
+ * tab's sound. Either Chrome's finalized words go into the draft, or (with `record`) Gemini writes
+ * the text from the recording, piece by piece, and Chrome's words only show until then. Words
+ * still being recognized are shown as `interim`. The browser ends recognition on its own now and
+ * then, so it is reopened until stopListening() is called. Every start gets a new session number,
+ * and callbacks from an older session are ignored.
  */
 export function useSpeechRecognition({
   language,
@@ -59,7 +65,7 @@ export function useSpeechRecognition({
   busyRef,
   setError,
   record = false,
-  onPhraseEnd,
+  onPiece,
   onRecordingEnd,
   onSilenceStop,
 }: Options) {
@@ -76,6 +82,12 @@ export function useSpeechRecognition({
   const recognitionRef = useRef<Recognition | null>(null);
   // The shared tab's sound being listened to, or null for the mic.
   const trackRef = useRef<MediaStreamTrack | null>(null);
+  // Whether Gemini writes the text for this listening session (`record` when it started).
+  const recordingRef = useRef(false);
+  // Words of a Chrome session that ended by itself, shown before the next session's words.
+  const carryRef = useRef('');
+  // The words shown when listening stopped, which go with the recording's last piece.
+  const lastHeardRef = useRef('');
   const stopListeningRef = useRef<(() => Promise<void>) | null>(null);
   const sessionRef = useRef(0);
   const shouldListenRef = useRef(false);
@@ -87,16 +99,11 @@ export function useSpeechRecognition({
   const stopWaitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopFinalizeRef = useRef<(() => void) | null>(null);
   // Always the latest options, since speech callbacks and timers outlive the render that started them.
-  const optionsRef = useRef({ record, onPhraseEnd, onRecordingEnd, onSilenceStop });
+  const optionsRef = useRef({ record, onPiece, onRecordingEnd, onSilenceStop });
   useEffect(() => {
-    optionsRef.current = { record, onPhraseEnd, onRecordingEnd, onSilenceStop };
+    optionsRef.current = { record, onPiece, onRecordingEnd, onSilenceStop };
   });
-  const {
-    start: startRecording,
-    stop: stopRecording,
-    peek: peekRecording,
-    cancel: cancelRecording,
-  } = useAudioRecorder();
+  const { start: startRecording, stop: stopRecording, cancel: cancelRecording, isQuiet } = useAudioRecorder();
 
   const updateInterim = useCallback((value: string) => {
     interimRef.current = value;
@@ -139,6 +146,7 @@ export function useSpeechRecognition({
       stoppingRef.current = false;
       if (preserveInterim) appendWords(interimRef.current);
       updateInterim('');
+      carryRef.current = '';
       recognitionFinalRef.current = '';
       clearTimers();
       disposeRecognition();
@@ -150,14 +158,22 @@ export function useSpeechRecognition({
     [appendWords, cancelRecording, clearTimers, disposeRecognition, finishStop, updateInterim],
   );
 
-  // Stops the mic once no new words have arrived for 2.2s (the "stop after silence" option).
+  // Stops the mic once no new words have arrived for 2.2s (the "stop after silence" option). When
+  // Gemini writes the text, the sound must be quiet too, as Chrome can fall behind on long speech;
+  // but not for ever, in case music is playing.
   const scheduleSilenceStop = useCallback(() => {
-    if (silenceRef.current) clearTimeout(silenceRef.current);
-    silenceRef.current = setTimeout(() => {
-      const stop = stopListeningRef.current;
-      if (shouldListenRef.current && stop) optionsRef.current.onSilenceStop?.(stop());
-    }, 2200);
-  }, []);
+    let waits = 0;
+    const arm = () => {
+      if (silenceRef.current) clearTimeout(silenceRef.current);
+      silenceRef.current = setTimeout(() => {
+        const stop = stopListeningRef.current;
+        if (!shouldListenRef.current || !stop) return;
+        if (recordingRef.current && !isQuiet() && waits++ < 3) return arm();
+        optionsRef.current.onSilenceStop?.(stop());
+      }, 2200);
+    };
+    arm();
+  }, [isQuiet]);
 
   /**
    * Starts listening to the mic, or to `track` (a shared tab's sound) if given. Returns whether
@@ -177,6 +193,8 @@ export function useSpeechRecognition({
       shouldListenRef.current = true;
       stoppingRef.current = false;
       trackRef.current = track ?? null;
+      recordingRef.current = optionsRef.current.record;
+      carryRef.current = '';
       // Once a shared tab stops being shared, its track ends; the page then stops listening.
       const tabGone = () => track?.readyState === 'ended';
       const listeningText = track ? 'Listening to the tab' : 'Listening live';
@@ -186,7 +204,6 @@ export function useSpeechRecognition({
       setListening(true);
       setStatus(track ? 'Connecting to the tab...' : 'Connecting microphone...');
       timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
-      if (optionsRef.current.record) startRecording(track);
 
       const openRecognition = () => {
         if (sessionRef.current !== token || !shouldListenRef.current || stoppingRef.current || tabGone()) return;
@@ -205,18 +222,20 @@ export function useSpeechRecognition({
             if (result.isFinal) final += result[0].transcript + ' ';
             else temporary += result[0].transcript + ' ';
           }
-          // Browser results represent the current recognition session, not just new words.
-          // Append only the newly finalized suffix, keeping manual textarea edits intact.
-          if (final.length < recognitionFinalRef.current.length || !final.startsWith(recognitionFinalRef.current)) {
-            recognitionFinalRef.current = '';
+          if (recordingRef.current) {
+            // Gemini writes the text: Chrome's words only show until its version of them is in.
+            updateInterim(join(carryRef.current, final + temporary));
+          } else {
+            // Browser results represent the current recognition session, not just new words.
+            // Append only the newly finalized suffix, keeping manual textarea edits intact.
+            if (final.length < recognitionFinalRef.current.length || !final.startsWith(recognitionFinalRef.current)) {
+              recognitionFinalRef.current = '';
+            }
+            const addition = final.slice(recognitionFinalRef.current.length).trim();
+            if (addition) appendWords(addition);
+            recognitionFinalRef.current = final;
+            updateInterim(temporary.trim());
           }
-          const addition = final.slice(recognitionFinalRef.current.length).trim();
-          if (addition) appendWords(addition);
-          recognitionFinalRef.current = final;
-          updateInterim(temporary.trim());
-          // A pause: every word heard so far is final, so the recording so far can be transcribed early.
-          if (addition && !temporary.trim() && !stoppingRef.current && optionsRef.current.record)
-            optionsRef.current.onPhraseEnd?.(peekRecording);
           setStatus(stoppingRef.current ? 'Finishing transcription...' : listeningText);
           if (autoPauseRef.current && (final.trim() || temporary.trim())) scheduleSilenceStop();
         };
@@ -230,7 +249,9 @@ export function useSpeechRecognition({
                 ? `Couldn't listen to the tab (${event.error}).`
                 : `Microphone recognition error: ${event.error}. Check browser permissions.`,
             );
-            haltRecognition(true);
+            // When Gemini writes the text, stop as usual, so the last piece goes to it.
+            if (recordingRef.current) void stopListeningRef.current?.();
+            else haltRecognition(true);
           } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
             setStatus(`Recognition interrupted: ${event.error}`);
           }
@@ -246,8 +267,15 @@ export function useSpeechRecognition({
             return;
           }
           if (shouldListenRef.current && !tabGone()) {
+            // Chrome ended the session by itself. Keep the words it hadn't finished: in the text,
+            // or, when Gemini writes it, shown before the next session's words.
+            if (recordingRef.current) carryRef.current = interimRef.current;
+            else {
+              appendWords(interimRef.current);
+              updateInterim('');
+            }
             setStatus(track ? 'Reconnecting to the tab...' : 'Reconnecting microphone...');
-            restartRef.current = setTimeout(openRecognition, 300);
+            restartRef.current = setTimeout(openRecognition, 100);
           }
         };
         try {
@@ -263,16 +291,36 @@ export function useSpeechRecognition({
           haltRecognition(true);
         }
       };
+
+      // A piece of the recording was cut: hand it on with the words Chrome heard in it, and start
+      // Chrome afresh for the next one. So the words shown start over, and Chrome never runs one
+      // endless sentence (after about 18 seconds of one, it stops hearing new words).
+      const handOn = (piece: Piece) => {
+        if (sessionRef.current !== token) return;
+        const stopping = stoppingRef.current;
+        optionsRef.current.onPiece?.({ ...piece, heard: stopping ? lastHeardRef.current : interimRef.current });
+        if (stopping || !shouldListenRef.current) return;
+        carryRef.current = '';
+        updateInterim('');
+        disposeRecognition();
+        if (restartRef.current) clearTimeout(restartRef.current);
+        openRecognition();
+      };
+      if (recordingRef.current)
+        void startRecording(track, handOn).then(started => {
+          // Without a recording, Gemini has nothing to write from: Chrome's words are the text after all.
+          if (!started && sessionRef.current === token) recordingRef.current = false;
+        });
       openRecognition();
       return true;
     },
     [
       appendWords,
       busyRef,
+      disposeRecognition,
       finishStop,
       haltRecognition,
       language,
-      peekRecording,
       scheduleSilenceStop,
       setError,
       startRecording,
@@ -280,7 +328,7 @@ export function useSpeechRecognition({
     ],
   );
 
-  /** Stops listening. Resolves once the last words are final. */
+  /** Stops listening. Resolves once the last words are in. */
   const stopListening = useCallback(async (): Promise<void> => {
     if (!shouldListenRef.current) return;
     stoppingRef.current = true;
@@ -288,10 +336,17 @@ export function useSpeechRecognition({
     clearTimers();
     setListening(false);
     setStatus('Finishing transcription...');
-    // The recording ends now, while live recognition gets a moment to finalize its last words.
-    // (Taking it now also keeps it from being discarded by the halt below.)
-    const audio = stopRecording();
-    optionsRef.current.onRecordingEnd?.(audio, Boolean(interimRef.current.trim()));
+    if (recordingRef.current) {
+      // Gemini writes the text: the recording's last piece has every word, so there is no waiting
+      // for Chrome's. Stopping the recording hands that piece on.
+      lastHeardRef.current = interimRef.current;
+      const audio = stopRecording();
+      optionsRef.current.onRecordingEnd?.(audio);
+      await audio;
+      haltRecognition(false);
+      return;
+    }
+    // Live recognition gets a moment to finalize its last words.
     const rec = recognitionRef.current;
     if (rec) {
       await new Promise<void>(resolve => {
@@ -328,12 +383,12 @@ export function useSpeechRecognition({
   );
 
   const isListening = useCallback(() => shouldListenRef.current, []);
-  /** The words still being recognized, not final yet. */
+  /** The words shown but not yet in the text: still being recognized, or waiting for Gemini. */
   const pendingWords = useCallback(() => interimRef.current.trim(), []);
 
   /**
    * Stops listening at once, to send the question with its recording, and returns the recording.
-   * Words not final yet are dropped rather than waited for: the recording has them.
+   * Words not in the text yet are dropped rather than waited for: the recording has them.
    */
   const stopForSending = useCallback(() => {
     const audio = stopRecording();

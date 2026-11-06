@@ -50,22 +50,23 @@ export default function Home() {
   const improver = useTranscriptImprover({ draftRef, updateDraft, conversationId });
   const {
     begin: beginDictation,
-    noteDictated,
     noteTyped,
-    prefetch,
+    addPiece,
     prepare,
+    end: endDictation,
     improve,
     handOver,
     handOverNow,
+    discard,
+    waitingWords,
   } = improver;
-  // Only real words count as dictation (stopping also flushes an often-empty last phrase).
+  // Chrome's words, when they are the text (Gemini's improvement is off). Only real words count
+  // (stopping also flushes an often-empty last phrase).
   const appendDictated = useCallback(
     (words: string) => {
-      if (!words.trim()) return;
-      appendWords(words);
-      noteDictated();
+      if (words.trim()) appendWords(words);
     },
-    [appendWords, noteDictated],
+    [appendWords],
   );
   const typeInDraft = useCallback(
     (value: string) => {
@@ -80,7 +81,7 @@ export default function Home() {
     busyRef,
     setError,
     record: improver.enabled,
-    onPhraseEnd: prefetch,
+    onPiece: addPiece,
     onRecordingEnd: prepare,
     // Runs after a later render, by which time finish and sendMessage (defined below) exist.
     onSilenceStop: stopped => {
@@ -97,6 +98,10 @@ export default function Home() {
   });
   const { connect: connectTab, disconnect: disconnectTab } = tabAudio;
   const fromTab = tabAudio.supported && source === 'tab';
+  // However listening ended (Stop, a pause, an error), no more pieces will come.
+  useEffect(() => {
+    if (!speech.listening) endDictation();
+  }, [endDictation, speech.listening]);
 
   const startDictation = useCallback(async () => {
     if (busyRef.current) return;
@@ -109,7 +114,7 @@ export default function Home() {
         return;
       }
     }
-    if (startListening(track)) beginDictation(fromTab);
+    if (startListening(track)) beginDictation();
   }, [beginDictation, connectTab, fromTab, startListening]);
 
   const changeSource = useCallback(
@@ -142,15 +147,16 @@ export default function Home() {
   );
 
   /**
-   * Stops the mic and, if polishing is on, swaps in Gemini's more accurate transcript. If the
-   * mic is already off, it just waits for any dictation still being finished.
+   * Stops the mic, then waits for Gemini to write down the dictation's last pieces. If the mic is
+   * already off, it just waits for those.
    */
   const finishDictation = useCallback(
-    () => (isListening() ? finish(stopListening()) : (finishingRef.current ?? Promise.resolve())),
+    () => (isListening() ? finish(stopListening()) : (finishingRef.current ?? finish(Promise.resolve()))),
     [finish, isListening, stopListening],
   );
 
   const clearDraft = useCallback(() => {
+    discard(); // words still being written down must not come back
     updateDraft('');
     updateInterim('');
     setError('');
@@ -163,7 +169,7 @@ export default function Home() {
       }, 80);
     }
     textareaRef.current?.focus();
-  }, [haltRecognition, isListening, startDictation, updateDraft, updateInterim]);
+  }, [discard, haltRecognition, isListening, startDictation, updateDraft, updateInterim]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -178,6 +184,7 @@ export default function Home() {
     async (id: string) => {
       if (busyRef.current) return;
       haltRecognition(false);
+      discard();
       try {
         const r = await api.getInterview(id);
         if (!r.ok) throw new Error('Could not open interview');
@@ -194,7 +201,7 @@ export default function Home() {
         setError(e instanceof Error ? e.message : 'Could not load history');
       }
     },
-    [followNewest, haltRecognition, updateDraft],
+    [discard, followNewest, haltRecognition, updateDraft],
   );
 
   const renameSession = useCallback(
@@ -234,9 +241,11 @@ export default function Home() {
     let spoken: string | null = null; // the live words, when the question goes straight from listening
     try {
       const pending = pendingWords();
+      // The words so far: those in the box, then those shown in gray.
+      const words = [draftRef.current.trim(), waitingWords(), pending].filter(Boolean).join(' ');
       if (isListening() && handOverNow(Boolean(pending))) {
-        // At once, with no waiting for the words still being recognized: the recording has them.
-        spoken = `${draftRef.current.trim()} ${pending}`.trim();
+        // At once, with no waiting for the words not in the box yet: the recording has them.
+        spoken = words;
         const audio = await stopForSending();
         if (audio) recording = { audio, heard: spoken };
       } else {
@@ -341,6 +350,7 @@ export default function Home() {
     isListening,
     pendingWords,
     stopForSending,
+    waitingWords,
     followNewest,
     refreshSessions,
     updateDraft,
@@ -374,6 +384,7 @@ export default function Home() {
   const newChat = useCallback(() => {
     if (busyRef.current) return;
     haltRecognition(false);
+    discard();
     updateDraft('');
     updateInterim('');
     setMessages([]);
@@ -384,14 +395,15 @@ export default function Home() {
     setStreamMetrics(null);
     setView('setup');
     void refreshSessions();
-  }, [haltRecognition, refreshSessions, updateDraft, updateInterim]);
+  }, [discard, haltRecognition, refreshSessions, updateDraft, updateInterim]);
 
   const showHistory = useCallback(() => {
     haltRecognition(false);
+    discard();
     setError('');
     setView('history');
     void refreshSessions();
-  }, [haltRecognition, refreshSessions]);
+  }, [discard, haltRecognition, refreshSessions]);
 
   const startInterview = useCallback(
     async (form: NewInterview) => {
@@ -498,6 +510,7 @@ export default function Home() {
             onDraftChange={typeInDraft}
             textareaRef={textareaRef}
             speech={speech}
+            preview={[improver.waiting, speech.interim].filter(Boolean).join(' ')}
             source={fromTab ? 'tab' : 'mic'}
             onSourceChange={changeSource}
             tabSupported={tabAudio.supported}

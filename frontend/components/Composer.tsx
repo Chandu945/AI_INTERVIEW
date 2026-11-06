@@ -16,9 +16,7 @@ const IMPROVE_MESSAGES: Record<ImproveStatus, string> = {
   idle: '',
   improving: 'Improving the transcript with Gemini…',
   improved: 'Transcript improved by Gemini',
-  'kept-edits': 'Kept your edits (the improved transcript was not applied)',
-  failed: "Couldn't improve the transcript, so the live text was kept",
-  'too-long': 'Long recording, so the live text was kept',
+  failed: "Gemini couldn't write some of it down, so Chrome's words were kept there",
 };
 
 type Props = {
@@ -26,6 +24,8 @@ type Props = {
   onDraftChange: (value: string) => void;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   speech: Speech;
+  /** Words shown in gray after the text: still being recognized, or waiting for Gemini. */
+  preview: string;
   source: VoiceSource;
   onSourceChange: (source: VoiceSource) => void;
   /** Whether this browser can share a tab's sound. */
@@ -57,6 +57,7 @@ export function Composer({
   onDraftChange,
   textareaRef,
   speech,
+  preview,
   source,
   onSourceChange,
   tabSupported,
@@ -79,7 +80,7 @@ export function Composer({
   onClear,
   onSend,
 }: Props) {
-  const { listening, status, elapsed, interim, supported, autoPause, changeAutoPause } = speech;
+  const { listening, status, elapsed, supported, autoPause, changeAutoPause } = speech;
   const shownStatus = !listening && improveStatus !== 'idle' ? IMPROVE_MESSAGES[improveStatus] : status;
   const fromTab = source === 'tab';
   // Words still being recognized are shown in gray right after the text, on a see-through copy of
@@ -128,7 +129,7 @@ export function Composer({
     if (listening && (document.activeElement !== box || box.selectionStart === box.value.length))
       box.scrollTop = box.scrollHeight;
     scrollGhost();
-  }, [draft, interim, listening, fitGhost, scrollGhost, textareaRef]);
+  }, [draft, preview, listening, fitGhost, scrollGhost, textareaRef]);
   const time = `${Math.floor(elapsed / 60)
     .toString()
     .padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}`;
@@ -156,7 +157,7 @@ export function Composer({
             aria-label="Your message"
             placeholder={
               // Not while gray words are shown, which would be drawn over it.
-              interim
+              preview
                 ? ''
                 : fromTab
                   ? 'Type a question, or press Listen to tab to write down what a tab is saying...'
@@ -168,10 +169,10 @@ export function Composer({
             spellCheck
             rows={10}
           />
-          {interim && (
+          {preview && (
             <div className="ghost-text" ref={ghostRef} aria-hidden="true">
               {draft}
-              <span className="ghost-words">{(draft && !/\s$/.test(draft) ? ' ' : '') + interim}</span>
+              <span className="ghost-words">{(draft && !/\s$/.test(draft) ? ' ' : '') + preview}</span>
             </div>
           )}
         </div>
@@ -198,7 +199,7 @@ export function Composer({
           Clear
         </button>
         {/* Pressable while listening, even before any words: sending waits for the last of them. */}
-        <button className="btn primary" onClick={onSend} disabled={busy || (!listening && !draft.trim())}>
+        <button className="btn primary" onClick={onSend} disabled={busy || (!listening && !draft.trim() && !preview)}>
           {' '}
           {busy ? 'Sending…' : 'Send ↗'}
         </button>

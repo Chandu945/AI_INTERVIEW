@@ -14,7 +14,7 @@ declare global {
     __sayInterim: (text: string) => void;
     __transcript: string | null;
     __transcriptDelayMs: number;
-    __transcripts: string[];
+    __transcripts: (string | null)[];
     __transcriptDelays: number[];
     __recognitionTrack: MediaStreamTrack | null;
     __tabShare: 'share' | 'cancel' | 'no-audio';
@@ -22,6 +22,10 @@ declare global {
     __sharedTracks: MediaStreamTrack[];
     __stopSharing: () => void;
     __heard: string | null;
+    __contexts: string[];
+    __pieceTimings: { min: number; max: number; quiet: number; silence: number };
+    __cutPiece?: () => boolean;
+    __tabPauses: boolean;
   }
 }
 
@@ -36,18 +40,26 @@ function pageFakes() {
   window.__emptyHistory = false;
   // When set, recordings are "transcribed" as this text instead of being sent to the test backend
   // (which has no Gemini key, so it answers 503). __transcripts and __transcriptDelays, when not
-  // empty, give each request its own text and delay instead, in turn.
+  // empty, give each request its own text and delay instead, in turn; a null text fails.
   window.__transcript = null;
   window.__transcriptDelayMs = 0;
   window.__transcripts = [];
   window.__heard = null;
+  // The text so far sent with each piece.
+  window.__contexts = [];
+  // Pieces are cut only when a test says so (see cutPiece), and "stop after silence" goes by the
+  // fake recognition alone (the fake mic beeps on and on).
+  window.__pieceTimings = { min: 1e9, max: 1e9, quiet: 1e9, silence: 0 };
   window.__transcriptDelays = [];
   const realFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const url = String(input);
     window.__requests.push(url);
+    if (url.endsWith('/transcribe') && init?.body instanceof FormData)
+      window.__contexts.push(String(init.body.get('context') ?? ''));
     if ((window.__transcript !== null || window.__transcripts.length) && url.endsWith('/transcribe')) {
       const text = window.__transcripts.length ? window.__transcripts.shift() : window.__transcript;
+      if (text === null) return realFetch(input, init); // the test backend can't, so it fails
       const delay = window.__transcriptDelays.length ? window.__transcriptDelays.shift() : window.__transcriptDelayMs;
       const body = JSON.stringify({ text });
       const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
@@ -156,9 +168,11 @@ function pageFakes() {
   };
 
   // Chrome's share picker. `__tabShare` sets what it does: share a tab (its sound is a test
-  // tone), close without sharing, or share a tab without its sound.
+  // tone, or with `__tabPauses`, a tone that pauses for 0.4 s every second), close without
+  // sharing, or share a tab without its sound.
   window.__recognitionTrack = null;
   window.__tabShare = 'share';
+  window.__tabPauses = false;
   window.__tabShares = 0;
   window.__sharedTracks = [];
   navigator.mediaDevices.getDisplayMedia = async () => {
@@ -168,8 +182,14 @@ function pageFakes() {
     if (window.__tabShare === 'share') {
       const context = new AudioContext();
       const tone = context.createOscillator();
+      const volume = context.createGain();
       const sound = context.createMediaStreamDestination();
-      tone.connect(sound);
+      tone.connect(volume).connect(sound);
+      if (window.__tabPauses)
+        for (let second = 0; second < 120; second++) {
+          volume.gain.setValueAtTime(1, context.currentTime + second);
+          volume.gain.setValueAtTime(0, context.currentTime + second + 0.6);
+        }
       tone.start();
       tracks.push(...sound.stream.getAudioTracks());
     }
@@ -209,6 +229,19 @@ export async function waitForAnswer(page: Page) {
 
 export function chatRequests(page: Page) {
   return page.evaluate(() => window.__requests.filter(url => url.includes('/api/chat')).length);
+}
+
+export function chatUrls(page: Page) {
+  return page.evaluate(() => window.__requests.filter(url => url.includes('/api/chat')));
+}
+
+/**
+ * Cuts the recording into a piece now, as a pause would (once there is something recorded). The
+ * piece goes to Gemini with the words heard since the last cut. A piece's text may have at most
+ * 3 words, plus 4.5 a second: wait a little before cutting one with more.
+ */
+export async function cutPiece(page: Page) {
+  await page.waitForFunction(() => window.__cutPiece?.() === true);
 }
 
 export function transcribeRequests(page: Page) {

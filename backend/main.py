@@ -424,6 +424,18 @@ TRANSCRIBE_PROMPT = (
     "terms that may come up include: {terms}.\n"
     "Return only the transcript. Do not answer the question, add words or explain. If nothing is said, return nothing."
 )
+# For a piece of a longer recording: what was said before it, so Gemini carries on from it.
+CONTINUES_PROMPT = (
+    '\nThis recording continues what was said before, which ends: "{context}"\n'
+    "Write down only the words spoken in this recording, carrying on from that text. Do not repeat it."
+)
+# Given a recording with no one speaking in it (noise, music, a cough), Gemini makes up a question
+# that fits the interview, whatever the prompt says, unless it's asked about that first.
+SPEECH_PROMPT = (
+    '\nFirst write one line: "SPEECH: yes" if someone speaks in the recording, or "SPEECH: no" if it holds only '
+    "silence, noise, music or other sounds. If yes, write the transcript on the next line."
+)
+SPEECH_LINE = re.compile(r"^[\s*#>]*speech\s*[:\-]?\s*(yes|no)\b[\s.*]*", re.IGNORECASE)
 MAX_RECORDING_BYTES = 10 * 1024 * 1024  # about 5 minutes of 16 kHz mono WAV
 TERM_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[.+#-][A-Za-z0-9]+)*[+#]*")
 
@@ -471,18 +483,32 @@ def interview_hints(conversation_id: str):
     return row["target_role"], row["interview_type"], ", ".join(terms)
 
 
+def spoken_words(reply: str) -> str:
+    """The transcript in Gemini's reply, which starts by saying whether anyone speaks ('' if no one
+    does). A reply that doesn't is taken as the transcript."""
+    reply = reply.strip()
+    said = SPEECH_LINE.match(reply)
+    if not said:
+        return reply
+    return reply[said.end() :].strip() if said.group(1).lower() == "yes" else ""
+
+
 @app.post("/api/conversations/{conversation_id}/transcribe")
-async def transcribe(conversation_id: str, file: UploadFile = File(...)):
-    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as hints."""
+async def transcribe(conversation_id: str, file: UploadFile = File(...), context: str = Form("", max_length=2000)):
+    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as
+    hints. `context`: for a piece of a longer recording, the end of the text so far."""
     client = app.state.chat_client
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
     audio = await read_recording(file)
     role, interview_type, terms = interview_hints(conversation_id)
     prompt = TRANSCRIBE_PROMPT.format(role=role, interview_type=interview_type, terms=terms)
+    if context.strip():
+        prompt += CONTINUES_PROMPT.format(context=context.strip())
+    prompt += SPEECH_PROMPT
 
     async def attempt(model):
-        # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
+        # A short limit: if Gemini is slow, the app tries the piece again, or uses Chrome's words.
         # Writing down what was said needs no thinking, and skipping it makes replies quicker.
         config = types.GenerateContentConfig(
             temperature=0,
@@ -500,14 +526,14 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
             ],
             config=config,
         )
-        return (response.text or "").strip(), model
+        return spoken_words(response.text or ""), model
 
     started = time.perf_counter()
     try:
         text, model = await TRANSCRIBE_HEDGE.run(attempt)
     except Exception as exc:
         logger.exception("Gemini transcription failed")
-        raise HTTPException(502, "Transcription failed; the live transcript was kept") from exc
+        raise HTTPException(502, "Transcription failed") from exc
     logger.info(
         "transcribe model=%s bytes=%s total_ms=%s chars=%s",
         model, len(audio), round((time.perf_counter() - started) * 1000), len(text),
