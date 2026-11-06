@@ -48,7 +48,16 @@ export default function Home() {
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
   const improver = useTranscriptImprover({ draftRef, updateDraft, conversationId });
-  const { begin: beginDictation, noteDictated, noteTyped, prefetch, prepare, improve, handOver } = improver;
+  const {
+    begin: beginDictation,
+    noteDictated,
+    noteTyped,
+    prefetch,
+    prepare,
+    improve,
+    handOver,
+    handOverNow,
+  } = improver;
   // Only real words count as dictation (stopping also flushes an often-empty last phrase).
   const appendDictated = useCallback(
     (words: string) => {
@@ -79,7 +88,8 @@ export default function Home() {
       if (autoSend) void sendMessage(); // it waits for the last words itself
     },
   });
-  const { haltRecognition, startListening, stopListening, updateInterim, isListening } = speech;
+  const { haltRecognition, startListening, stopListening, updateInterim, isListening, pendingWords, stopForSending } =
+    speech;
   const { bodyRef, bottomRef, onPanelScroll, followNewest } = useStickToBottom(messages, busy);
   // Stop sharing, pressed in Chrome's sharing bar, stops listening as if Stop was pressed.
   const tabAudio = useTabAudio(() => {
@@ -221,15 +231,24 @@ export default function Home() {
     // text. Other sends (a second click, ⌘+Enter) are ignored meanwhile.
     busyRef.current = true;
     let recording: HandOff | null = null;
+    let spoken: string | null = null; // the live words, when the question goes straight from listening
     try {
-      const finishing = finishDictation();
-      await stoppedRef.current;
-      recording = conversationId ? await handOver() : null;
-      if (!recording) await finishing;
+      const pending = pendingWords();
+      if (isListening() && handOverNow(Boolean(pending))) {
+        // At once, with no waiting for the words still being recognized: the recording has them.
+        spoken = `${draftRef.current.trim()} ${pending}`.trim();
+        const audio = await stopForSending();
+        if (audio) recording = { audio, heard: spoken };
+      } else {
+        const finishing = finishDictation();
+        await stoppedRef.current;
+        recording = conversationId ? await handOver() : null;
+        if (!recording) await finishing;
+      }
     } finally {
       busyRef.current = false;
     }
-    const text = recording ? recording.heard : draftRef.current.trim();
+    const text = recording ? recording.heard : (spoken ?? draftRef.current.trim());
     if ((!text && !recording) || busyRef.current) {
       if (!text && !recording) setError('Type or speak a message first.');
       return;
@@ -281,6 +300,10 @@ export default function Home() {
           question = written;
           setMessages(prev => prev.map((m, i) => (i === prev.length - 2 ? { role: 'user', content: written } : m)));
         }
+        if (event.type === 'restart') {
+          received = '';
+          setMessages(prev => prev.map((m, i) => (i === prev.length - 1 ? { role: 'assistant', content: '' } : m)));
+        }
         if (event.type === 'delta' && event.text) {
           received += event.text;
           const next = received;
@@ -314,6 +337,10 @@ export default function Home() {
     draftRef,
     finishDictation,
     handOver,
+    handOverNow,
+    isListening,
+    pendingWords,
+    stopForSending,
     followNewest,
     refreshSessions,
     updateDraft,

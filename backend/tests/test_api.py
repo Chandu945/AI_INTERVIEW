@@ -504,6 +504,35 @@ def test_when_both_models_fail_the_answer_reports_an_error(client, gemini):
     assert fake.models == [main.MODEL, "backup-model"]
 
 
+def test_an_answer_that_breaks_off_is_started_again(client, gemini):
+    cid = new_interview(client)
+    fake = gemini(("Part one. ", None), ("Part two.", "STOP"))
+    fake.breaks = [SERVER_ERROR]  # the first answer breaks off after its first words
+    events = ask(client, cid)
+    assert [e["type"] for e in events] == ["start", "delta", "restart", "delta", "delta", "done"]
+    assert "".join(e["text"] for e in events[3:] if e["type"] == "delta") == "Part one. Part two."
+    assert saved_messages(client, cid)[1]["content"] == "Part one. Part two."
+    assert fake.calls == 2
+
+
+def test_an_answer_that_breaks_off_twice_reports_an_error(client, gemini):
+    cid = new_interview(client)
+    fake = gemini(("Part one. ", None), ("Part two.", "STOP"))
+    fake.breaks = [SERVER_ERROR, SERVER_ERROR]
+    events = ask(client, cid)
+    assert events[-1]["type"] == "error"
+    assert saved_messages(client, cid) == []
+
+
+def test_a_recorded_question_that_breaks_off_is_written_down_again(client, gemini):
+    cid = new_interview(client)
+    fake = gemini(("Q: What is RAG?\n\n", None), ("Retrieval first.", "STOP"))
+    fake.breaks = [SERVER_ERROR]
+    events = events_of(ask_recording(client, cid))
+    assert [e["type"] for e in events] == ["start", "question", "restart", "question", "delta", "done"]
+    assert [m["content"] for m in saved_messages(client, cid)] == ["What is RAG?", "Retrieval first."]
+
+
 def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
     monkeypatch.setattr(main.TRANSCRIBE_HEDGE, "minimum", 0.3)
     cid = new_interview(client)
@@ -515,6 +544,19 @@ def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
     assert time.perf_counter() - started < 5
     assert response.json() == {"text": "What is RAG?"}
     assert (fake.calls, fake.cancelled) == (2, 1)
+    assert fake.models == [main.MODEL, "backup-model"]
+
+
+def test_a_slow_answer_to_a_recording_is_requested_again_on_its_own_timing(client, gemini, monkeypatch):
+    # An answer to a recording starts later than a typed one, so it has its own retry timing.
+    monkeypatch.setattr(main.RECORDED_HEDGE, "minimum", 0.3)
+    cid = new_interview(client)
+    fake = gemini(("Q: What is RAG?\n\nRetrieval first.", "STOP"))
+    fake.delays = [10, 0]
+    started = time.perf_counter()
+    events = events_of(ask_recording(client, cid))
+    assert time.perf_counter() - started < 1.2  # retried after 0.3 s, not a typed answer's 1.5 s
+    assert events[1] == {"type": "question", "text": "What is RAG?"} and events[-1]["type"] == "done"
     assert fake.models == [main.MODEL, "backup-model"]
 
 
@@ -530,3 +572,13 @@ def test_the_retry_waits_twice_a_quick_reply():
     assert hedge.delay() == 9.0  # a model that always thinks a while: twice 4.5 s
     hedge.recent.extend([20.0] * 8)
     assert hedge.delay() == 10.0  # never more than the maximum
+
+
+def test_the_app_retries_after_one_and_a_half_quick_replies():
+    main.ANSWER_HEDGE.recent.extend([1.0, 1.1, 1.2, 1.3])
+    assert main.ANSWER_HEDGE.delay() == 1.5 * 1.1
+    main.TRANSCRIBE_HEDGE.recent.extend([1.8, 1.9, 2.0, 2.2])
+    assert main.TRANSCRIBE_HEDGE.delay() == 1.5 * 1.9
+    assert main.RECORDED_HEDGE.delay() == 2.0  # no replies yet: its minimum
+    for hedge in (main.ANSWER_HEDGE, main.TRANSCRIBE_HEDGE):
+        hedge.recent.clear()

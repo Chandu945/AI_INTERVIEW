@@ -323,6 +323,34 @@ test('Send before the transcript is final sends the recording, and Gemini writes
   await expect(page.locator('.editor-top')).not.toContainText('Transcript improved');
 });
 
+test('Send while words are still being recognized goes at once, without waiting for them', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcript = 'What is RAG, and how does LangChain use it?';
+    window.__transcriptDelayMs = 2_000; // the pause's transcript is still on its way at Send
+  });
+  await forgetRequests(page);
+  const box = page.getByLabel('Your message');
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => {
+    window.__say('what is rag');
+    window.__sayInterim('and how does lang chain'); // not final yet
+  });
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.message.user').last()).toContainText('What is RAG, and how does LangChain use it?');
+  await waitForAnswer(page);
+  // The recording went with the live words so far, the unfinished ones included.
+  expect(await page.evaluate(() => window.__heard)).toBe('what is rag and how does lang chain');
+  expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]);
+  // The recognizer was stopped at once: its late words never land in the box, nor does the
+  // transcript that comes back afterwards.
+  await page.evaluate(() => window.__say('and how does lang chain use it'));
+  await page.waitForTimeout(2_000);
+  await expect(box).toHaveValue('');
+  await expect(page.locator('.mic-btn')).toContainText('Start speaking');
+});
+
 test('Send once the transcript is final sends its text', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);

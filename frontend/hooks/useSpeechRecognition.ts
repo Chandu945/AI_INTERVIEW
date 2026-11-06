@@ -328,6 +328,18 @@ export function useSpeechRecognition({
   );
 
   const isListening = useCallback(() => shouldListenRef.current, []);
+  /** The words still being recognized, not final yet. */
+  const pendingWords = useCallback(() => interimRef.current.trim(), []);
+
+  /**
+   * Stops listening at once, to send the question with its recording, and returns the recording.
+   * Words not final yet are dropped rather than waited for: the recording has them.
+   */
+  const stopForSending = useCallback(() => {
+    const audio = stopRecording();
+    haltRecognition(false);
+    return audio;
+  }, [haltRecognition, stopRecording]);
 
   useEffect(() => {
     const w = window as SpeechWindow;
@@ -348,5 +360,7 @@ export function useSpeechRecognition({
     changeAutoPause,
     updateInterim,
     isListening,
+    pendingWords,
+    stopForSending,
   };
 }

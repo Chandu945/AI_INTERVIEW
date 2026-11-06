@@ -19,8 +19,11 @@ export type Session = {
 
 /** One line of a streamed answer (see /api/chat/stream in backend/main.py). */
 export type StreamEvent = {
-  /** 'question': a recorded question, as Gemini wrote it down. */
-  type: 'start' | 'question' | 'delta' | 'done' | 'error';
+  /**
+   * 'question': a recorded question, as Gemini wrote it down. 'restart': Gemini broke off, and the
+   * answer starts again from the beginning.
+   */
+  type: 'start' | 'question' | 'restart' | 'delta' | 'done' | 'error';
   conversation_id?: string;
   text?: string;
   message?: string;

@@ -29,10 +29,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-chatbot")
 # INTERACT_DB lets tests run against a throwaway database.
 DB = Path(os.getenv("INTERACT_DB") or HERE / "chat.db")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+# The quickest and steadiest of the models tried (November 2026): answers start in about 1 second,
+# and it stalled once in about 50 tries, where Gemini 3.1 Flash-Lite often did, for 5-30 seconds.
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # A slow or failed request is also sent to this model. It runs on separate capacity, so a stall
 # in MODEL doesn't hold up the answer. Empty means the second try goes to MODEL itself.
-BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash").strip() or MODEL
+BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.1-flash-lite").strip() or MODEL
 # Optional: how much the model "thinks" before answering; less is faster. Gemini 3 models take a
 # level (minimal, low, medium or high); older models take a token budget instead (0 turns it off).
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().upper()
@@ -111,17 +113,18 @@ def worth_retrying(error: Exception) -> bool:
 class Hedge:
     """
     Sends a second request when Gemini is slow. Gemini usually replies within 1-3 seconds, but now
-    and then takes 10-30 seconds or fails. If an attempt hasn't succeeded after twice the time of a
-    quick recent reply (between `minimum` and `maximum` seconds), or it fails in a way worth
-    retrying, a second attempt goes to the backup model, and whichever succeeds first is used; the
-    other is cancelled. The backup runs on separate capacity, so it helps even when the main model
-    is stalled for everyone.
+    and then takes 10-30 seconds or fails. If an attempt hasn't succeeded after `factor` times the
+    time of a quick recent reply (between `minimum` and `maximum` seconds), or it fails in a way
+    worth retrying, a second attempt goes to the backup model, and whichever succeeds first is used;
+    the other is cancelled. The backup runs on separate capacity, so it helps even when the main
+    model is stalled for everyone.
     """
 
-    def __init__(self, name: str, minimum: float, maximum: float):
+    def __init__(self, name: str, minimum: float, maximum: float, factor: float = 2.0):
         self.name = name
         self.minimum = minimum
         self.maximum = maximum
+        self.factor = factor
         self.recent: deque[float] = deque(maxlen=20)  # how long the main model's recent replies took
 
     def delay(self) -> float:
@@ -130,7 +133,7 @@ class Hedge:
         # A quick reply: the fastest quarter of recent ones, so a slow spell doesn't make the
         # retry wait longer, while a model that always thinks for a while isn't retried every time.
         quick = sorted(self.recent)[len(self.recent) // 4]
-        return min(self.maximum, max(self.minimum, 2 * quick))
+        return min(self.maximum, max(self.minimum, self.factor * quick))
 
     async def run(self, attempt, discard=None):
         """
@@ -194,10 +197,14 @@ class Hedge:
                     await discard(task.result()[0])
 
 
-# Time to the first text of an answer, and time for a whole transcription.
-ANSWER_HEDGE = Hedge("Gemini answer", minimum=3.0, maximum=10.0)
+# Time to the first text of an answer, and time for a whole transcription. A second try goes out
+# once a request takes 1.5 times as long as a quick one: it costs little on the paid tier, and
+# saves seconds whenever Gemini stalls. An answer to a recording has its own timing, as hearing
+# the audio and writing the question down makes it start about a second later than a typed one.
+ANSWER_HEDGE = Hedge("Gemini answer", minimum=1.5, maximum=6.0, factor=1.5)
+RECORDED_HEDGE = Hedge("Gemini answer to a recording", minimum=2.0, maximum=6.0, factor=1.5)
 # At most 4 s, so the second try still has time before the app gives up after 8 s.
-TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=2.5, maximum=4.0)
+TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=1.5, maximum=4.0, factor=1.5)
 
 
 def connect():
@@ -650,6 +657,14 @@ async def close_answer(started):
     await started[0].aclose()
 
 
+async def chained(head, stream):
+    """The chunks start_answer() read, then the rest of its stream."""
+    for chunk in head:
+        yield chunk
+    async for chunk in stream:
+        yield chunk
+
+
 @app.post("/api/chat/stream")
 async def stream_chat(request: ChatRequest):
     cid = request.conversation_id or str(uuid.uuid4())
@@ -757,36 +772,43 @@ async def answer_events(client, cid, mode, contents, config, question, from_reco
     finish_reason = None
     yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
     try:
-        stream, head, answered_by = await ANSWER_HEDGE.run(
-            lambda model: start_answer(client, contents, config, model), discard=close_answer
-        )
-
-        async def all_chunks():
-            for chunk in head:
-                yield chunk
-            async for chunk in stream:
-                yield chunk
-
-        try:
-            async for chunk in all_chunks():
-                if chunk.candidates and chunk.candidates[0].finish_reason:
-                    finish_reason = chunk.candidates[0].finish_reason
-                delta = chunk.text or ""
-                if not delta:
-                    continue
-                if first_token is None:
-                    first_token = time.perf_counter()
-                if splitter:
-                    waiting = splitter.question is None
-                    delta = splitter.feed(delta)
-                    if waiting and splitter.question is not None:
-                        yield question_event()
+        hedge = RECORDED_HEDGE if from_recording else ANSWER_HEDGE
+        for attempt in range(2):
+            stream, head, answered_by = await hedge.run(
+                lambda model: start_answer(client, contents, config, model), discard=close_answer
+            )
+            try:
+                async for chunk in chained(head, stream):
+                    if chunk.candidates and chunk.candidates[0].finish_reason:
+                        finish_reason = chunk.candidates[0].finish_reason
+                    delta = chunk.text or ""
                     if not delta:
                         continue
-                chunks.append(delta)
-                yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
-        finally:
-            await stream.aclose()
+                    if first_token is None:
+                        first_token = time.perf_counter()
+                    if splitter:
+                        waiting = splitter.question is None
+                        delta = splitter.feed(delta)
+                        if waiting and splitter.question is not None:
+                            yield question_event()
+                        if not delta:
+                            continue
+                    chunks.append(delta)
+                    yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
+                break
+            except (errors.ServerError, httpx.HTTPError) as exc:
+                # Gemini broke off partway (for example, "high demand"). Start the answer again,
+                # once, and have the app clear what it showed of this one.
+                if attempt:
+                    raise
+                logger.warning("Gemini answer broke off (%s); starting it again", exc)
+                chunks.clear()
+                finish_reason = None
+                if splitter:
+                    splitter = QuestionLine()
+                yield json.dumps({"type": "restart"}) + "\n"
+            finally:
+                await stream.aclose()
         if splitter and splitter.question is None:  # the stream ended within the first line
             rest = splitter.finish()
             yield question_event()

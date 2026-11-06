@@ -277,5 +277,38 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     return { audio, heard: draftRef.current.trim() };
   }, [draftRef]);
 
-  return { enabled, setEnabled, status, begin, noteDictated, noteTyped, prefetch, prepare, improve, handOver };
+  /**
+   * Call when Send is pressed while listening, saying whether words are still being recognized.
+   * Returns true if the question should go at once with its recording, because its transcript
+   * isn't final yet; any transcript of it is then kept from changing the draft. False if the draft
+   * is final or was typed in, or part of the question was in the box before dictating: then
+   * dictation is finished as usual and its text sent.
+   */
+  const handOverNow = useCallback(
+    (wordsPending: boolean) => {
+      const segment = segmentRef.current;
+      if (!segment || !conversationRef.current || !enabledRef.current || segment.prefix.trim()) return false;
+      if (segment.typed || draftRef.current !== segment.expected) return false;
+      if (!wordsPending && segment.polished === segment.expected) return false; // final already
+      segment.handedOver = true;
+      segmentRef.current = null;
+      setStatus('idle');
+      return true;
+    },
+    [draftRef],
+  );
+
+  return {
+    enabled,
+    setEnabled,
+    status,
+    begin,
+    noteDictated,
+    noteTyped,
+    prefetch,
+    prepare,
+    improve,
+    handOver,
+    handOverNow,
+  };
 }

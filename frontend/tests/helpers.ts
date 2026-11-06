@@ -9,6 +9,7 @@ declare global {
     __fakeStream: null | ((url: string, heard: string) => Response);
     __emptyHistory: boolean;
     __streams: (intervalMs?: number, count?: number) => void;
+    __replay: (events: object[], intervalMs?: number) => void;
     __say: (text: string) => void;
     __sayInterim: (text: string) => void;
     __transcript: string | null;
@@ -20,6 +21,7 @@ declare global {
     __tabShares: number;
     __sharedTracks: MediaStreamTrack[];
     __stopSharing: () => void;
+    __heard: string | null;
   }
 }
 
@@ -38,6 +40,7 @@ function pageFakes() {
   window.__transcript = null;
   window.__transcriptDelayMs = 0;
   window.__transcripts = [];
+  window.__heard = null;
   window.__transcriptDelays = [];
   const realFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
@@ -56,9 +59,30 @@ function pageFakes() {
     }
     if (window.__fakeStream && url.includes('/api/chat/stream')) {
       const heard = init?.body instanceof FormData ? String(init.body.get('heard') ?? '') : '';
+      if (url.endsWith('/stream-recording')) window.__heard = heard;
       return Promise.resolve(window.__fakeStream(url, heard));
     }
     return realFetch(input, init);
+  };
+
+  // Answers with exactly these events, one every `intervalMs`.
+  window.__replay = (events, intervalMs = 50) => {
+    window.__fakeStream = () => {
+      const encoder = new TextEncoder();
+      let sent = 0;
+      const stream = new ReadableStream({
+        start(controller) {
+          const timer = setInterval(() => {
+            if (sent < events.length) controller.enqueue(encoder.encode(JSON.stringify(events[sent++]) + '\n'));
+            else {
+              clearInterval(timer);
+              controller.close();
+            }
+          }, intervalMs);
+        },
+      });
+      return new Response(stream, { headers: { 'Content-Type': 'application/x-ndjson' } });
+    };
   };
 
   // Answers with `count` sentences, one every `intervalMs`.

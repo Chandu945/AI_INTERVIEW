@@ -20,7 +20,7 @@ import main  # noqa: E402
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB", tmp_path / "chat.db")
-    for hedge in (main.ANSWER_HEDGE, main.TRANSCRIBE_HEDGE):
+    for hedge in (main.ANSWER_HEDGE, main.RECORDED_HEDGE, main.TRANSCRIBE_HEDGE):
         hedge.recent.clear()  # so timings from one test can't change another's retry delay
     monkeypatch.setattr(main, "backup_resting_until", 0.0)
     with TestClient(main.app) as test_client:
@@ -31,8 +31,9 @@ class FakeGemini:
     """Streams the given (text, finish_reason) chunks for answers, returns `transcript` for
     transcriptions (or raises it, if it's an exception), and keeps what it was sent. To act slow
     or broken, `delays` and `errors` give, call by call, how many seconds to wait before replying
-    and an exception to raise instead. `calls` and `cancelled` count the requests, and `models`
-    and `configs` record what each was sent with."""
+    and an exception to raise instead, and `breaks` an exception to raise after an answer's first
+    chunk. `calls` and `cancelled` count the requests, and `models` and `configs` record what each
+    was sent with."""
 
     def __init__(self, chunks):
         self.config = None
@@ -40,6 +41,7 @@ class FakeGemini:
         self.transcript = ""
         self.delays: list[float] = []
         self.errors: list[Exception | None] = []
+        self.breaks: list[Exception | None] = []
         self.calls = 0
         self.cancelled = 0
         self.models: list[str] = []
@@ -62,8 +64,11 @@ class FakeGemini:
             self.configs.append(config)
 
             async def stream():
+                call = self.calls
                 await wait_and_check()
-                for text, finish in chunks:
+                for i, (text, finish) in enumerate(chunks):
+                    if i == 1 and call < len(self.breaks) and self.breaks[call]:
+                        raise self.breaks[call]
                     yield SimpleNamespace(text=text, candidates=[SimpleNamespace(finish_reason=finish)])
 
             return stream()

@@ -32,14 +32,16 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   minutes of listening. Only Chrome tabs are
   covered: for sound from desktop apps (the Zoom app, say), share your whole screen instead,
   where Chrome may offer the computer's sound.
-- **Quick answers:** Gemini usually starts answering in 1 to 3 seconds, but now and then stalls
-  for 10 to 30. If an answer hasn't started within a few seconds (twice as long as a quick
-  reply, at least 3 seconds), or Gemini returns an error, the backend also sends the question to
-  a second model (`GEMINI_BACKUP_MODEL`) and uses whichever replies first; the same goes for
-  transcriptions. The second model runs on separate capacity, so it still answers when the main
-  one is stalled. If it refuses (for example, its free daily quota is used up), the retry goes to
-  the main model instead, and the second model is left alone until Google says to try again. The connection to Gemini stays open between questions, so each question doesn't
-  wait for a new one.
+- **Quick answers:** the default model, Gemini 3.5 Flash-Lite, was the quickest and steadiest in
+  tests (November 2026): typed questions are answered within about 1 to 2 seconds, and it stalled
+  once in about 50 tries, where Gemini 3.1 Flash-Lite often did, for 5 to 30 seconds. Still,
+  if a request takes 1.5 times as long as a quick one (at least 1.5 seconds; 2 for a question
+  sent as its recording), or returns an error, the backend also sends it to a second model
+  (`GEMINI_BACKUP_MODEL`, Gemini 3.1 Flash-Lite) and uses whichever replies first. It runs on
+  separate capacity, so it still answers when the main one is stalled. If it refuses (for
+  example, a free daily quota is used up), the retry goes to the main model instead, and the
+  second model is left alone until Google says to try again. The connection to Gemini
+  stays open between questions, so each question doesn't wait for a new one.
 - **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
 
 ## First-time setup (macOS)
@@ -76,10 +78,10 @@ that, set `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (see `frontend/.env.loc
 | Setting | What it does |
 | --- | --- |
 | `GEMINI_API_KEY` | Your Gemini API key (required). |
-| `GEMINI_MODEL` | The model that writes the answers and improves dictated questions (default `gemini-3.1-flash-lite`). |
+| `GEMINI_MODEL` | The model that writes the answers and improves dictated questions (default `gemini-3.5-flash-lite`). |
 | `GEMINI_THINKING_LEVEL` | Optional, for Gemini 3 models: `minimal`, `low`, `medium` or `high`. Less thinking is faster; leave unset for the model's default. |
 | `GEMINI_THINKING_BUDGET` | Optional, the same for older models as a token budget (`0` turns thinking off). |
-| `GEMINI_BACKUP_MODEL` | Optional: the model a slow or failed request is also sent to (default `gemini-3.5-flash`). It answers with minimal thinking, so it must be a Gemini 3 model. On the free tier it allows only 20 requests a day; when they run out, retries go to `GEMINI_MODEL` until the quota resets. Set it empty to always retry with `GEMINI_MODEL`. |
+| `GEMINI_BACKUP_MODEL` | Optional: the model a slow or failed request is also sent to (default `gemini-3.1-flash-lite`). It answers with minimal thinking, so it must be a Gemini 3 model. If it refuses (say, a free-tier daily limit is used up), retries go to `GEMINI_MODEL` until Google says to try again. Set it empty to always retry with `GEMINI_MODEL`. |
 | `FRONTEND_ORIGIN` | Where the frontend runs, for CORS (default `http://localhost:3000`). |
 | `INTERACT_ACCESS_TOKEN` | Optional: require an `X-Interact-Token` header on API calls. The bundled frontend doesn't send one. |
 | `INTERACT_DB` | Optional: a database file to use instead of `backend/chat.db`. |

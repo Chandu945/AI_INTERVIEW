@@ -1,5 +1,14 @@
 import { expect, test } from '@playwright/test';
-import { API, chatRequests, forgetRequests, interviewId, openApp, openInterview } from './helpers';
+import {
+  API,
+  chatRequests,
+  forgetRequests,
+  interviewId,
+  openApp,
+  openInterview,
+  sendQuestion,
+  waitForAnswer,
+} from './helpers';
 
 test.beforeEach(async ({ page }) => {
   await openApp(page);
@@ -68,4 +77,22 @@ test('Focus Mode on a phone keeps the answers near the top', async ({ page }) =>
     .locator('.conversation-panel')
     .evaluate(panel => panel.getBoundingClientRect().top + window.scrollY);
   expect(answersTop).toBeLessThan(560);
+});
+
+test('an answer that Gemini restarts partway is shown afresh, without an error', async ({ page }) => {
+  await page.evaluate(() =>
+    window.__replay([
+      { type: 'start' },
+      { type: 'delta', text: 'A half-written answer that broke ' },
+      { type: 'restart' },
+      { type: 'delta', text: 'The whole answer, ' },
+      { type: 'delta', text: 'from the start.' },
+      { type: 'done', first_token_ms: 900, total_ms: 2500 },
+    ]),
+  );
+  await sendQuestion(page, 'What is a pod?');
+  await waitForAnswer(page);
+  await expect(page.locator('.message.assistant').last()).toHaveText(/The whole answer, from the start\./);
+  await expect(page.locator('.message.assistant').last()).not.toContainText('half-written');
+  await expect(page.locator('.error-banner')).toHaveCount(0);
 });
