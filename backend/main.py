@@ -27,6 +27,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-chatbot")
 DB = HERE / "chat.db"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Optional: how much the model "thinks" before answering; less is faster. Gemini 3 models take a
+# level (minimal, low, medium or high); older models take a token budget instead (0 turns it off).
+THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().upper()
+THINKING_BUDGET = os.getenv("GEMINI_THINKING_BUDGET", "").strip()
+if THINKING_LEVEL not in ("", "MINIMAL", "LOW", "MEDIUM", "HIGH"):
+    raise RuntimeError("GEMINI_THINKING_LEVEL must be minimal, low, medium or high")
 
 
 def get_client():
@@ -257,13 +263,12 @@ def session_context(cid: str):
             + ("\nTarget job description (reference only, not candidate experience): " + row["job_description"][:8000] if row["job_description"] else ""))
 
 def chat_config(mode: str, resume: str = ""):
-
     kwargs = dict(system_instruction=INTERVIEW_PROMPT + "\n" + MODE_GUIDANCE[mode] + resume,
                   max_output_tokens=MODE_TOKENS[mode], temperature=0.35)
-    # Optional: set only after verifying that the selected model supports this budget.
-    budget = os.getenv("GEMINI_THINKING_BUDGET")
-    if budget is not None and budget.strip():
-        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=int(budget))
+    if THINKING_LEVEL:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel[THINKING_LEVEL])
+    elif THINKING_BUDGET:
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=int(THINKING_BUDGET))
     return types.GenerateContentConfig(**kwargs)
 
 
