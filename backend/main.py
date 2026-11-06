@@ -68,20 +68,44 @@ async def warm_up(client):
         logger.warning("Couldn't reach Gemini model %s at startup: %s", MODEL, exc)
 
 
-def for_attempt(config: types.GenerateContentConfig, backup: bool):
-    """The model and settings for a try. The backup model answers with minimal thinking, for speed."""
-    if not backup or BACKUP_MODEL == MODEL:
-        return MODEL, config
-    minimal = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
-    return BACKUP_MODEL, config.model_copy(update={"thinking_config": minimal})
+# After the backup model refuses a request (for example, its daily free quota is used up), it's
+# skipped until this time (time.monotonic()), and retries go to the main model instead.
+backup_resting_until = 0.0
+
+
+def retry_model() -> str:
+    """Where a second try goes: the backup model, unless it's resting (then the main model again)."""
+    return BACKUP_MODEL if time.monotonic() >= backup_resting_until else MODEL
+
+
+def rest_backup(error: errors.ClientError) -> float:
+    """Skips the backup model for as long as Google's error says to wait, or else 10 minutes."""
+    global backup_resting_until
+    seconds = 600.0
+    body = error.details if isinstance(error.details, dict) else {}
+    for detail in (body.get("error") or {}).get("details") or []:
+        delay = re.fullmatch(r"([\d.]+)s", str(detail.get("retryDelay", ""))) if isinstance(detail, dict) else None
+        if delay:
+            seconds = float(delay.group(1))
+    backup_resting_until = time.monotonic() + min(seconds, 86400)
+    return seconds
+
+
+def settings_for(model: str, config: types.GenerateContentConfig):
+    """The backup model answers with minimal thinking, for speed; the main model with its own settings."""
+    if model == MODEL:
+        return config
+    return config.model_copy(
+        update={"thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)}
+    )
 
 
 def worth_retrying(error: Exception) -> bool:
     """Server and network errors are. Of the errors caused by the request itself, only a missing
-    model or a rate limit, and only when the backup is a different model (with its own limits)."""
+    model or a rate limit, and only when the retry can go to a different model (with its own limits)."""
     if not isinstance(error, errors.ClientError):
         return True
-    return error.code in (404, 429) and BACKUP_MODEL != MODEL
+    return error.code in (404, 429) and retry_model() != MODEL
 
 
 class Hedge:
@@ -110,18 +134,27 @@ class Hedge:
 
     async def run(self, attempt, discard=None):
         """
-        Returns what attempt(backup=False) or attempt(backup=True) returns, whichever succeeds
-        first. discard() is given the other result, if both succeed, to close it.
+        Returns what attempt(model) returns for the main model or, if that's slow or fails, for the
+        retry, whichever succeeds first. discard() is given the other result, if both succeed, to
+        close it.
         """
 
-        async def timed(backup):
+        async def timed(retry):
             started = time.perf_counter()
+            model = retry_model() if retry else MODEL
             try:
-                result = await attempt(backup)
-            except Exception as exc:
-                if backup:
-                    logger.warning("%s: the backup (%s) failed: %s", self.name, BACKUP_MODEL, exc)
-                raise
+                result = await attempt(model)
+            except errors.ClientError as exc:
+                if model == MODEL or exc.code not in (404, 429):
+                    raise
+                # The backup refused (its quota is used up, or it isn't available to this key):
+                # rest it, and send this retry to the main model instead.
+                seconds = rest_backup(exc)
+                logger.warning(
+                    "%s: the backup (%s) refused (%s); trying %s again instead, and resting the backup for %.0f s",
+                    self.name, model, exc.code, MODEL, seconds,
+                )  # fmt: skip
+                result = await attempt(MODEL)
             return result, time.perf_counter() - started
 
         tasks = [asyncio.create_task(timed(False))]
@@ -136,7 +169,7 @@ class Hedge:
                 if error and not worth_retrying(error):
                     raise error
                 reason = f"failed ({error})" if error else f"no reply after {delay:.1f}s"
-                logger.warning("%s %s; also sending it to %s", self.name, reason, BACKUP_MODEL)
+                logger.warning("%s %s; also sending it to %s", self.name, reason, retry_model())
                 tasks.append(asyncio.create_task(timed(True)))
                 while winner is None:
                     pending = [task for task in tasks if not task.done()]
@@ -144,7 +177,7 @@ class Hedge:
                         raise tasks[0].exception()  # both failed; the main model's error says more
                     await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     winner = next((t for t in tasks if t.done() and t.exception() is None), None)
-                logger.info("%s: the %s replied first", self.name, "backup" if winner is tasks[1] else "original")
+                logger.info("%s: the %s replied first", self.name, "retry" if winner is tasks[1] else "original")
             result, seconds = winner.result()
             # Only the main model's own replies show how quick it normally is. (Counting the backup's
             # would make the next retry wait longer just when the main model is having trouble.)
@@ -430,10 +463,10 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
         role=row["target_role"], interview_type=row["interview_type"], terms=", ".join(terms)
     )
 
-    async def attempt(backup):
+    async def attempt(model):
         # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
         config = types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=8000))
-        model, config = for_attempt(config, backup)
+        config = settings_for(model, config)
         response = await client.aio.models.generate_content(
             model=model,
             contents=[
@@ -583,10 +616,10 @@ def save_turn(cid: str, question: str, answer: str):
         )
 
 
-async def start_answer(client, contents, config, backup):
+async def start_answer(client, contents, config, model):
     """Starts a streamed answer and reads it up to the first text. Returns the stream, the chunks
     read and the model answering."""
-    model, config = for_attempt(config, backup)
+    config = settings_for(model, config)
     stream = await client.aio.models.generate_content_stream(model=model, contents=contents, config=config)
     head = []
     async for chunk in stream:
@@ -618,7 +651,7 @@ async def stream_chat(request: ChatRequest):
         yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
         try:
             stream, head, answered_by = await ANSWER_HEDGE.run(
-                lambda backup: start_answer(client, contents, config, backup), discard=close_answer
+                lambda model: start_answer(client, contents, config, model), discard=close_answer
             )
 
             async def all_chunks():

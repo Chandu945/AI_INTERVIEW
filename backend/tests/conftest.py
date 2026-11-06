@@ -22,6 +22,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB", tmp_path / "chat.db")
     for hedge in (main.ANSWER_HEDGE, main.TRANSCRIBE_HEDGE):
         hedge.recent.clear()  # so timings from one test can't change another's retry delay
+    monkeypatch.setattr(main, "backup_resting_until", 0.0)
     with TestClient(main.app) as test_client:
         yield test_client
 

@@ -332,6 +332,16 @@ def test_transcription_problems_are_reported(client, gemini):
 SERVER_ERROR = errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
 RATE_LIMIT = errors.ClientError(429, {"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}})
 BAD_REQUEST = errors.ClientError(400, {"error": {"code": 400, "message": "bad", "status": "INVALID_ARGUMENT"}})
+DAILY_LIMIT = errors.ClientError(
+    429,
+    {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "71447s"}],
+        }
+    },
+)
 
 
 def timed_ask(client, cid):
@@ -402,6 +412,28 @@ def test_without_a_backup_model_the_main_model_is_tried_again(client, gemini, mo
     fake.errors = [RATE_LIMIT]
     assert timed_ask(client, cid)[0][-1]["type"] == "error"
     assert fake.calls == 1
+
+
+def test_when_the_backup_is_out_of_quota_the_main_model_is_retried(client, gemini, monkeypatch):
+    monkeypatch.setattr(main.ANSWER_HEDGE, "minimum", 0.3)
+    cid = new_interview(client)
+    fake = gemini(("Quick answer.", "STOP"))
+    fake.delays = [10, 0, 0]
+    fake.errors = [None, DAILY_LIMIT, None]  # the backup refuses; the main model answers the retry
+    events, seconds = timed_ask(client, cid)
+    assert seconds < 5 and events[-1]["type"] == "done"
+    assert fake.models == [main.MODEL, "backup-model", main.MODEL]
+    # The backup rests for as long as Google said, so the next retry goes straight to the main model.
+    assert main.backup_resting_until - time.monotonic() > 70_000
+    fake = gemini(("Quick answer.", "STOP"))
+    fake.delays = [10, 0]
+    assert timed_ask(client, cid)[0][-1]["type"] == "done"
+    assert fake.models == [main.MODEL, main.MODEL]
+
+
+def test_a_refusal_without_a_retry_delay_rests_the_backup_for_10_minutes(monkeypatch):
+    monkeypatch.setattr(main, "backup_resting_until", 0.0)  # restored after the test
+    assert main.rest_backup(RATE_LIMIT) == 600
 
 
 def test_when_both_models_fail_the_answer_reports_an_error(client, gemini):
