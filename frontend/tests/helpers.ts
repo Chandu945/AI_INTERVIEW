@@ -10,6 +10,8 @@ declare global {
     __emptyHistory: boolean;
     __streams: (intervalMs?: number, count?: number) => void;
     __say: (text: string) => void;
+    __transcript: string | null;
+    __transcriptDelayMs: number;
   }
 }
 
@@ -21,10 +23,19 @@ function pageFakes() {
   window.__requests = [];
   window.__fakeStream = null;
   window.__emptyHistory = false;
+  // When set, recordings are "transcribed" as this text instead of being sent to the test backend
+  // (which has no Gemini key, so it answers 503).
+  window.__transcript = null;
+  window.__transcriptDelayMs = 0;
   const realFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const url = String(input);
     window.__requests.push(url);
+    if (window.__transcript !== null && url.endsWith('/transcribe')) {
+      const body = JSON.stringify({ text: window.__transcript });
+      const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
+      return new Promise(resolve => setTimeout(() => resolve(response), window.__transcriptDelayMs));
+    }
     if (window.__emptyHistory && !init?.method && url.endsWith('/api/conversations')) {
       const body = JSON.stringify({ sessions: [] });
       return Promise.resolve(new Response(body, { headers: { 'Content-Type': 'application/json' } }));
@@ -114,6 +125,10 @@ export async function waitForAnswer(page: Page) {
 
 export function chatRequests(page: Page) {
   return page.evaluate(() => window.__requests.filter(url => url.includes('/api/chat')).length);
+}
+
+export function transcribeRequests(page: Page) {
+  return page.evaluate(() => window.__requests.filter(url => url.endsWith('/transcribe')).length);
 }
 
 export async function forgetRequests(page: Page) {

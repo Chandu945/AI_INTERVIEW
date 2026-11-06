@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { chatRequests, forgetRequests, openApp, openInterview } from './helpers';
+import { chatRequests, forgetRequests, openApp, openInterview, transcribeRequests, waitForAnswer } from './helpers';
 
 // Speech recognition is faked (see helpers.ts), so window.__say() stands in for speaking.
 
@@ -56,4 +56,152 @@ test('with hands-free sending on, a pause sends the question', async ({ page }) 
   await expect(page.locator('.message.user').last()).toContainText('what is a closure', { timeout: 5_000 });
   await expect(page.locator('.mic-btn')).toContainText('Start speaking');
   expect(await chatRequests(page)).toBe(1);
+});
+
+// Polishing: the recording is transcribed again by Gemini when dictation stops.
+
+test("when you stop, Gemini's transcript replaces the live words", async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcript = 'What is RAG in LangChain?';
+  });
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('what is rag in lang chain'));
+  await page.waitForTimeout(500); // let the recorder capture some audio
+  await mic.click();
+  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG in LangChain?');
+  await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
+});
+
+test('text typed during dictation is never overwritten', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcript = 'This should not appear.';
+  });
+  const mic = page.locator('.mic-btn');
+  const box = page.getByLabel('Your message');
+  await mic.click();
+  await box.focus();
+  // Something typed the instant the words arrive must not wipe them out.
+  await page.evaluate(() => {
+    window.__say('first words');
+    document.execCommand('insertText', false, ' and');
+  });
+  await box.pressSequentially(' typed words');
+  await page.waitForTimeout(500);
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText('Kept your edits');
+  await expect(box).toHaveValue('first words and typed words');
+  expect(await transcribeRequests(page)).toBe(0); // no point asking Gemini
+});
+
+test('a transcript far longer than the live words is not used', async ({ page }) => {
+  await page.evaluate(() => {
+    // Gemini answering the question instead of writing it down.
+    window.__transcript =
+      'A closure is a function that remembers the variables of the scope it was created in, even after that scope has finished running.';
+  });
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('what is a closure'));
+  await page.waitForTimeout(500);
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText("Couldn't improve the transcript");
+  await expect(page.getByLabel('Your message')).toHaveValue('what is a closure');
+});
+
+test('a slow transcript is dropped once you start speaking again', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcript = 'First question.';
+    window.__transcriptDelayMs = 1_500;
+  });
+  const mic = page.locator('.mic-btn');
+  const box = page.getByLabel('Your message');
+  await mic.click();
+  await page.evaluate(() => window.__say('first question'));
+  await page.waitForTimeout(500);
+  await mic.click(); // its transcript arrives 1.5 s later, during the next dictation
+  await expect.poll(() => transcribeRequests(page)).toBe(1);
+  await page.evaluate(() => {
+    window.__transcript = 'Second part.';
+    window.__transcriptDelayMs = 0;
+  });
+  await mic.click();
+  await page.evaluate(() => window.__say('second part'));
+  await page.waitForTimeout(2_000);
+  await expect(box).toHaveValue('first question second part');
+  await mic.click();
+  await expect(box).toHaveValue('first question Second part.');
+});
+
+test('pressing the mic again while it is still stopping is ignored', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcript = 'First question.';
+  });
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('first question'));
+  await page.waitForTimeout(500);
+  await mic.dblclick(); // stop, then at once start again
+  await expect(page.getByLabel('Your message')).toHaveValue('First question.');
+  await page.waitForTimeout(1_000); // past the longest wait for the last words
+  await expect(mic).toContainText('Start speaking');
+  await expect(page.getByLabel('Your message')).toHaveValue('First question.');
+});
+
+test('a second Send while the transcript is polished does not send twice', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcript = 'What is a closure?';
+    window.__transcriptDelayMs = 1_000;
+  });
+  await forgetRequests(page);
+  await page.locator('.mic-btn').click();
+  await page.evaluate(() => window.__say('what is a closure'));
+  await page.waitForTimeout(500);
+  const send = page.getByRole('button', { name: /Send/ });
+  await send.click(); // stops the mic, polishes, then sends
+  await send.click();
+  await expect(page.locator('.message.user').last()).toContainText('What is a closure?');
+  await waitForAnswer(page);
+  expect(await chatRequests(page)).toBe(1);
+  await expect(page.locator('.error-banner')).toHaveCount(0);
+});
+
+test("if Gemini can't transcribe, the live words stay", async ({ page }) => {
+  // No fake transcript: the test backend has no Gemini key, so transcription fails.
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('what is a vector database'));
+  await page.waitForTimeout(300);
+  await mic.click();
+  await expect(page.locator('.editor-top')).toContainText("Couldn't improve the transcript");
+  await expect(page.getByLabel('Your message')).toHaveValue('what is a vector database');
+});
+
+test('polishing can be turned off', async ({ page }) => {
+  await page.getByLabel(/Improve the transcript/).uncheck();
+  await forgetRequests(page);
+  const mic = page.locator('.mic-btn');
+  await mic.click();
+  await page.evaluate(() => window.__say('no polishing please'));
+  await page.waitForTimeout(300);
+  await mic.click();
+  await expect(mic).toContainText('Start speaking');
+  await page.waitForTimeout(500);
+  expect(await transcribeRequests(page)).toBe(0);
+  await expect(page.getByLabel('Your message')).toHaveValue('no polishing please');
+});
+
+test('hands-free sending sends the polished transcript', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcript = 'What is a closure in JavaScript?';
+  });
+  await page.getByLabel(/Stop listening after 2.2s/).check();
+  await page.getByLabel(/send the question automatically/).check();
+  await page.locator('.mic-btn').click();
+  await page.evaluate(() => window.__say('what is a closure in java script'));
+  await expect(page.locator('.message.user').last()).toContainText('What is a closure in JavaScript?', {
+    timeout: 6_000,
+  });
 });

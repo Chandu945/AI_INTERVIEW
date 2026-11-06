@@ -9,6 +9,7 @@ import { TopBar } from '../components/TopBar';
 import { useDraft } from '../hooks/useDraft';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useStickToBottom } from '../hooks/useStickToBottom';
+import { useTranscriptImprover } from '../hooks/useTranscriptImprover';
 import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
 import type { AnswerMode, Message, Session, StreamMetrics, View } from '../lib/types';
 
@@ -41,18 +42,67 @@ export default function Home() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
+  const improver = useTranscriptImprover({ draftRef, updateDraft, conversationId });
+  const { begin: beginDictation, noteDictated, noteTyped, improve } = improver;
+  // Only real words count as dictation (stopping also flushes an often-empty last phrase).
+  const appendDictated = useCallback(
+    (words: string) => {
+      if (!words.trim()) return;
+      appendWords(words);
+      noteDictated();
+    },
+    [appendWords, noteDictated],
+  );
+  const typeInDraft = useCallback(
+    (value: string) => {
+      updateDraft(value);
+      noteTyped();
+    },
+    [noteTyped, updateDraft],
+  );
   const speech = useSpeechRecognition({
     language,
-    appendWords,
+    appendWords: appendDictated,
     busyRef,
     setError,
-    // Runs after a later render, by which time sendMessage (defined below) exists.
-    onSilenceStop: () => {
-      if (autoSend) void sendMessage();
+    record: improver.enabled,
+    // Runs after a later render, by which time finish and sendMessage (defined below) exist.
+    onSilenceStop: stopped => {
+      void finish(stopped).then(() => {
+        if (autoSend) void sendMessage();
+      });
     },
   });
   const { haltRecognition, startListening, stopListening, updateInterim, isListening } = speech;
   const { bodyRef, bottomRef, onPanelScroll, followNewest } = useStickToBottom(messages, busy);
+
+  const startDictation = useCallback(() => {
+    if (busyRef.current) return;
+    if (startListening()) beginDictation();
+  }, [beginDictation, startListening]);
+
+  // The dictation being finished (the mic stopping, then the transcript being polished), so
+  // that Send can wait for it.
+  const finishingRef = useRef<Promise<void> | null>(null);
+  const finish = useCallback(
+    (stopped: Promise<Blob | null>) => {
+      const done = stopped.then(improve).finally(() => {
+        if (finishingRef.current === done) finishingRef.current = null;
+      });
+      finishingRef.current = done;
+      return done;
+    },
+    [improve],
+  );
+
+  /**
+   * Stops the mic and, if polishing is on, swaps in Gemini's more accurate transcript. If the
+   * mic is already off, it just waits for any dictation still being finished.
+   */
+  const finishDictation = useCallback(
+    () => (isListening() ? finish(stopListening()) : (finishingRef.current ?? Promise.resolve())),
+    [finish, isListening, stopListening],
+  );
 
   const clearDraft = useCallback(() => {
     updateDraft('');
@@ -63,11 +113,11 @@ export default function Home() {
       haltRecognition(false);
       // Restart on the next tick after disposing the old recognition instance.
       setTimeout(() => {
-        if (mountedRef.current) startListening();
+        if (mountedRef.current) startDictation();
       }, 80);
     }
     textareaRef.current?.focus();
-  }, [haltRecognition, isListening, startListening, updateDraft, updateInterim]);
+  }, [haltRecognition, isListening, startDictation, updateDraft, updateInterim]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -129,7 +179,14 @@ export default function Home() {
 
   const sendMessage = useCallback(async () => {
     if (busyRef.current) return;
-    if (isListening()) await stopListening();
+    // Wait for dictation to finish: its last words, then polishing (a few seconds). Other sends
+    // (a second click, ⌘+Enter) are ignored meanwhile.
+    busyRef.current = true;
+    try {
+      await finishDictation();
+    } finally {
+      busyRef.current = false;
+    }
     const text = draftRef.current.trim();
     if (!text || busyRef.current) {
       if (!text) setError('Type or speak a message first.');
@@ -200,10 +257,9 @@ export default function Home() {
     answerMode,
     conversationId,
     draftRef,
+    finishDictation,
     followNewest,
-    isListening,
     refreshSessions,
-    stopListening,
     updateDraft,
     updateInterim,
   ]);
@@ -348,9 +404,14 @@ export default function Home() {
         <div className={`workspace ${focusMode ? 'focus-workspace' : ''}`}>
           <Composer
             draft={draft}
-            onDraftChange={updateDraft}
+            onDraftChange={typeInDraft}
             textareaRef={textareaRef}
             speech={speech}
+            onStartDictation={startDictation}
+            onStopDictation={() => void finishDictation()}
+            improve={improver.enabled}
+            onImproveChange={improver.setEnabled}
+            improveStatus={improver.status}
             busy={busy}
             answerMode={answerMode}
             onAnswerModeChange={changeAnswerMode}

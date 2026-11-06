@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
 import httpx
@@ -271,3 +272,56 @@ def test_invalid_thinking_level_stops_startup():
         text=True,
     )
     assert result.returncode != 0 and "GEMINI_THINKING_LEVEL must be" in result.stderr
+
+
+# Transcribing recorded questions
+
+
+def silence_wav(seconds=0.1):
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(16000)
+        recording.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return buffer.getvalue()
+
+
+def send_recording(client, cid, data=None, content_type="audio/wav"):
+    audio = silence_wav() if data is None else data
+    return client.post(f"/api/conversations/{cid}/transcribe", files={"file": ("question.wav", audio, content_type)})
+
+
+def test_transcription_uses_the_interview_as_hints(client, gemini):
+    cid = new_interview(client, target_role="Data Engineer", interview_type="Mixed",
+                        job_description="Experience with AWS S3 and PostgreSQL.")  # fmt: skip
+    upload(client, cid, "resume.docx", docx_with("Built ETL pipelines in PySpark and TensorFlow models at Acme."))
+    fake = gemini()
+    fake.transcript = "  What is a DAG in Airflow?  "
+    assert send_recording(client, cid).json() == {"text": "What is a DAG in Airflow?"}
+    prompt, audio = fake.contents[0].parts
+    assert "Data Engineer (Mixed interview)" in prompt.text
+    for term in ("LangChain", "PostgreSQL", "PySpark", "TensorFlow", "S3", "AWS"):
+        assert term in prompt.text
+    assert audio.inline_data.mime_type == "audio/wav"
+
+
+def test_vocabulary_picks_technical_words():
+    text = "We use PostgreSQL, GPT-4, Node.js, C++ and AWS. Python is great; so is the team."
+    assert main.vocabulary(text) == ["PostgreSQL", "GPT-4", "Node.js", "C++", "AWS"]
+
+
+def test_transcription_rejects_bad_recordings(client, gemini):
+    gemini()
+    cid = new_interview(client)
+    assert send_recording(client, cid, content_type="audio/webm").status_code == 415
+    assert send_recording(client, cid, data=b"").status_code == 400
+    assert send_recording(client, cid, data=b"x" * (main.MAX_RECORDING_BYTES + 1)).status_code == 413
+    assert send_recording(client, "missing").status_code == 404
+
+
+def test_transcription_problems_are_reported(client, gemini):
+    cid = new_interview(client)
+    assert send_recording(client, cid).status_code == 503  # no API key
+    gemini().transcript = RuntimeError("Gemini is busy")
+    assert send_recording(client, cid).status_code == 502

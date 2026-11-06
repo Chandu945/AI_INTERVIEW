@@ -23,11 +23,13 @@ def client(tmp_path, monkeypatch):
 
 
 class FakeGemini:
-    """Streams the given (text, finish_reason) chunks and keeps what it was sent."""
+    """Streams the given (text, finish_reason) chunks for answers, returns `transcript` for
+    transcriptions (or raises it, if it's an exception), and keeps what it was sent."""
 
     def __init__(self, chunks):
         self.config = None
         self.contents = None
+        self.transcript = ""
 
         async def generate_content_stream(model, contents, config):
             self.config, self.contents = config, contents
@@ -38,11 +40,18 @@ class FakeGemini:
 
             return stream()
 
+        async def generate_content(model, contents, config):
+            self.config, self.contents = config, contents
+            if isinstance(self.transcript, Exception):
+                raise self.transcript
+            return SimpleNamespace(text=self.transcript)
+
         async def aclose():
             pass
 
         self.aio = SimpleNamespace(
-            models=SimpleNamespace(generate_content_stream=generate_content_stream), aclose=aclose
+            models=SimpleNamespace(generate_content_stream=generate_content_stream, generate_content=generate_content),
+            aclose=aclose,
         )
 
 

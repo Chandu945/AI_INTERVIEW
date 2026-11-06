@@ -8,7 +8,14 @@ export default defineConfig({
   workers: 1, // the tests share one backend
   timeout: 60_000,
   reporter: [['list']],
-  use: { baseURL: 'http://localhost:3100', channel: 'chrome', viewport: { width: 1440, height: 900 } },
+  use: {
+    baseURL: 'http://localhost:3100',
+    channel: 'chrome',
+    viewport: { width: 1440, height: 900 },
+    // A built-in fake microphone (a test tone), so the recording code runs for real.
+    permissions: ['microphone'],
+    launchOptions: { args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] },
+  },
   expect: { toHaveScreenshot: { maxDiffPixels: 50 } },
   webServer: [
     {

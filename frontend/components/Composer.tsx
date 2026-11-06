@@ -1,5 +1,6 @@
 import type { RefObject } from 'react';
 import type { Speech } from '../hooks/useSpeechRecognition';
+import type { ImproveStatus } from '../hooks/useTranscriptImprover';
 import { MAX_QUESTION_CHARS } from '../lib/api';
 import { ANSWER_MODES, answerModeLabel, type AnswerMode } from '../lib/types';
 
@@ -10,11 +11,25 @@ const LANGUAGES = [
   { code: 'te-IN', label: 'Telugu' },
 ];
 
+// Shown in place of the mic status once dictation has stopped.
+const IMPROVE_MESSAGES: Record<ImproveStatus, string> = {
+  idle: '',
+  improving: 'Improving the transcript with Gemini…',
+  improved: 'Transcript improved by Gemini',
+  'kept-edits': 'Kept your edits (the improved transcript was not applied)',
+  failed: "Couldn't improve the transcript, so the live text was kept",
+};
+
 type Props = {
   draft: string;
   onDraftChange: (value: string) => void;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   speech: Speech;
+  onStartDictation: () => void;
+  onStopDictation: () => void;
+  improve: boolean;
+  onImproveChange: (on: boolean) => void;
+  improveStatus: ImproveStatus;
   busy: boolean;
   answerMode: AnswerMode;
   onAnswerModeChange: (mode: AnswerMode) => void;
@@ -34,6 +49,11 @@ export function Composer({
   onDraftChange,
   textareaRef,
   speech,
+  onStartDictation,
+  onStopDictation,
+  improve,
+  onImproveChange,
+  improveStatus,
   busy,
   answerMode,
   onAnswerModeChange,
@@ -46,8 +66,8 @@ export function Composer({
   onClear,
   onSend,
 }: Props) {
-  const { listening, status, elapsed, interim, supported, autoPause, changeAutoPause, startListening, stopListening } =
-    speech;
+  const { listening, status, elapsed, interim, supported, autoPause, changeAutoPause } = speech;
+  const shownStatus = !listening && improveStatus !== 'idle' ? IMPROVE_MESSAGES[improveStatus] : status;
   const time = `${Math.floor(elapsed / 60)
     .toString()
     .padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}`;
@@ -64,7 +84,7 @@ export function Composer({
       <div className={`editor-wrap ${listening ? 'active' : ''}`}>
         <div className="editor-top">
           <span className={`status-dot ${listening ? 'pulse' : ''}`} />
-          <span>{status}</span>
+          <span>{shownStatus}</span>
           {listening && <span className="duration">{time}</span>}
         </div>
         <textarea
@@ -91,7 +111,7 @@ export function Composer({
       <div className="controls">
         <button
           className={`btn mic-btn ${listening ? 'recording' : ''}`}
-          onClick={() => (listening ? void stopListening() : startListening())}
+          onClick={() => (listening ? onStopDictation() : onStartDictation())}
           disabled={!supported || busy}
           aria-pressed={listening}
         >
@@ -121,6 +141,12 @@ export function Composer({
             </button>
           ))}
         </div>
+      </div>
+      <div className="options-row">
+        <label>
+          <input type="checkbox" checked={improve} onChange={e => onImproveChange(e.target.checked)} /> Improve the
+          transcript with Gemini when you stop
+        </label>
       </div>
       <div className="options-row">
         <label>

@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-chatbot")
 # INTERACT_DB lets tests run against a throwaway database.
 DB = Path(os.getenv("INTERACT_DB") or HERE / "chat.db")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 # Optional: how much the model "thinks" before answering; less is faster. Gemini 3 models take a
 # level (minimal, low, medium or high); older models take a token budget instead (0 turns it off).
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().upper()
@@ -243,6 +243,90 @@ async def upload_resume(conversation_id: str, file: UploadFile = File(...)):
         if not result.rowcount:
             raise HTTPException(404, "Interview not found")
     return {"resume_name": name, "characters": min(len(extracted), 30000)}
+
+
+# Terms that often come up in technical interviews, so transcripts spell them the standard way.
+COMMON_TERMS = [
+    "LangChain", "LangGraph", "LlamaIndex", "RAG", "LLM", "GPT", "Gemini", "Claude", "OpenAI", "Hugging Face",
+    "transformers", "embeddings", "vector database", "fine-tuning", "LoRA", "prompt engineering", "tokenization",
+    "FastAPI", "Django", "Flask", "Python", "JavaScript", "TypeScript", "React", "Next.js", "Node.js", "PostgreSQL",
+    "MySQL", "MongoDB", "Redis", "Kafka", "Docker", "Kubernetes", "AWS", "Azure", "GCP", "CI/CD", "REST", "GraphQL",
+    "microservices", "SQL", "NoSQL", "API",
+]  # fmt: skip
+TRANSCRIBE_PROMPT = (
+    "Transcribe this recording of a job candidate saying an interview question.\n"
+    "Write exactly the words spoken, in normal sentence case with punctuation.\n"
+    "The interview is for the role: {role} ({interview_type} interview). Spell technical terms the standard way; "
+    "terms that may come up include: {terms}.\n"
+    "Return only the transcript. Do not answer the question, add words or explain. If nothing is said, return nothing."
+)
+MAX_RECORDING_BYTES = 10 * 1024 * 1024  # about 5 minutes of 16 kHz mono WAV
+TERM_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[.+#-][A-Za-z0-9]+)*[+#]*")
+
+
+def vocabulary(*texts: str, limit: int = 40) -> list[str]:
+    """Technical-looking words from a job description or resume: ones with inner capitals, digits
+    or symbols (PostgreSQL, GPT-4, Node.js, C++) and acronyms (AWS, SQL)."""
+    found: dict[str, str] = {}
+    for text in texts:
+        for word in TERM_PATTERN.findall(text or ""):
+            technical = (
+                sum(c.isupper() for c in word) >= 2
+                or any(c.isdigit() for c in word)
+                or any(c in ".+#" for c in word[1:])
+            )
+            if technical and word.lower() not in found:
+                found[word.lower()] = word
+    return list(found.values())[:limit]
+
+
+@app.post("/api/conversations/{conversation_id}/transcribe")
+async def transcribe(conversation_id: str, file: UploadFile = File(...)):
+    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as hints."""
+    client = app.state.chat_client
+    if client is None:
+        raise HTTPException(503, "GEMINI_API_KEY is not configured")
+    if (file.content_type or "").split(";")[0] != "audio/wav":
+        raise HTTPException(415, "Send the recording as audio/wav")
+    audio = await file.read(MAX_RECORDING_BYTES + 1)
+    if len(audio) > MAX_RECORDING_BYTES:
+        raise HTTPException(413, "Recording is too long")
+    if not audio:
+        raise HTTPException(400, "Recording is empty")
+    with connect() as db:
+        row = db.execute(
+            "SELECT target_role, interview_type, job_description, resume_text FROM sessions WHERE id=?",
+            (conversation_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Interview not found")
+    known = {term.lower() for term in COMMON_TERMS}
+    terms = COMMON_TERMS + [t for t in vocabulary(row["job_description"], row["resume_text"]) if t.lower() not in known]
+    prompt = TRANSCRIBE_PROMPT.format(
+        role=row["target_role"], interview_type=row["interview_type"], terms=", ".join(terms)
+    )
+    started = time.perf_counter()
+    try:
+        response = await client.aio.models.generate_content(
+            model=MODEL,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=prompt), types.Part.from_bytes(data=audio, mime_type="audio/wav")],
+                )
+            ],
+            # A short timeout: if Gemini is slow, the app keeps the live transcript instead of waiting.
+            config=types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=15000)),
+        )
+    except Exception as exc:
+        logger.exception("Gemini transcription failed")
+        raise HTTPException(502, "Transcription failed; the live transcript was kept") from exc
+    text = (response.text or "").strip()
+    logger.info(
+        "transcribe model=%s bytes=%s total_ms=%s chars=%s",
+        MODEL, len(audio), round((time.perf_counter() - started) * 1000), len(text),
+    )  # fmt: skip
+    return {"text": text}
 
 
 def ensure_session(cid: str):

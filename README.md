@@ -8,6 +8,13 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
 - **Interview:** type or dictate questions (Chrome's speech recognition) and watch the answers
   stream in. Optional auto-stop after a 2.2-second pause, with optional hands-free sending.
   Focus Mode, font sizes and copy buttons.
+- **More accurate dictation:** while you dictate, the app also records the microphone. When you
+  stop, Gemini transcribes the recording again, using the role and the technical terms in your
+  resume and job description as hints, and its version replaces the live words: proper
+  punctuation and terms like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or
+  "fast api". This takes a few seconds. Anything you typed meanwhile is never overwritten; if
+  Gemini is unavailable or its text doesn't match what was heard, the live words stay. Turn it
+  off with "Improve the transcript with Gemini when you stop".
 - **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
 
 ## First-time setup (macOS)
@@ -44,7 +51,7 @@ that, set `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (see `frontend/.env.loc
 | Setting | What it does |
 | --- | --- |
 | `GEMINI_API_KEY` | Your Gemini API key (required). |
-| `GEMINI_MODEL` | The model that writes the answers. |
+| `GEMINI_MODEL` | The model that writes the answers and improves dictated questions (default `gemini-3.1-flash-lite`). |
 | `GEMINI_THINKING_LEVEL` | Optional, for Gemini 3 models: `minimal`, `low`, `medium` or `high`. Less thinking is faster; leave unset for the model's default. |
 | `GEMINI_THINKING_BUDGET` | Optional, the same for older models as a token budget (`0` turns thinking off). |
 | `FRONTEND_ORIGIN` | Where the frontend runs, for CORS (default `http://localhost:3000`). |
@@ -72,7 +79,8 @@ Frontend, from `frontend/`:
 - `frontend/app/page.tsx`: the app's state and the actions that connect the screens.
 - `frontend/components/`: the screens and panels (New Interview, History, the question box,
   the answers).
-- `frontend/hooks/`: speech recognition, the question draft and answer scrolling.
+- `frontend/hooks/`: speech recognition, the microphone recording and transcript improvement,
+  the question draft and answer scrolling.
 - `frontend/lib/`: the API client and shared types. Styles are in `frontend/app/style.css`.
 
 ## Security and limitations
@@ -84,7 +92,9 @@ backend publicly without authentication, TLS, access controls and secure storage
 not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
 
 The voice pause detection relies on the browser's SpeechRecognition events, so its accuracy and
-availability vary by browser. Model names in `.env.example` may need updating to models
+availability vary by browser. With transcript improvement on, each dictated question's recording
+is sent to Gemini (Chrome's live recognition also sends audio to Google), and each dictation makes
+one extra Gemini request, which counts toward your API key's rate limits. Model names in `.env.example` may need updating to models
 available to your API key.
 
 Before updating an existing installation, back up `backend/chat.db`. Database columns are

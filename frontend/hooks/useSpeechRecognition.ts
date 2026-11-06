@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAudioRecorder } from './useAudioRecorder';
 
 type SpeechResult = { isFinal: boolean; 0: { transcript: string } };
 type SpeechEvent = { resultIndex: number; results: ArrayLike<SpeechResult> };
@@ -26,8 +27,13 @@ type Options = {
   /** The mic won't start while an answer is being generated. */
   busyRef: { current: boolean };
   setError: (message: string) => void;
-  /** Called after the mic stops by itself because of a pause (the "stop after silence" option). */
-  onSilenceStop?: () => void;
+  /** Also record the audio, so it can be transcribed again more accurately when listening stops. */
+  record?: boolean;
+  /**
+   * Called when the mic stops by itself after a pause (the "stop after silence" option), with
+   * the stop in progress. It resolves with the recording, if one was made.
+   */
+  onSilenceStop?: (stopped: Promise<Blob | null>) => void;
 };
 
 export type Speech = ReturnType<typeof useSpeechRecognition>;
@@ -38,7 +44,14 @@ export type Speech = ReturnType<typeof useSpeechRecognition>;
  * its own now and then, so it is reopened until stopListening() is called. Every start gets a
  * new session number, and callbacks from an older session are ignored.
  */
-export function useSpeechRecognition({ language, appendWords, busyRef, setError, onSilenceStop }: Options) {
+export function useSpeechRecognition({
+  language,
+  appendWords,
+  busyRef,
+  setError,
+  record = false,
+  onSilenceStop,
+}: Options) {
   const [listening, setListening] = useState(false);
   const [supported, setSupported] = useState(true);
   const [status, setStatus] = useState('Ready to type or speak');
@@ -50,7 +63,7 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
   const autoPauseRef = useRef(false);
 
   const recognitionRef = useRef<Recognition | null>(null);
-  const stopListeningRef = useRef<(() => Promise<void>) | null>(null);
+  const stopListeningRef = useRef<(() => Promise<Blob | null>) | null>(null);
   const sessionRef = useRef(0);
   const shouldListenRef = useRef(false);
   const stoppingRef = useRef(false);
@@ -65,6 +78,11 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
   useEffect(() => {
     onSilenceStopRef.current = onSilenceStop;
   });
+  const recordRef = useRef(record);
+  useEffect(() => {
+    recordRef.current = record;
+  });
+  const { start: startRecording, stop: stopRecording, cancel: cancelRecording } = useAudioRecorder();
 
   const updateInterim = useCallback((value: string) => {
     interimRef.current = value;
@@ -110,11 +128,12 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
       recognitionFinalRef.current = '';
       clearTimers();
       disposeRecognition();
+      cancelRecording();
       setListening(false);
       setStatus('Microphone off');
       finishStop();
     },
-    [appendWords, clearTimers, disposeRecognition, finishStop, updateInterim],
+    [appendWords, cancelRecording, clearTimers, disposeRecognition, finishStop, updateInterim],
   );
 
   // Stops the mic once no new words have arrived for 2.2s (the "stop after silence" option).
@@ -122,18 +141,19 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
     if (silenceRef.current) clearTimeout(silenceRef.current);
     silenceRef.current = setTimeout(() => {
       const stop = stopListeningRef.current;
-      if (shouldListenRef.current && stop) void stop().then(() => onSilenceStopRef.current?.());
+      if (shouldListenRef.current && stop) onSilenceStopRef.current?.(stop());
     }, 2200);
   }, []);
 
-  const startListening = useCallback(() => {
+  /** Returns whether listening started. It won't while already listening or still stopping. */
+  const startListening = useCallback((): boolean => {
     const w = window as SpeechWindow;
     const Constructor = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (!Constructor) {
       setError('Live speech recognition is not supported in this browser. Try Chrome.');
-      return;
+      return false;
     }
-    if (shouldListenRef.current || busyRef.current) return;
+    if (shouldListenRef.current || stoppingRef.current || busyRef.current) return false;
     setError('');
     const token = ++sessionRef.current;
     shouldListenRef.current = true;
@@ -144,6 +164,7 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
     setListening(true);
     setStatus('Connecting microphone...');
     timerRef.current = setInterval(() => setElapsed(v => v + 1), 1000);
+    if (recordRef.current) startRecording();
 
     const openRecognition = () => {
       if (sessionRef.current !== token || !shouldListenRef.current || stoppingRef.current) return;
@@ -208,36 +229,50 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
       }
     };
     openRecognition();
-  }, [appendWords, busyRef, finishStop, haltRecognition, language, scheduleSilenceStop, setError, updateInterim]);
+    return true;
+  }, [
+    appendWords,
+    busyRef,
+    finishStop,
+    haltRecognition,
+    language,
+    scheduleSilenceStop,
+    setError,
+    startRecording,
+    updateInterim,
+  ]);
 
-  const stopListening = useCallback(async () => {
-    if (!shouldListenRef.current) return;
+  /** Stops listening once the last words are final. Resolves with the recording, if one was made. */
+  const stopListening = useCallback(async (): Promise<Blob | null> => {
+    if (!shouldListenRef.current) return null;
     stoppingRef.current = true;
     shouldListenRef.current = false;
     clearTimers();
     setListening(false);
     setStatus('Finishing transcription...');
+    // The recording ends now, while live recognition gets a moment to finalize its last words.
+    // (Taking it now also keeps it from being discarded by the halt below.)
+    const audio = stopRecording();
     const rec = recognitionRef.current;
-    if (!rec) {
-      haltRecognition(true);
-      return;
+    if (rec) {
+      await new Promise<void>(resolve => {
+        stopFinalizeRef.current = resolve;
+        stopWaitRef.current = setTimeout(() => {
+          // Some browsers never send onend after stop().
+          appendWords(interimRef.current);
+          updateInterim('');
+          finishStop();
+        }, 850);
+        try {
+          rec.stop();
+        } catch {
+          finishStop();
+        }
+      });
     }
-    await new Promise<void>(resolve => {
-      stopFinalizeRef.current = resolve;
-      stopWaitRef.current = setTimeout(() => {
-        // Some browsers never send onend after stop().
-        appendWords(interimRef.current);
-        updateInterim('');
-        finishStop();
-      }, 850);
-      try {
-        rec.stop();
-      } catch {
-        finishStop();
-      }
-    });
-    haltRecognition(false);
-  }, [appendWords, clearTimers, finishStop, haltRecognition, updateInterim]);
+    haltRecognition(!rec);
+    return audio;
+  }, [appendWords, clearTimers, finishStop, haltRecognition, stopRecording, updateInterim]);
 
   stopListeningRef.current = stopListening;
 
