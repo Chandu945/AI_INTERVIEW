@@ -9,6 +9,7 @@ from types import SimpleNamespace
 # a thinking setting or an access token to the tests.
 for name in ("GEMINI_API_KEY", "GEMINI_THINKING_LEVEL", "GEMINI_THINKING_BUDGET", "INTERACT_ACCESS_TOKEN"):
     os.environ[name] = ""
+os.environ["GEMINI_BACKUP_MODEL"] = "backup-model"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -29,7 +30,8 @@ class FakeGemini:
     """Streams the given (text, finish_reason) chunks for answers, returns `transcript` for
     transcriptions (or raises it, if it's an exception), and keeps what it was sent. To act slow
     or broken, `delays` and `errors` give, call by call, how many seconds to wait before replying
-    and an exception to raise instead. `calls` and `cancelled` count the requests."""
+    and an exception to raise instead. `calls` and `cancelled` count the requests, and `models`
+    and `configs` record what each was sent with."""
 
     def __init__(self, chunks):
         self.config = None
@@ -39,6 +41,8 @@ class FakeGemini:
         self.errors: list[Exception | None] = []
         self.calls = 0
         self.cancelled = 0
+        self.models: list[str] = []
+        self.configs: list = []
 
         async def wait_and_check():
             call = self.calls
@@ -53,6 +57,8 @@ class FakeGemini:
 
         async def generate_content_stream(model, contents, config):
             self.config, self.contents = config, contents
+            self.models.append(model)
+            self.configs.append(config)
 
             async def stream():
                 await wait_and_check()
@@ -63,6 +69,8 @@ class FakeGemini:
 
         async def generate_content(model, contents, config):
             self.config, self.contents = config, contents
+            self.models.append(model)
+            self.configs.append(config)
             await wait_and_check()
             if isinstance(self.transcript, Exception):
                 raise self.transcript

@@ -16,11 +16,13 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   text is usually ready by the time you stop. Anything you typed meanwhile is never overwritten;
   if Gemini is unavailable or its text doesn't match what was heard, the live words stay. Turn it
   off with "Improve the transcript with Gemini when you stop".
-- **Quick answers:** Gemini usually starts answering in 1 to 3 seconds, but now and then takes
-  10 to 30. If an answer hasn't started within a few seconds (twice as long as a quick reply,
-  at least 3 seconds), the backend sends the request again and uses whichever replies first; the
-  same goes for transcriptions. The connection to Gemini stays open between questions, so each
-  question doesn't wait for a new one.
+- **Quick answers:** Gemini usually starts answering in 1 to 3 seconds, but now and then stalls
+  for 10 to 30. If an answer hasn't started within a few seconds (twice as long as a quick
+  reply, at least 3 seconds), or Gemini returns an error, the backend also sends the question to
+  a second model (`GEMINI_BACKUP_MODEL`) and uses whichever replies first; the same goes for
+  transcriptions. The second model runs on separate capacity, so it still answers when the main
+  one is stalled. The connection to Gemini stays open between questions, so each question doesn't
+  wait for a new one.
 - **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
 
 ## First-time setup (macOS)
@@ -60,6 +62,7 @@ that, set `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (see `frontend/.env.loc
 | `GEMINI_MODEL` | The model that writes the answers and improves dictated questions (default `gemini-3.1-flash-lite`). |
 | `GEMINI_THINKING_LEVEL` | Optional, for Gemini 3 models: `minimal`, `low`, `medium` or `high`. Less thinking is faster; leave unset for the model's default. |
 | `GEMINI_THINKING_BUDGET` | Optional, the same for older models as a token budget (`0` turns thinking off). |
+| `GEMINI_BACKUP_MODEL` | Optional: the model a slow or failed request is also sent to (default `gemini-3.5-flash`). It answers with minimal thinking, so it must be a Gemini 3 model. Set it empty to retry with `GEMINI_MODEL`. |
 | `FRONTEND_ORIGIN` | Where the frontend runs, for CORS (default `http://localhost:3000`). |
 | `INTERACT_ACCESS_TOKEN` | Optional: require an `X-Interact-Token` header on API calls. The bundled frontend doesn't send one. |
 | `INTERACT_DB` | Optional: a database file to use instead of `backend/chat.db`. |

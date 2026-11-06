@@ -331,6 +331,7 @@ def test_transcription_problems_are_reported(client, gemini):
 
 SERVER_ERROR = errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
 RATE_LIMIT = errors.ClientError(429, {"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}})
+BAD_REQUEST = errors.ClientError(400, {"error": {"code": 400, "message": "bad", "status": "INVALID_ARGUMENT"}})
 
 
 def timed_ask(client, cid):
@@ -349,6 +350,12 @@ def test_a_slow_answer_is_requested_again_and_the_quicker_one_is_used(client, ge
     assert "".join(e["text"] for e in events if e["type"] == "delta") == "Quick answer."
     assert events[-1]["type"] == "done"
     assert (fake.calls, fake.cancelled) == (2, 1)
+    # The second request went to the backup model, with minimal thinking for speed.
+    assert fake.models == [main.MODEL, "backup-model"]
+    assert fake.configs[1].thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
+    assert fake.configs[1].system_instruction == fake.configs[0].system_instruction
+    # The backup's reply doesn't count toward how quick the main model normally is.
+    assert not main.ANSWER_HEDGE.recent
 
 
 def test_a_failed_answer_is_retried_at_once(client, gemini, monkeypatch):
@@ -359,16 +366,51 @@ def test_a_failed_answer_is_retried_at_once(client, gemini, monkeypatch):
     events, seconds = timed_ask(client, cid)
     assert seconds < 5
     assert events[-1]["type"] == "done"
-    assert fake.calls == 2
+    assert fake.models == [main.MODEL, "backup-model"]
 
 
-def test_a_rate_limited_answer_is_not_retried(client, gemini):
+def test_a_rate_limited_answer_goes_to_the_backup_model(client, gemini):
     cid = new_interview(client)
     fake = gemini(("Answer.", "STOP"))
-    fake.errors = [RATE_LIMIT]
+    fake.errors = [RATE_LIMIT]  # the backup model has its own limits
+    events, _ = timed_ask(client, cid)
+    assert events[-1]["type"] == "done"
+    assert fake.models == [main.MODEL, "backup-model"]
+
+
+def test_a_bad_request_is_not_retried(client, gemini):
+    cid = new_interview(client)
+    fake = gemini(("Answer.", "STOP"))
+    fake.errors = [BAD_REQUEST]
     events, _ = timed_ask(client, cid)
     assert events[-1]["type"] == "error"
     assert fake.calls == 1
+
+
+def test_without_a_backup_model_the_main_model_is_tried_again(client, gemini, monkeypatch):
+    monkeypatch.setattr(main, "BACKUP_MODEL", main.MODEL)
+    monkeypatch.setattr(main.ANSWER_HEDGE, "minimum", 0.3)
+    cid = new_interview(client)
+    fake = gemini(("Quick answer.", "STOP"))
+    fake.delays = [10, 0]
+    events, _ = timed_ask(client, cid)
+    assert events[-1]["type"] == "done"
+    assert fake.models == [main.MODEL, main.MODEL]
+    assert fake.configs[1].thinking_config is None  # the main model's own settings
+    # A rate limit isn't retried then: the same model would refuse again.
+    fake = gemini(("Answer.", "STOP"))
+    fake.errors = [RATE_LIMIT]
+    assert timed_ask(client, cid)[0][-1]["type"] == "error"
+    assert fake.calls == 1
+
+
+def test_when_both_models_fail_the_answer_reports_an_error(client, gemini):
+    cid = new_interview(client)
+    fake = gemini(("Answer.", "STOP"))
+    fake.errors = [SERVER_ERROR, SERVER_ERROR]
+    events, _ = timed_ask(client, cid)
+    assert events[-1]["type"] == "error"
+    assert fake.models == [main.MODEL, "backup-model"]
 
 
 def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
@@ -382,6 +424,7 @@ def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
     assert time.perf_counter() - started < 5
     assert response.json() == {"text": "What is RAG?"}
     assert (fake.calls, fake.cancelled) == (2, 1)
+    assert fake.models == [main.MODEL, "backup-model"]
 
 
 def test_the_retry_waits_twice_a_quick_reply():

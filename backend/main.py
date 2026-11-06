@@ -30,6 +30,9 @@ logger = logging.getLogger("voice-chatbot")
 # INTERACT_DB lets tests run against a throwaway database.
 DB = Path(os.getenv("INTERACT_DB") or HERE / "chat.db")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+# A slow or failed request is also sent to this model. It runs on separate capacity, so a stall
+# in MODEL doesn't hold up the answer. Empty means the second try goes to MODEL itself.
+BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "gemini-3.5-flash").strip() or MODEL
 # Optional: how much the model "thinks" before answering; less is faster. Gemini 3 models take a
 # level (minimal, low, medium or high); older models take a token budget instead (0 turns it off).
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().upper()
@@ -65,21 +68,37 @@ async def warm_up(client):
         logger.warning("Couldn't reach Gemini model %s at startup: %s", MODEL, exc)
 
 
+def for_attempt(config: types.GenerateContentConfig, backup: bool):
+    """The model and settings for a try. The backup model answers with minimal thinking, for speed."""
+    if not backup or BACKUP_MODEL == MODEL:
+        return MODEL, config
+    minimal = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
+    return BACKUP_MODEL, config.model_copy(update={"thinking_config": minimal})
+
+
+def worth_retrying(error: Exception) -> bool:
+    """Server and network errors are. Of the errors caused by the request itself, only a missing
+    model or a rate limit, and only when the backup is a different model (with its own limits)."""
+    if not isinstance(error, errors.ClientError):
+        return True
+    return error.code in (404, 429) and BACKUP_MODEL != MODEL
+
+
 class Hedge:
     """
-    Sends a request again when Gemini is slow. Gemini usually replies within 1-3 seconds, but now
-    and then takes 10-30 seconds or fails, and a second try is then usually quick. If an attempt
-    hasn't succeeded after twice the time of a quick recent reply (between `minimum` and `maximum`
-    seconds), or it fails with a server or network error, a second attempt starts and whichever
-    succeeds first is used; the other is cancelled. Errors caused by the request itself, like the
-    per-minute rate limit, aren't retried.
+    Sends a second request when Gemini is slow. Gemini usually replies within 1-3 seconds, but now
+    and then takes 10-30 seconds or fails. If an attempt hasn't succeeded after twice the time of a
+    quick recent reply (between `minimum` and `maximum` seconds), or it fails in a way worth
+    retrying, a second attempt goes to the backup model, and whichever succeeds first is used; the
+    other is cancelled. The backup runs on separate capacity, so it helps even when the main model
+    is stalled for everyone.
     """
 
     def __init__(self, name: str, minimum: float, maximum: float):
         self.name = name
         self.minimum = minimum
         self.maximum = maximum
-        self.recent: deque[float] = deque(maxlen=20)  # how long recent successful attempts took
+        self.recent: deque[float] = deque(maxlen=20)  # how long the main model's recent replies took
 
     def delay(self) -> float:
         if not self.recent:
@@ -90,14 +109,22 @@ class Hedge:
         return min(self.maximum, max(self.minimum, 2 * quick))
 
     async def run(self, attempt, discard=None):
-        """Returns what attempt() returns. discard() is given a second result, if both succeed, to close it."""
+        """
+        Returns what attempt(backup=False) or attempt(backup=True) returns, whichever succeeds
+        first. discard() is given the other result, if both succeed, to close it.
+        """
 
-        async def timed():
+        async def timed(backup):
             started = time.perf_counter()
-            result = await attempt()
+            try:
+                result = await attempt(backup)
+            except Exception as exc:
+                if backup:
+                    logger.warning("%s: the backup (%s) failed: %s", self.name, BACKUP_MODEL, exc)
+                raise
             return result, time.perf_counter() - started
 
-        tasks = [asyncio.create_task(timed())]
+        tasks = [asyncio.create_task(timed(False))]
         winner = None
         try:
             delay = self.delay()
@@ -106,20 +133,23 @@ class Hedge:
             if done and error is None:
                 winner = tasks[0]
             else:
-                if isinstance(error, errors.ClientError):
+                if error and not worth_retrying(error):
                     raise error
                 reason = f"failed ({error})" if error else f"no reply after {delay:.1f}s"
-                logger.warning("%s %s; sending the request again", self.name, reason)
-                tasks.append(asyncio.create_task(timed()))
+                logger.warning("%s %s; also sending it to %s", self.name, reason, BACKUP_MODEL)
+                tasks.append(asyncio.create_task(timed(True)))
                 while winner is None:
                     pending = [task for task in tasks if not task.done()]
                     if not pending:
-                        raise tasks[-1].exception()
+                        raise tasks[0].exception()  # both failed; the main model's error says more
                     await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     winner = next((t for t in tasks if t.done() and t.exception() is None), None)
-                logger.info("%s: attempt %s of 2 replied first", self.name, tasks.index(winner) + 1)
+                logger.info("%s: the %s replied first", self.name, "backup" if winner is tasks[1] else "original")
             result, seconds = winner.result()
-            self.recent.append(seconds)
+            # Only the main model's own replies show how quick it normally is. (Counting the backup's
+            # would make the next retry wait longer just when the main model is having trouble.)
+            if winner is tasks[0]:
+                self.recent.append(seconds)
             return result
         finally:
             for task in tasks:
@@ -400,29 +430,31 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
         role=row["target_role"], interview_type=row["interview_type"], terms=", ".join(terms)
     )
 
-    async def attempt():
+    async def attempt(backup):
+        # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
+        config = types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=8000))
+        model, config = for_attempt(config, backup)
         response = await client.aio.models.generate_content(
-            model=MODEL,
+            model=model,
             contents=[
                 types.Content(
                     role="user",
                     parts=[types.Part.from_text(text=prompt), types.Part.from_bytes(data=audio, mime_type="audio/wav")],
                 )
             ],
-            # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
-            config=types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=8000)),
+            config=config,
         )
-        return (response.text or "").strip()
+        return (response.text or "").strip(), model
 
     started = time.perf_counter()
     try:
-        text = await TRANSCRIBE_HEDGE.run(attempt)
+        text, model = await TRANSCRIBE_HEDGE.run(attempt)
     except Exception as exc:
         logger.exception("Gemini transcription failed")
         raise HTTPException(502, "Transcription failed; the live transcript was kept") from exc
     logger.info(
         "transcribe model=%s bytes=%s total_ms=%s chars=%s",
-        MODEL, len(audio), round((time.perf_counter() - started) * 1000), len(text),
+        model, len(audio), round((time.perf_counter() - started) * 1000), len(text),
     )  # fmt: skip
     return {"text": text}
 
@@ -551,20 +583,21 @@ def save_turn(cid: str, question: str, answer: str):
         )
 
 
-async def start_answer(client, contents, config):
-    """Starts a streamed answer and reads it up to the first text. Returns the stream and the chunks read."""
-    stream = await client.aio.models.generate_content_stream(model=MODEL, contents=contents, config=config)
+async def start_answer(client, contents, config, backup):
+    """Starts a streamed answer and reads it up to the first text. Returns the stream, the chunks
+    read and the model answering."""
+    model, config = for_attempt(config, backup)
+    stream = await client.aio.models.generate_content_stream(model=model, contents=contents, config=config)
     head = []
     async for chunk in stream:
         head.append(chunk)
         if chunk.text:
             break
-    return stream, head
+    return stream, head, model
 
 
 async def close_answer(started):
-    stream, _ = started
-    await stream.aclose()
+    await started[0].aclose()
 
 
 @app.post("/api/chat/stream")
@@ -584,7 +617,9 @@ async def stream_chat(request: ChatRequest):
         finish_reason = None
         yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
         try:
-            stream, head = await ANSWER_HEDGE.run(lambda: start_answer(client, contents, config), discard=close_answer)
+            stream, head, answered_by = await ANSWER_HEDGE.run(
+                lambda backup: start_answer(client, contents, config, backup), discard=close_answer
+            )
 
             async def all_chunks():
                 for chunk in head:
@@ -630,7 +665,7 @@ async def stream_chat(request: ChatRequest):
             first_ms = round((first_token - started) * 1000) if first_token else None
             logger.info(
                 "chat_stream model=%s mode=%s first_token_ms=%s total_ms=%s chars=%s",
-                MODEL,
+                answered_by,
                 request.mode,
                 first_ms,
                 total_ms,
