@@ -19,7 +19,8 @@ export type Session = {
 
 /** One line of a streamed answer (see /api/chat/stream in backend/main.py). */
 export type StreamEvent = {
-  type: 'start' | 'delta' | 'done' | 'error';
+  /** 'question': a recorded question, as Gemini wrote it down. */
+  type: 'start' | 'question' | 'delta' | 'done' | 'error';
   conversation_id?: string;
   text?: string;
   message?: string;

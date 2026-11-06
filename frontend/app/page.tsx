@@ -10,7 +10,7 @@ import { useDraft } from '../hooks/useDraft';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useStickToBottom } from '../hooks/useStickToBottom';
 import { useTabAudio } from '../hooks/useTabAudio';
-import { useTranscriptImprover } from '../hooks/useTranscriptImprover';
+import { useTranscriptImprover, type HandOff } from '../hooks/useTranscriptImprover';
 import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
 import type { AnswerMode, Message, Session, StreamMetrics, View, VoiceSource } from '../lib/types';
 
@@ -48,7 +48,7 @@ export default function Home() {
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
   const improver = useTranscriptImprover({ draftRef, updateDraft, conversationId });
-  const { begin: beginDictation, noteDictated, noteTyped, prefetch, prepare, improve } = improver;
+  const { begin: beginDictation, noteDictated, noteTyped, prefetch, prepare, improve, handOver } = improver;
   // Only real words count as dictation (stopping also flushes an often-empty last phrase).
   const appendDictated = useCallback(
     (words: string) => {
@@ -75,9 +75,8 @@ export default function Home() {
     onRecordingEnd: prepare,
     // Runs after a later render, by which time finish and sendMessage (defined below) exist.
     onSilenceStop: stopped => {
-      void finish(stopped).then(() => {
-        if (autoSend) void sendMessage();
-      });
+      void finish(stopped);
+      if (autoSend) void sendMessage(); // it waits for the last words itself
     },
   });
   const { haltRecognition, startListening, stopListening, updateInterim, isListening } = speech;
@@ -117,10 +116,12 @@ export default function Home() {
   );
 
   // The dictation being finished (the mic stopping, then the transcript being polished), so
-  // that Send can wait for it.
+  // that Send can wait for it, and the stopping part alone (its last words coming in).
   const finishingRef = useRef<Promise<void> | null>(null);
+  const stoppedRef = useRef<Promise<void>>(Promise.resolve());
   const finish = useCallback(
     (stopped: Promise<void>) => {
+      stoppedRef.current = stopped;
       const done = stopped.then(improve).finally(() => {
         if (finishingRef.current === done) finishingRef.current = null;
       });
@@ -214,17 +215,23 @@ export default function Home() {
 
   const sendMessage = useCallback(async () => {
     if (busyRef.current) return;
-    // Wait for dictation to finish: its last words, then polishing (a few seconds). Other sends
-    // (a second click, ⌘+Enter) are ignored meanwhile.
+    // Wait for dictation's last words. Then, if its transcript isn't final yet, send the question
+    // with its recording: one Gemini request writes it down and answers it, which is quicker than
+    // waiting for the transcript first. Otherwise wait for the transcript, if any, and send the
+    // text. Other sends (a second click, ⌘+Enter) are ignored meanwhile.
     busyRef.current = true;
+    let recording: HandOff | null = null;
     try {
-      await finishDictation();
+      const finishing = finishDictation();
+      await stoppedRef.current;
+      recording = conversationId ? await handOver() : null;
+      if (!recording) await finishing;
     } finally {
       busyRef.current = false;
     }
-    const text = draftRef.current.trim();
-    if (!text || busyRef.current) {
-      if (!text) setError('Type or speak a message first.');
+    const text = recording ? recording.heard : draftRef.current.trim();
+    if ((!text && !recording) || busyRef.current) {
+      if (!text && !recording) setError('Type or speak a message first.');
       return;
     }
     if (text.length > MAX_QUESTION_CHARS) {
@@ -241,18 +248,26 @@ export default function Home() {
     updateDraft('');
     updateInterim('');
     followNewest(); // show the new question even if the reader had scrolled up
-    setMessages(prev => [...prev, { role: 'user', content: text }]);
+    setMessages(prev => [...prev, { role: 'user', content: text || '…' }]); // '…' until Gemini writes it down
     setStreamMetrics(null);
     const controller = new AbortController();
     chatRequestRef.current = controller;
     // Create an answer placeholder and update it progressively as chunks arrive.
     setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
     let completed = false;
+    // The question as shown: for a recording, its live words until Gemini has written it down.
+    let question = text;
     try {
-      const response = await api.askQuestion(
-        { message: text, conversation_id: conversationId, mode: answerMode },
-        controller.signal,
-      );
+      const response =
+        recording && conversationId
+          ? await api.askRecordedQuestion(
+              { audio: recording.audio, heard: text, conversation_id: conversationId, mode: answerMode },
+              controller.signal,
+            )
+          : await api.askQuestion(
+              { message: text, conversation_id: conversationId, mode: answerMode },
+              controller.signal,
+            );
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw new Error(errorMessage(data, `Chat request failed (${response.status})`));
@@ -261,6 +276,11 @@ export default function Home() {
       let received = '';
       await readEvents(response.body, event => {
         if (event.type === 'start' && event.conversation_id) setConversationId(event.conversation_id);
+        if (event.type === 'question' && event.text) {
+          const written = event.text;
+          question = written;
+          setMessages(prev => prev.map((m, i) => (i === prev.length - 2 ? { role: 'user', content: written } : m)));
+        }
         if (event.type === 'delta' && event.text) {
           received += event.text;
           const next = received;
@@ -278,8 +298,8 @@ export default function Home() {
     } catch (e) {
       if (!controller.signal.aborted && mountedRef.current) {
         setError(e instanceof Error ? e.message : 'Could not send message');
-        updateDraft(text);
-        setFailedDraft(text);
+        updateDraft(question);
+        setFailedDraft(question);
         // Drop the uncompleted answer and unsaved question.
         setMessages(prev => prev.slice(0, -2));
       }
@@ -293,6 +313,7 @@ export default function Home() {
     conversationId,
     draftRef,
     finishDictation,
+    handOver,
     followNewest,
     refreshSessions,
     updateDraft,

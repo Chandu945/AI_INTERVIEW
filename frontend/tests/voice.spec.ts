@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { chatRequests, forgetRequests, openApp, openInterview, transcribeRequests, waitForAnswer } from './helpers';
 
 // Speech recognition is faked (see helpers.ts), so window.__say() stands in for speaking.
@@ -272,7 +272,7 @@ test('pressing the mic again while it is still stopping is ignored', async ({ pa
   await expect(page.getByLabel('Your message')).toHaveValue('First question.');
 });
 
-test('a second Send while the transcript is polished does not send twice', async ({ page }) => {
+test('a second Send while the first is still going out does not send twice', async ({ page }) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
     window.__transcript = 'What is a closure?';
@@ -280,15 +280,98 @@ test('a second Send while the transcript is polished does not send twice', async
   });
   await forgetRequests(page);
   await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
   await page.evaluate(() => window.__say('what is a closure'));
-  await page.waitForTimeout(500);
-  const send = page.getByRole('button', { name: /Send/ });
-  await send.click(); // stops the mic, polishes, then sends
-  await send.click();
+  await page.waitForTimeout(200);
+  // Two clicks at once, as a quick double-click: the first stops the mic and sends; the second is ignored.
+  await page.evaluate(() => {
+    const send = document.querySelector<HTMLButtonElement>('.btn.primary')!;
+    send.click();
+    send.click();
+  });
   await expect(page.locator('.message.user').last()).toContainText('What is a closure?');
   await waitForAnswer(page);
   expect(await chatRequests(page)).toBe(1);
   await expect(page.locator('.error-banner')).toHaveCount(0);
+});
+
+// Sending while the transcript isn't final yet: the question goes with its recording, and one
+// Gemini request writes it down and answers it.
+
+const chatUrls = (page: Page) => page.evaluate(() => window.__requests.filter(url => url.includes('/api/chat')));
+
+test('Send before the transcript is final sends the recording, and Gemini writes the question down', async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcript = 'What is RAG in LangChain?';
+    window.__transcriptDelayMs = 2_000; // the pause's transcript is still on its way at Send
+  });
+  await forgetRequests(page);
+  const box = page.getByLabel('Your message');
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300); // the recorder is running
+  await page.evaluate(() => window.__say('what is rag in lang chain'));
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.message.user').last()).toContainText('What is RAG in LangChain?');
+  await waitForAnswer(page);
+  expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]);
+  await expect(box).toHaveValue('');
+  await page.waitForTimeout(2_000); // the transcript comes back, and leaves the box alone
+  await expect(box).toHaveValue('');
+  await expect(page.locator('.editor-top')).not.toContainText('Transcript improved');
+});
+
+test('Send once the transcript is final sends its text', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcript = 'What is RAG in LangChain?';
+  });
+  await forgetRequests(page);
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.__say('what is rag in lang chain'));
+  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG in LangChain?');
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.message.user').last()).toContainText('What is RAG in LangChain?');
+  await waitForAnswer(page);
+  expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]);
+});
+
+test('a dictated question that was typed in is sent as its text', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__streams(50, 5);
+    window.__transcript = 'This should not be used.';
+    window.__transcriptDelayMs = 2_000;
+  });
+  await forgetRequests(page);
+  const box = page.getByLabel('Your message');
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.__say('what is a closure'));
+  await box.focus();
+  await box.press('End');
+  await box.pressSequentially(' in JavaScript');
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.message.user').last()).toContainText('what is a closure in JavaScript');
+  await waitForAnswer(page);
+  expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]);
+});
+
+test("if a recorded question can't be answered, its words come back to the box", async ({ page }) => {
+  // No fake answer: the test backend has no Gemini key, so the request fails.
+  await page.evaluate(() => {
+    window.__transcriptDelayMs = 2_000;
+    window.__transcript = 'What is a pod?';
+  });
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.__say('what is a pod'));
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.error-banner')).toContainText('GEMINI_API_KEY');
+  await expect(page.getByLabel('Your message')).toHaveValue('what is a pod');
+  await expect(page.getByRole('button', { name: 'Retry question' })).toBeVisible();
 });
 
 test("if Gemini can't transcribe, the live words stay", async ({ page }) => {

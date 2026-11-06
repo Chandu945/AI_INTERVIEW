@@ -2,12 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 
 export type ImproveStatus = 'idle' | 'improving' | 'improved' | 'kept-edits' | 'failed' | 'too-long';
+/** A dictated question's recording and live words, to send it with before its transcript is final. */
+export type HandOff = { audio: Blob; heard: string };
 
 // If Gemini takes longer than this, the live transcript is simply kept.
 const TIMEOUT_MS = 8_000;
-// A tab can talk on and on (a class, say), so only recordings up to 2 minutes, a long question,
-// are improved. The recorder makes 16 kHz 16-bit audio: 32,000 bytes a second.
-const MAX_TAB_BYTES = 120 * 32_000;
+// About 2 minutes of the recorder's 16 kHz 16-bit audio (32,000 bytes a second), a long question:
+// the most a question is sent with, and, as a tab can talk on and on (a class, say), the most of
+// a tab that is improved.
+const TWO_MINUTES = 120 * 32_000;
 // A tab pauses after nearly every sentence, and the answers share Gemini's free per-minute
 // limit, so a tab sends at most 3 transcriptions at once, and after that one every 6 seconds.
 const TAB_BURST = 3;
@@ -55,6 +58,8 @@ type Segment = {
   polished?: string;
   /** Whether the recording got too long to improve. */
   tooLong?: boolean;
+  /** Whether the question was sent with its recording, so its transcript must leave the draft alone. */
+  handedOver?: boolean;
   /** Started when listening stopped, for the whole recording. */
   final?: Transcript;
   /** The whole recording, in case none of the above fits. */
@@ -105,6 +110,8 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
   const enabledRef = useRef(true);
   const [status, setStatus] = useState<ImproveStatus>('idle');
   const segmentRef = useRef<Segment | null>(null);
+  // The dictation whose transcript improve() is waiting for, so handOver() can still take it.
+  const improvingRef = useRef<Segment | null>(null);
   // Counts dictations, so a slow transcription can't change the draft once a new one has started.
   const dictationRef = useRef(0);
   const conversationRef = useRef(conversationId);
@@ -189,7 +196,7 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
       segment.pauses += 1;
       const early: Early = {
         expected: segment.expected,
-        transcript: transcribe(id, recording(), segment.fromTab ? MAX_TAB_BYTES : Infinity),
+        transcript: transcribe(id, recording(), segment.fromTab ? TWO_MINUTES : Infinity),
         seq: segment.pauses,
       };
       segment.early = early;
@@ -207,7 +214,7 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
       segment.audio = audio;
       // Nothing more to send if the last pause's transcript is in, or on its way, and no words came after it.
       const upToDate = segment.polished === segment.expected || segment.early?.expected === segment.expected;
-      if (wordsPending || !upToDate) segment.final = transcribe(id, audio, segment.fromTab ? MAX_TAB_BYTES : Infinity);
+      if (wordsPending || !upToDate) segment.final = transcribe(id, audio, segment.fromTab ? TWO_MINUTES : Infinity);
     },
     [usable],
   );
@@ -228,11 +235,18 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     if (!request && !segment.audio) return; // nothing was recorded
     const dictation = dictationRef.current;
     setStatus('improving');
-    let text = request ? await request : null;
-    // The early transcript had no audio (the recorder was still starting), or none fits: use the whole recording.
-    if (text === null && !segment.final && segment.audio)
-      text = await transcribe(id, segment.audio, segment.fromTab ? MAX_TAB_BYTES : Infinity);
+    improvingRef.current = segment;
+    let text: Text;
+    try {
+      text = request ? await request : null;
+      // The early transcript had no audio (the recorder was still starting), or none fits: use the whole recording.
+      if (text === null && !segment.final && segment.audio)
+        text = await transcribe(id, segment.audio, segment.fromTab ? TWO_MINUTES : Infinity);
+    } finally {
+      if (improvingRef.current === segment) improvingRef.current = null;
+    }
     if (dictationRef.current !== dictation) return; // a new dictation has started; leave its draft alone
+    if (segment.handedOver) return setStatus('idle'); // sent with its recording already
     const draft = draftRef.current;
     if (text === null || (changed() && !draft.trim())) return setStatus('idle'); // nothing recorded, or sent/cleared
     if (text === undefined) return setStatus('failed');
@@ -244,5 +258,24 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     setStatus('improved');
   }, [draftRef, updateDraft]);
 
-  return { enabled, setEnabled, status, begin, noteDictated, noteTyped, prefetch, prepare, improve };
+  /**
+   * Call when sending, once dictation's last words are in. If the transcript isn't final yet,
+   * returns the recording and the live words, so the question can go at once and Gemini writes it
+   * down while answering it, and keeps the transcript from changing the draft later. Null if the
+   * draft is final already or was typed in (then its text is sent as it is), or if part of the
+   * question was in the box before dictating.
+   */
+  const handOver = useCallback(async (): Promise<HandOff | null> => {
+    const segment = segmentRef.current ?? improvingRef.current;
+    if (!segment?.audio || segment.handedOver || !enabledRef.current || segment.prefix.trim()) return null;
+    const settled = () =>
+      segment.typed || draftRef.current !== segment.expected || segment.polished === segment.expected;
+    if (settled()) return null;
+    const audio = await segment.audio;
+    if (!audio || audio.size > TWO_MINUTES || settled() || segment.handedOver) return null;
+    segment.handedOver = true;
+    return { audio, heard: draftRef.current.trim() };
+  }, [draftRef]);
+
+  return { enabled, setEnabled, status, begin, noteDictated, noteTyped, prefetch, prepare, improve, handOver };
 }

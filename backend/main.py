@@ -15,7 +15,7 @@ from typing import Literal, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from google import genai
@@ -437,12 +437,8 @@ def vocabulary(*texts: str, limit: int = 40) -> list[str]:
     return list(found.values())[:limit]
 
 
-@app.post("/api/conversations/{conversation_id}/transcribe")
-async def transcribe(conversation_id: str, file: UploadFile = File(...)):
-    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as hints."""
-    client = app.state.chat_client
-    if client is None:
-        raise HTTPException(503, "GEMINI_API_KEY is not configured")
+async def read_recording(file: UploadFile) -> bytes:
+    """The uploaded recording, checked: WAV, not empty and not too long."""
     if (file.content_type or "").split(";")[0] != "audio/wav":
         raise HTTPException(415, "Send the recording as audio/wav")
     audio = await file.read(MAX_RECORDING_BYTES + 1)
@@ -450,6 +446,12 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
         raise HTTPException(413, "Recording is too long")
     if not audio:
         raise HTTPException(400, "Recording is empty")
+    return audio
+
+
+def interview_hints(conversation_id: str):
+    """The interview's role and type, and the technical terms its questions may use (common ones,
+    then those in its job description and resume), for writing down recorded questions."""
     with connect() as db:
         row = db.execute(
             "SELECT target_role, interview_type, job_description, resume_text FROM sessions WHERE id=?",
@@ -459,9 +461,18 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
         raise HTTPException(404, "Interview not found")
     known = {term.lower() for term in COMMON_TERMS}
     terms = COMMON_TERMS + [t for t in vocabulary(row["job_description"], row["resume_text"]) if t.lower() not in known]
-    prompt = TRANSCRIBE_PROMPT.format(
-        role=row["target_role"], interview_type=row["interview_type"], terms=", ".join(terms)
-    )
+    return row["target_role"], row["interview_type"], ", ".join(terms)
+
+
+@app.post("/api/conversations/{conversation_id}/transcribe")
+async def transcribe(conversation_id: str, file: UploadFile = File(...)):
+    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as hints."""
+    client = app.state.chat_client
+    if client is None:
+        raise HTTPException(503, "GEMINI_API_KEY is not configured")
+    audio = await read_recording(file)
+    role, interview_type, terms = interview_hints(conversation_id)
+    prompt = TRANSCRIBE_PROMPT.format(role=role, interview_type=interview_type, terms=terms)
 
     async def attempt(model):
         # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
@@ -564,7 +575,8 @@ CUT_OFF_NOTE = (
 )
 
 
-def make_contents(cid: str, question: str):
+def make_contents(cid: str, *question: types.Part):
+    """The interview so far, then the new question: its text, or its recording and what to do with it."""
     # Only the last 10 messages (5 exchanges), to keep follow-up context without unbounded latency/cost.
     previous = history(cid, 10)
     contents = [
@@ -573,7 +585,7 @@ def make_contents(cid: str, question: str):
         )
         for m in previous
     ]
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=question)]))
+    contents.append(types.Content(role="user", parts=list(question)))
     return contents
 
 
@@ -645,81 +657,187 @@ async def stream_chat(request: ChatRequest):
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
     ensure_session(cid)
-    contents = make_contents(cid, request.message)
+    contents = make_contents(cid, types.Part.from_text(text=request.message))
     config = chat_config(request.mode, session_context(cid) + resume_context(cid, request.message))
+    return answer_response(answer_events(client, cid, request.mode, contents, config, request.message))
 
-    async def generate():
-        started = time.perf_counter()
-        first_token = None
-        chunks = []
-        finish_reason = None
-        yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
+
+RECORDED_QUESTION_PROMPT = (
+    'The interview question is in this recording. First, on one line starting with "Q: ", write the question '
+    "exactly as spoken, in normal sentence case with punctuation, spelling technical terms the standard way "
+    "(terms that may come up include: {terms}). Then leave a blank line and answer the question as you normally would."
+)
+
+
+@app.post("/api/chat/stream-recording")
+async def stream_chat_from_recording(
+    file: UploadFile = File(...),
+    conversation_id: str = Form(...),
+    mode: Literal["quick", "balanced", "detailed"] = Form("balanced"),
+    heard: str = Form("", max_length=10000),
+):
+    """Answers a question sent as its recording, with `heard` its live words. One Gemini request
+    does it all: Gemini writes the question down, which goes out as a "question" event and is saved
+    as the question, then answers it. Quicker than transcribing the recording and then asking."""
+    client = app.state.chat_client
+    if client is None:
+        raise HTTPException(503, "GEMINI_API_KEY is not configured")
+    audio = await read_recording(file)
+    _, _, terms = interview_hints(conversation_id)
+    heard = heard.strip()
+    contents = make_contents(
+        conversation_id,
+        types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+        types.Part.from_text(text=RECORDED_QUESTION_PROMPT.format(terms=terms)),
+    )
+    config = chat_config(mode, session_context(conversation_id) + resume_context(conversation_id, heard))
+    # Room for the question's line on top of the answer.
+    config = config.model_copy(update={"max_output_tokens": config.max_output_tokens + 200})
+    events = answer_events(client, conversation_id, mode, contents, config, heard, from_recording=True)
+    return answer_response(events)
+
+
+QUESTION_LINE = re.compile(r"\s*(?:\*\*)?Q(?:uestion)?(?:\*\*)?\s*:\s*(?:\*\*)?\s*", re.IGNORECASE)
+
+
+class QuestionLine:
+    """For a recorded question, Gemini first writes the question down on a line starting "Q: ".
+    feed() takes the streamed text, holds it back until that line is complete, then lets the answer
+    through. `question` is the question once known ("" if Gemini didn't write one)."""
+
+    def __init__(self):
+        self.question = None
+        self.held = ""
+        self.answering = False
+
+    def feed(self, text: str) -> str:
+        """The part of `text` that belongs to the answer."""
+        if self.question is None:
+            self.held += text
+            if "\n" not in self.held.lstrip() and len(self.held) < 500:
+                return ""
+            text = self._split()
+        return self._answer(text)
+
+    def finish(self) -> str:
+        """At the end of the stream: any answer text still held back."""
+        return "" if self.question is not None else self._answer(self._split())
+
+    def _split(self) -> str:
+        text, self.held = self.held.lstrip(), ""
+        match = QUESTION_LINE.match(text)
+        if not match:
+            self.question = ""
+            return text
+        line, _, rest = text[match.end() :].partition("\n")
+        self.question = line.strip().strip("*").strip()
+        return rest
+
+    def _answer(self, text: str) -> str:
+        if not self.answering:  # the blank line between the question and the answer
+            text = text.lstrip()
+            self.answering = bool(text)
+        return text
+
+
+async def answer_events(client, cid, mode, contents, config, question, from_recording=False):
+    """The answer, streamed as NDJSON events, then saved with its question. For a recorded
+    question, Gemini writes the question down first: it is sent as a "question" event and saved in
+    place of `question` (the live words, kept if Gemini doesn't write one)."""
+    splitter = QuestionLine() if from_recording else None
+
+    def question_event():
+        nonlocal question
+        question = splitter.question or question or "(spoken question)"
+        return json.dumps({"type": "question", "text": question}, ensure_ascii=False) + "\n"
+
+    started = time.perf_counter()
+    first_token = None
+    chunks = []
+    finish_reason = None
+    yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
+    try:
+        stream, head, answered_by = await ANSWER_HEDGE.run(
+            lambda model: start_answer(client, contents, config, model), discard=close_answer
+        )
+
+        async def all_chunks():
+            for chunk in head:
+                yield chunk
+            async for chunk in stream:
+                yield chunk
+
         try:
-            stream, head, answered_by = await ANSWER_HEDGE.run(
-                lambda model: start_answer(client, contents, config, model), discard=close_answer
-            )
-
-            async def all_chunks():
-                for chunk in head:
-                    yield chunk
-                async for chunk in stream:
-                    yield chunk
-
-            try:
-                async for chunk in all_chunks():
-                    if chunk.candidates and chunk.candidates[0].finish_reason:
-                        finish_reason = chunk.candidates[0].finish_reason
-                    delta = chunk.text or ""
+            async for chunk in all_chunks():
+                if chunk.candidates and chunk.candidates[0].finish_reason:
+                    finish_reason = chunk.candidates[0].finish_reason
+                delta = chunk.text or ""
+                if not delta:
+                    continue
+                if first_token is None:
+                    first_token = time.perf_counter()
+                if splitter:
+                    waiting = splitter.question is None
+                    delta = splitter.feed(delta)
+                    if waiting and splitter.question is not None:
+                        yield question_event()
                     if not delta:
                         continue
-                    if first_token is None:
-                        first_token = time.perf_counter()
-                    chunks.append(delta)
-                    yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
-            finally:
-                await stream.aclose()
-            if finish_reason == types.FinishReason.MAX_TOKENS:
-                logger.warning("Answer hit the %s-token limit (mode=%s)", MODE_TOKENS[request.mode], request.mode)
-                if not "".join(chunks).strip():
-                    # Thinking can use up the whole limit before any answer text is written.
-                    yield (
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "message": "Gemini reached the answer-length limit before writing anything. Choose a longer answer length and retry.",
-                            }
-                        )
-                        + "\n"
+                chunks.append(delta)
+                yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
+        finally:
+            await stream.aclose()
+        if splitter and splitter.question is None:  # the stream ended within the first line
+            rest = splitter.finish()
+            yield question_event()
+            if rest:
+                chunks.append(rest)
+                yield json.dumps({"type": "delta", "text": rest}, ensure_ascii=False) + "\n"
+        if finish_reason == types.FinishReason.MAX_TOKENS:
+            logger.warning("Answer hit the %s-token limit (mode=%s)", MODE_TOKENS[mode], mode)
+            if not "".join(chunks).strip():
+                # Thinking can use up the whole limit before any answer text is written.
+                yield (
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Gemini reached the answer-length limit before writing anything. Choose a longer answer length and retry.",
+                        }
                     )
-                    return
-                chunks.append(CUT_OFF_NOTE)
-                yield json.dumps({"type": "delta", "text": CUT_OFF_NOTE}, ensure_ascii=False) + "\n"
-            answer = "".join(chunks).strip()
-            if not answer:
-                raise ValueError("Gemini returned an empty answer")
-            # Save only completed responses; failed or interrupted streams are not persisted.
-            await asyncio.to_thread(save_turn, cid, request.message, answer)
-            total_ms = round((time.perf_counter() - started) * 1000)
-            first_ms = round((first_token - started) * 1000) if first_token else None
-            logger.info(
-                "chat_stream model=%s mode=%s first_token_ms=%s total_ms=%s chars=%s",
-                answered_by,
-                request.mode,
-                first_ms,
-                total_ms,
-                len(answer),
-            )
-            yield (
-                json.dumps({"type": "done", "conversation_id": cid, "first_token_ms": first_ms, "total_ms": total_ms})
-                + "\n"
-            )
-        except asyncio.CancelledError:
-            logger.info("Chat stream disconnected; incomplete response not saved")
-            raise
-        except Exception:
-            logger.exception("Gemini streaming chat failed")
-            yield json.dumps({"type": "error", "message": "Gemini request failed; check backend logs"}) + "\n"
+                    + "\n"
+                )
+                return
+            chunks.append(CUT_OFF_NOTE)
+            yield json.dumps({"type": "delta", "text": CUT_OFF_NOTE}, ensure_ascii=False) + "\n"
+        answer = "".join(chunks).strip()
+        if not answer:
+            raise ValueError("Gemini returned an empty answer")
+        # Save only completed responses; failed or interrupted streams are not persisted.
+        await asyncio.to_thread(save_turn, cid, question, answer)
+        total_ms = round((time.perf_counter() - started) * 1000)
+        first_ms = round((first_token - started) * 1000) if first_token else None
+        logger.info(
+            "chat_stream model=%s mode=%s first_token_ms=%s total_ms=%s chars=%s from_recording=%s",
+            answered_by,
+            mode,
+            first_ms,
+            total_ms,
+            len(answer),
+            bool(splitter),
+        )
+        yield (
+            json.dumps({"type": "done", "conversation_id": cid, "first_token_ms": first_ms, "total_ms": total_ms})
+            + "\n"
+        )
+    except asyncio.CancelledError:
+        logger.info("Chat stream disconnected; incomplete response not saved")
+        raise
+    except Exception:
+        logger.exception("Gemini streaming chat failed")
+        yield json.dumps({"type": "error", "message": "Gemini request failed; check backend logs"}) + "\n"
 
+
+def answer_response(events):
     return StreamingResponse(
-        generate(), media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        events, media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )

@@ -32,6 +32,18 @@ export const api = {
   },
   askQuestion: (body: { message: string; conversation_id: string | null; mode: AnswerMode }, signal: AbortSignal) =>
     fetch(`${API}/api/chat/stream`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body), signal }),
+  /** Asks a question by its recording (with its live words): Gemini writes it down and answers it. */
+  askRecordedQuestion: (
+    fields: { audio: Blob; heard: string; conversation_id: string; mode: AnswerMode },
+    signal: AbortSignal,
+  ) => {
+    const body = new FormData();
+    body.append('file', fields.audio, 'question.wav');
+    body.append('heard', fields.heard);
+    body.append('conversation_id', fields.conversation_id);
+    body.append('mode', fields.mode);
+    return fetch(`${API}/api/chat/stream-recording`, { method: 'POST', body, signal });
+  },
 };
 
 /**

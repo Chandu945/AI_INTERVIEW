@@ -6,7 +6,7 @@ export const API = 'http://localhost:8100';
 declare global {
   interface Window {
     __requests: string[];
-    __fakeStream: null | (() => Response);
+    __fakeStream: null | ((url: string, heard: string) => Response);
     __emptyHistory: boolean;
     __streams: (intervalMs?: number, count?: number) => void;
     __say: (text: string) => void;
@@ -54,19 +54,25 @@ function pageFakes() {
       const body = JSON.stringify({ sessions: [] });
       return Promise.resolve(new Response(body, { headers: { 'Content-Type': 'application/json' } }));
     }
-    if (window.__fakeStream && url.includes('/api/chat/stream')) return Promise.resolve(window.__fakeStream());
+    if (window.__fakeStream && url.includes('/api/chat/stream')) {
+      const heard = init?.body instanceof FormData ? String(init.body.get('heard') ?? '') : '';
+      return Promise.resolve(window.__fakeStream(url, heard));
+    }
     return realFetch(input, init);
   };
 
   // Answers with `count` sentences, one every `intervalMs`.
   window.__streams = (intervalMs = 100, count = 40) => {
-    window.__fakeStream = () => {
+    window.__fakeStream = (url, heard) => {
       const encoder = new TextEncoder();
       const line = (event: object) => encoder.encode(JSON.stringify(event) + '\n');
       let sent = 0;
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(line({ type: 'start' }));
+          // A question sent as its recording: Gemini writes it down first (here, as __transcript).
+          if (url.endsWith('/stream-recording'))
+            controller.enqueue(line({ type: 'question', text: window.__transcript ?? heard }));
           const timer = setInterval(() => {
             sent += 1;
             if (sent <= count) {

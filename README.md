@@ -12,11 +12,15 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   Gemini transcribes the recording again, using the role and the technical terms in your resume
   and job description as hints. Its version replaces the live words: proper punctuation and terms
   like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or "fast api". This happens
-  as you go: at each pause, the recording so far is sent, and about 1.5 seconds later Gemini's
+  as you go: at each pause, the recording so far is sent, and about 2 seconds later Gemini's
   version replaces those words while you keep speaking, so the text is usually final by the time
-  you stop. Anything you typed meanwhile is never overwritten; if Gemini is unavailable or its
-  text doesn't match what was heard, the live words stay. Turn it off with "Improve the transcript
-  with Gemini as it listens".
+  you stop. If you press Send before it is, the question goes with its recording instead: one
+  Gemini request writes it down and answers it, so the answer starts about 2 to 3 seconds after
+  Send rather than after a transcript and then an answer. (To check the text before sending,
+  press Stop and wait for Gemini's version.) Anything you typed meanwhile is never overwritten,
+  and a question you typed in is sent as its text; if Gemini is unavailable or its text doesn't
+  match what was heard, the live words stay. Turn it off with "Improve the transcript with Gemini
+  as it listens".
 - **Listen to a browser tab:** instead of the microphone, the app can listen to another Chrome
   tab, such as a YouTube video or a Google Meet call. Set "Listen to" to "A browser tab", press
   **Listen to tab**, pick the tab in Chrome's list and keep "Also share tab audio" on. Live words

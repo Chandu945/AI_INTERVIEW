@@ -328,6 +328,64 @@ def test_transcription_problems_are_reported(client, gemini):
     assert send_recording(client, cid).status_code == 502
 
 
+# Questions sent as their recording: Gemini writes the question down and answers it in one go.
+
+
+def ask_recording(client, cid, heard="what is rag", data=None, content_type="audio/wav"):
+    audio = silence_wav() if data is None else data
+    return client.post(
+        "/api/chat/stream-recording",
+        data={"conversation_id": cid, "mode": "quick", "heard": heard},
+        files={"file": ("question.wav", audio, content_type)},
+    )
+
+
+def events_of(response):
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+def test_a_recorded_question_is_written_down_and_answered_in_one_go(client, gemini):
+    cid = new_interview(client, job_description="We use PostgreSQL.")
+    # The question's line arrives in pieces, as it would from Gemini.
+    fake = gemini(("Q", None), (": What is RAG", None), ("?\n", None), ("\nRAG pairs a retriever", None), (" with a model.", "STOP"))  # fmt: skip
+    events = events_of(ask_recording(client, cid))
+    assert [e["type"] for e in events] == ["start", "question", "delta", "delta", "done"]
+    assert events[1]["text"] == "What is RAG?"
+    assert "".join(e["text"] for e in events if e["type"] == "delta") == "RAG pairs a retriever with a model."
+    audio, prompt = fake.contents[-1].parts
+    assert audio.inline_data.mime_type == "audio/wav"
+    assert 'starting with "Q: "' in prompt.text and "PostgreSQL" in prompt.text
+    assert [m["content"] for m in saved_messages(client, cid)] == [
+        "What is RAG?",
+        "RAG pairs a retriever with a model.",
+    ]
+
+
+def test_without_a_question_line_the_live_words_are_kept_as_the_question(client, gemini):
+    cid = new_interview(client)
+    gemini(("RAG pairs a retriever with a model.", "STOP"))
+    events = events_of(ask_recording(client, cid, heard="what is rag"))
+    assert events[1] == {"type": "question", "text": "what is rag"}
+    assert events[2] == {"type": "delta", "text": "RAG pairs a retriever with a model."}
+    assert saved_messages(client, cid)[0]["content"] == "what is rag"
+
+
+def test_the_question_line_is_found_however_it_is_written():
+    for first in ("Q: What is RAG?", "**Q:** What is RAG?", "Question: What is RAG?"):
+        splitter = main.QuestionLine()
+        answer = splitter.feed(first + "\n\n") + splitter.feed("Retrieval first.")
+        assert (splitter.question, answer) == ("What is RAG?", "Retrieval first.")
+
+
+def test_recorded_questions_are_checked(client, gemini):
+    cid = new_interview(client)
+    assert ask_recording(client, cid).status_code == 503  # no API key
+    gemini(("Q: Hi?\n\nHello.", "STOP"))
+    assert ask_recording(client, cid, content_type="audio/webm").status_code == 415
+    assert ask_recording(client, cid, data=b"").status_code == 400
+    assert ask_recording(client, "missing").status_code == 404
+
+
 # Slow or failed Gemini requests are sent again (see main.Hedge).
 
 SERVER_ERROR = errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
