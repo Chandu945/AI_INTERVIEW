@@ -300,6 +300,7 @@ def test_transcription_uses_the_interview_as_hints(client, gemini):
     fake.transcript = "  What is a DAG in Airflow?  "
     assert send_recording(client, cid).json() == {"text": "What is a DAG in Airflow?"}
     prompt, audio = fake.contents[0].parts
+    assert fake.config.thinking_config.thinking_level == types.ThinkingLevel.MINIMAL  # quicker
     assert "Data Engineer (Mixed interview)" in prompt.text
     for term in ("LangChain", "PostgreSQL", "PySpark", "TensorFlow", "S3", "AWS"):
         assert term in prompt.text

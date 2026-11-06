@@ -44,22 +44,31 @@ test("a tab's sound is listened to instead of the mic, and the tab stays shared"
   expect(await shares(page)).toBe(1);
 });
 
-test('a tab is transcribed by Gemini once, when listening stops, not at every pause', async ({ page }) => {
+test("a tab's words are improved live, with at most 3 transcriptions at once", async ({ page }) => {
   await page.evaluate(() => {
-    window.__transcript = 'First sentence. Second sentence.';
+    window.__transcripts = ['One.', 'One, two.', 'One, two, three.', 'One, two, three, four.'];
   });
   await forgetRequests(page);
   const listen = page.locator('.mic-btn');
+  const box = page.getByLabel('Your message');
   await listen.click();
   await page.waitForTimeout(300); // the recorder is running
-  await page.evaluate(() => window.__say('first sentence')); // a pause
+  for (const [words, shown] of [
+    ['one', 'One.'],
+    ['two', 'One, two.'],
+    ['three', 'One, two, three.'],
+  ]) {
+    await page.evaluate(text => window.__say(text), words); // a pause: sends the recording so far
+    await expect(box).toHaveValue(shown);
+  }
+  // A fourth pause right away is skipped: after 3 at once, a tab sends one every 6 seconds.
+  await page.evaluate(() => window.__say('four'));
   await page.waitForTimeout(300);
-  await page.evaluate(() => window.__say('second sentence')); // another pause
-  await page.waitForTimeout(500);
-  expect(await transcribeRequests(page)).toBe(0);
-  await listen.click();
-  await expect(page.getByLabel('Your message')).toHaveValue('First sentence. Second sentence.');
-  expect(await transcribeRequests(page)).toBe(1);
+  await expect(box).toHaveValue('One, two, three. four');
+  expect(await transcribeRequests(page)).toBe(3);
+  await listen.click(); // so the last words are transcribed at Stop
+  await expect(box).toHaveValue('One, two, three, four.');
+  expect(await transcribeRequests(page)).toBe(4);
 });
 
 test("Chrome's Stop sharing stops listening and keeps the words; the next start asks again", async ({ page }) => {

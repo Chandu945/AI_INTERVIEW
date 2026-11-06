@@ -194,7 +194,7 @@ export function Composer({
       <div className="options-row">
         <label>
           <input type="checkbox" checked={improve} onChange={e => onImproveChange(e.target.checked)} /> Improve the
-          transcript with Gemini when you stop
+          transcript with Gemini as it listens
         </label>
       </div>
       <div className="options-row">

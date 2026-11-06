@@ -127,6 +127,57 @@ test('after a pause, the improved transcript is ready as soon as you stop', asyn
   expect(await transcribeRequests(page)).toBe(1);
 });
 
+test("at each pause, Gemini's version replaces the words while still listening", async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcripts = ['What is RAG?', 'What is RAG? How does LangChain use it?'];
+  });
+  const mic = page.locator('.mic-btn');
+  const box = page.getByLabel('Your message');
+  await mic.click();
+  await page.waitForTimeout(300); // the recorder is running
+  await page.evaluate(() => window.__say('what is rag'));
+  await expect(box).toHaveValue('What is RAG?');
+  await page.evaluate(() => window.__say('how does lang chain use it'));
+  await expect(box).toHaveValue('What is RAG? How does LangChain use it?');
+  await expect(mic).toContainText('Stop listening'); // all while listening
+  await mic.click();
+  // Nothing was left to transcribe at Stop.
+  await expect(page.locator('.editor-top')).toContainText('Transcript improved by Gemini');
+  await expect(box).toHaveValue('What is RAG? How does LangChain use it?');
+  expect(await transcribeRequests(page)).toBe(2);
+});
+
+test('a transcript that comes back while more words arrive keeps the newer words', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcripts = ['First part.', 'First part, second part.'];
+    window.__transcriptDelays = [400, 800];
+  });
+  const box = page.getByLabel('Your message');
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.__say('first part'));
+  await page.waitForTimeout(100);
+  await page.evaluate(() => window.__say('second part')); // the first transcript is still on its way
+  await expect(box).toHaveValue('First part. second part'); // the first is swapped in; later words stay
+  await expect(box).toHaveValue('First part, second part.'); // then the second, which covers both
+});
+
+test('an older transcript coming back late never replaces a newer one', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__transcripts = ['First part.', 'First part, second part.'];
+    window.__transcriptDelays = [1_200, 0];
+  });
+  const box = page.getByLabel('Your message');
+  await page.locator('.mic-btn').click();
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.__say('first part')); // slow to come back
+  await page.waitForTimeout(100);
+  await page.evaluate(() => window.__say('second part')); // back at once
+  await expect(box).toHaveValue('First part, second part.');
+  await page.waitForTimeout(1_400); // the first one has come back by now
+  await expect(box).toHaveValue('First part, second part.');
+});
+
 test('words still being recognized when you stop get a fresh transcript', async ({ page }) => {
   await page.evaluate(() => {
     window.__transcript = 'First part.';
@@ -197,9 +248,11 @@ test('a slow transcript is dropped once you start speaking again', async ({ page
     window.__transcriptDelayMs = 0;
   });
   await mic.click();
+  await page.waitForTimeout(300); // the recorder is running
   await page.evaluate(() => window.__say('second part'));
   await page.waitForTimeout(2_000);
-  await expect(box).toHaveValue('first question second part');
+  // Only this dictation's own transcript is swapped in, never the first one's.
+  await expect(box).toHaveValue('first question Second part.');
   await mic.click();
   await expect(box).toHaveValue('first question Second part.');
 });

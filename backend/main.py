@@ -465,7 +465,12 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...)):
 
     async def attempt(model):
         # A short limit: if Gemini is slow, the app keeps the live transcript instead of waiting.
-        config = types.GenerateContentConfig(temperature=0, http_options=types.HttpOptions(timeout=8000))
+        # Writing down what was said needs no thinking, and skipping it makes replies quicker.
+        config = types.GenerateContentConfig(
+            temperature=0,
+            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
+            http_options=types.HttpOptions(timeout=8000),
+        )
         config = settings_for(model, config)
         response = await client.aio.models.generate_content(
             model=model,

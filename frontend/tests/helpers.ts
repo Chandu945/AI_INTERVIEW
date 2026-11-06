@@ -13,6 +13,8 @@ declare global {
     __sayInterim: (text: string) => void;
     __transcript: string | null;
     __transcriptDelayMs: number;
+    __transcripts: string[];
+    __transcriptDelays: number[];
     __recognitionTrack: MediaStreamTrack | null;
     __tabShare: 'share' | 'cancel' | 'no-audio';
     __tabShares: number;
@@ -31,17 +33,22 @@ function pageFakes() {
   window.__fakeStream = null;
   window.__emptyHistory = false;
   // When set, recordings are "transcribed" as this text instead of being sent to the test backend
-  // (which has no Gemini key, so it answers 503).
+  // (which has no Gemini key, so it answers 503). __transcripts and __transcriptDelays, when not
+  // empty, give each request its own text and delay instead, in turn.
   window.__transcript = null;
   window.__transcriptDelayMs = 0;
+  window.__transcripts = [];
+  window.__transcriptDelays = [];
   const realFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const url = String(input);
     window.__requests.push(url);
-    if (window.__transcript !== null && url.endsWith('/transcribe')) {
-      const body = JSON.stringify({ text: window.__transcript });
+    if ((window.__transcript !== null || window.__transcripts.length) && url.endsWith('/transcribe')) {
+      const text = window.__transcripts.length ? window.__transcripts.shift() : window.__transcript;
+      const delay = window.__transcriptDelays.length ? window.__transcriptDelays.shift() : window.__transcriptDelayMs;
+      const body = JSON.stringify({ text });
       const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
-      return new Promise(resolve => setTimeout(() => resolve(response), window.__transcriptDelayMs));
+      return new Promise(resolve => setTimeout(() => resolve(response), delay));
     }
     if (window.__emptyHistory && !init?.method && url.endsWith('/api/conversations')) {
       const body = JSON.stringify({ sessions: [] });
