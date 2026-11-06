@@ -5,7 +5,10 @@ import { openApp, openInterview, sendQuestion, waitForAnswer } from './helpers';
 
 const panel = (page: Page) => page.locator('.conversation-body');
 const panelScroll = (page: Page) =>
-  panel(page).evaluate(body => ({ top: Math.round(body.scrollTop), fromBottom: Math.round(body.scrollHeight - body.scrollTop - body.clientHeight) }));
+  panel(page).evaluate(body => ({
+    top: Math.round(body.scrollTop),
+    fromBottom: Math.round(body.scrollHeight - body.scrollTop - body.clientHeight),
+  }));
 // Scrolls the answer panel and fires its scroll event right away, as a real scroll would.
 const scrollPanelTo = (page: Page, where: 'top' | 'bottom') =>
   panel(page).evaluate((body, to) => {

@@ -4,11 +4,15 @@ type SpeechResult = { isFinal: boolean; 0: { transcript: string } };
 type SpeechEvent = { resultIndex: number; results: ArrayLike<SpeechResult> };
 type SpeechError = { error: string };
 type Recognition = {
-  continuous: boolean; interimResults: boolean; lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
   onresult: ((event: SpeechEvent) => void) | null;
   onerror: ((event: SpeechError) => void) | null;
   onend: (() => void) | null;
-  start: () => void; stop: () => void; abort: () => void;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
 };
 type SpeechWindow = Window & {
   SpeechRecognition?: new () => Recognition;
@@ -58,7 +62,9 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
   const stopFinalizeRef = useRef<(() => void) | null>(null);
   // Always the latest callback, since the silence timer outlives the render that started it.
   const onSilenceStopRef = useRef(onSilenceStop);
-  useEffect(() => { onSilenceStopRef.current = onSilenceStop; });
+  useEffect(() => {
+    onSilenceStopRef.current = onSilenceStop;
+  });
 
   const updateInterim = useCallback((value: string) => {
     interimRef.current = value;
@@ -66,7 +72,8 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
   }, []);
 
   const clearTimers = useCallback(() => {
-    if (silenceRef.current) clearTimeout(silenceRef.current); silenceRef.current = null;
+    if (silenceRef.current) clearTimeout(silenceRef.current);
+    silenceRef.current = null;
     if (timerRef.current) clearInterval(timerRef.current);
     if (restartRef.current) clearTimeout(restartRef.current);
     timerRef.current = null;
@@ -79,7 +86,11 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
       rec.onresult = null;
       rec.onerror = null;
       rec.onend = null;
-      try { rec.abort(); } catch { /* already stopped */ }
+      try {
+        rec.abort();
+      } catch {
+        /* already stopped */
+      }
     }
   }, []);
   const finishStop = useCallback(() => {
@@ -89,19 +100,22 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
     stopFinalizeRef.current = null;
     if (resolve) resolve();
   }, []);
-  const haltRecognition = useCallback((preserveInterim: boolean) => {
-    sessionRef.current += 1;
-    shouldListenRef.current = false;
-    stoppingRef.current = false;
-    if (preserveInterim) appendWords(interimRef.current);
-    updateInterim('');
-    recognitionFinalRef.current = '';
-    clearTimers();
-    disposeRecognition();
-    setListening(false);
-    setStatus('Microphone off');
-    finishStop();
-  }, [appendWords, clearTimers, disposeRecognition, finishStop, updateInterim]);
+  const haltRecognition = useCallback(
+    (preserveInterim: boolean) => {
+      sessionRef.current += 1;
+      shouldListenRef.current = false;
+      stoppingRef.current = false;
+      if (preserveInterim) appendWords(interimRef.current);
+      updateInterim('');
+      recognitionFinalRef.current = '';
+      clearTimers();
+      disposeRecognition();
+      setListening(false);
+      setStatus('Microphone off');
+      finishStop();
+    },
+    [appendWords, clearTimers, disposeRecognition, finishStop, updateInterim],
+  );
 
   // Stops the mic once no new words have arrived for 2.2s (the "stop after silence" option).
   const scheduleSilenceStop = useCallback(() => {
@@ -115,7 +129,10 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
   const startListening = useCallback(() => {
     const w = window as SpeechWindow;
     const Constructor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Constructor) { setError('Live speech recognition is not supported in this browser. Try Chrome.'); return; }
+    if (!Constructor) {
+      setError('Live speech recognition is not supported in this browser. Try Chrome.');
+      return;
+    }
     if (shouldListenRef.current || busyRef.current) return;
     setError('');
     const token = ++sessionRef.current;
@@ -147,8 +164,7 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
         }
         // Browser results represent the current recognition session, not just new words.
         // Append only the newly finalized suffix, keeping manual textarea edits intact.
-        if (final.length < recognitionFinalRef.current.length ||
-            !final.startsWith(recognitionFinalRef.current)) {
+        if (final.length < recognitionFinalRef.current.length || !final.startsWith(recognitionFinalRef.current)) {
           recognitionFinalRef.current = '';
         }
         const addition = final.slice(recognitionFinalRef.current.length).trim();
@@ -183,8 +199,10 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
           restartRef.current = setTimeout(openRecognition, 300);
         }
       };
-      try { rec.start(); setStatus('Listening live'); }
-      catch {
+      try {
+        rec.start();
+        setStatus('Listening live');
+      } catch {
         setError('Unable to start speech recognition. Check microphone permissions.');
         haltRecognition(true);
       }
@@ -200,7 +218,10 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
     setListening(false);
     setStatus('Finishing transcription...');
     const rec = recognitionRef.current;
-    if (!rec) { haltRecognition(true); return; }
+    if (!rec) {
+      haltRecognition(true);
+      return;
+    }
     await new Promise<void>(resolve => {
       stopFinalizeRef.current = resolve;
       stopWaitRef.current = setTimeout(() => {
@@ -209,21 +230,29 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
         updateInterim('');
         finishStop();
       }, 850);
-      try { rec.stop(); } catch { finishStop(); }
+      try {
+        rec.stop();
+      } catch {
+        finishStop();
+      }
     });
     haltRecognition(false);
   }, [appendWords, clearTimers, finishStop, haltRecognition, updateInterim]);
 
   stopListeningRef.current = stopListening;
 
-  const changeAutoPause = useCallback((on: boolean) => {
-    autoPauseRef.current = on;
-    setAutoPause(on);
-    if (silenceRef.current) clearTimeout(silenceRef.current);
-    silenceRef.current = null;
-    // If words were already heard, start counting the current pause now.
-    if (on && shouldListenRef.current && (recognitionFinalRef.current.trim() || interimRef.current.trim())) scheduleSilenceStop();
-  }, [scheduleSilenceStop]);
+  const changeAutoPause = useCallback(
+    (on: boolean) => {
+      autoPauseRef.current = on;
+      setAutoPause(on);
+      if (silenceRef.current) clearTimeout(silenceRef.current);
+      silenceRef.current = null;
+      // If words were already heard, start counting the current pause now.
+      if (on && shouldListenRef.current && (recognitionFinalRef.current.trim() || interimRef.current.trim()))
+        scheduleSilenceStop();
+    },
+    [scheduleSilenceStop],
+  );
 
   const isListening = useCallback(() => shouldListenRef.current, []);
 
@@ -234,7 +263,17 @@ export function useSpeechRecognition({ language, appendWords, busyRef, setError,
   }, [haltRecognition]);
 
   return {
-    listening, supported, status, elapsed, interim, autoPause,
-    startListening, stopListening, haltRecognition, changeAutoPause, updateInterim, isListening,
+    listening,
+    supported,
+    status,
+    elapsed,
+    interim,
+    autoPause,
+    startListening,
+    stopListening,
+    haltRecognition,
+    changeAutoPause,
+    updateInterim,
+    isListening,
   };
 }

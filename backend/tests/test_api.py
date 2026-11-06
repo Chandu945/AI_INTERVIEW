@@ -1,4 +1,5 @@
 """API tests: interviews, resume uploads, streamed answers and how prompts are built."""
+
 import asyncio
 import io
 import json
@@ -54,6 +55,7 @@ def saved_messages(client, cid):
 
 # Interviews
 
+
 def test_health(client):
     assert client.get("/api/health").json() == {"status": "ok"}
 
@@ -62,7 +64,11 @@ def test_new_interview_keeps_its_settings_and_is_listed(client):
     cid = new_interview(client, target_role="Data Engineer", interview_type="HR", mode="detailed")
     session = client.get(f"/api/conversations/{cid}").json()["session"]
     assert (session["title"], session["target_role"], session["interview_type"], session["mode"]) == (
-        "New Interview", "Data Engineer", "HR", "detailed")
+        "New Interview",
+        "Data Engineer",
+        "HR",
+        "detailed",
+    )
     assert [s["id"] for s in client.get("/api/conversations").json()["sessions"]] == [cid]
 
 
@@ -103,6 +109,7 @@ def test_removed_endpoints_are_gone(client):
 
 # Resume uploads
 
+
 def test_resume_over_20_pages_gets_the_page_limit_message(client):
     response = upload(client, new_interview(client), "long.pdf", blank_pdf(21))
     assert (response.status_code, response.json()["detail"]) == (422, "Resume has 21 pages; the limit is 20")
@@ -120,7 +127,9 @@ def test_pdf_without_text_is_rejected(client):
 
 def test_docx_resume_is_saved(client):
     cid = new_interview(client)
-    response = upload(client, cid, "resume.docx", docx_with("Jane Doe. Python developer: FastAPI, RAG pipelines, PostgreSQL."))
+    response = upload(
+        client, cid, "resume.docx", docx_with("Jane Doe. Python developer: FastAPI, RAG pipelines, PostgreSQL.")
+    )
     assert response.status_code == 200 and response.json()["resume_name"] == "resume.docx"
     assert client.get(f"/api/conversations/{cid}").json()["session"]["resume_name"] == "resume.docx"
 
@@ -129,21 +138,28 @@ def test_resume_upload_validation(client):
     cid = new_interview(client)
     assert upload(client, cid, "resume.txt", b"plain text").status_code == 400
     assert upload(client, cid, "big.pdf", b"x" * (5 * 1024 * 1024 + 1)).status_code == 413
-    assert upload(client, "missing", "resume.docx", docx_with("Jane Doe, Python developer with FastAPI.")).status_code == 404
+    assert (
+        upload(client, "missing", "resume.docx", docx_with("Jane Doe, Python developer with FastAPI.")).status_code
+        == 404
+    )
 
 
 def test_resume_parsing_does_not_block_other_requests(client, monkeypatch):
     """A slow parse runs in a worker thread, so other requests still get answers right away."""
+
     def slow_extract(ext, raw):
         time.sleep(1.0)
         return "Jane Doe. Python developer with FastAPI and RAG experience."
+
     monkeypatch.setattr(main, "extract_resume_text", slow_extract)
     cid = new_interview(client)
 
     async def seconds_until_health_answers():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as api:
             started = time.perf_counter()
-            parsing = asyncio.create_task(api.post(f"/api/conversations/{cid}/resume", files={"file": ("r.docx", b"x")}))
+            parsing = asyncio.create_task(
+                api.post(f"/api/conversations/{cid}/resume", files={"file": ("r.docx", b"x")})
+            )
             await asyncio.sleep(0.2)
             await api.get("/api/health")
             elapsed = time.perf_counter() - started
@@ -154,6 +170,7 @@ def test_resume_parsing_does_not_block_other_requests(client, monkeypatch):
 
 
 # Streamed answers
+
 
 def test_streamed_answer_is_saved_and_names_the_interview(client, gemini):
     cid = new_interview(client)
@@ -169,8 +186,10 @@ def test_streamed_answer_is_saved_and_names_the_interview(client, gemini):
 
 def test_cut_off_answer_is_marked_and_saved(client, gemini):
     cid = new_interview(client)
-    gemini(("Situation: our team split on a database choice. I proposed", None),
-           (" a short spike to", types.FinishReason.MAX_TOKENS))
+    gemini(
+        ("Situation: our team split on a database choice. I proposed", None),
+        (" a short spike to", types.FinishReason.MAX_TOKENS),
+    )
     events = ask(client, cid)
     assert events[-1]["type"] == "done"
     assert "Cut off at the answer-length limit" in events[-2]["text"]
@@ -197,6 +216,7 @@ def test_question_over_10000_characters_is_rejected(client):
 
 
 # Prompt building
+
 
 def test_hr_interview_gets_behavioral_guidance(client, gemini):
     fake = gemini(("An answer.", "STOP"))
@@ -243,6 +263,11 @@ def test_thinking_settings(monkeypatch):
 
 
 def test_invalid_thinking_level_stops_startup():
-    result = subprocess.run([sys.executable, "-c", "import main"], cwd=Path(main.__file__).parent,
-                            env={**os.environ, "GEMINI_THINKING_LEVEL": "bogus"}, capture_output=True, text=True)
+    result = subprocess.run(
+        [sys.executable, "-c", "import main"],
+        cwd=Path(main.__file__).parent,
+        env={**os.environ, "GEMINI_THINKING_LEVEL": "bogus"},
+        capture_output=True,
+        text=True,
+    )
     assert result.returncode != 0 and "GEMINI_THINKING_LEVEL must be" in result.stderr

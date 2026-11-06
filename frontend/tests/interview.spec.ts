@@ -42,7 +42,9 @@ test('the answer length chosen during an interview is remembered', async ({ page
   await openInterview(page, 'Demo interview');
   await expect(selected).toHaveText('Detailed');
   // Put it back for the other tests.
-  await request.patch(`${API}/api/conversations/${await interviewId(request, 'Demo interview')}`, { data: { mode: 'balanced' } });
+  await request.patch(`${API}/api/conversations/${await interviewId(request, 'Demo interview')}`, {
+    data: { mode: 'balanced' },
+  });
 });
 
 test('Focus Mode hides the settings, widens the answers and fades older questions', async ({ page }) => {
@@ -62,6 +64,8 @@ test('Focus Mode hides the settings, widens the answers and fades older question
 test('Focus Mode on a phone keeps the answers near the top', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('button', { name: 'Focus Mode' }).click();
-  const answersTop = await page.locator('.conversation-panel').evaluate(panel => panel.getBoundingClientRect().top + window.scrollY);
+  const answersTop = await page
+    .locator('.conversation-panel')
+    .evaluate(panel => panel.getBoundingClientRect().top + window.scrollY);
   expect(answersTop).toBeLessThan(560);
 });

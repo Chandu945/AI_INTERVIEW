@@ -45,7 +45,12 @@ function pageFakes() {
           const timer = setInterval(() => {
             sent += 1;
             if (sent <= count) {
-              controller.enqueue(line({ type: 'delta', text: `Sentence ${sent} of a long streamed answer that keeps growing line after line. ` }));
+              controller.enqueue(
+                line({
+                  type: 'delta',
+                  text: `Sentence ${sent} of a long streamed answer that keeps growing line after line. `,
+                }),
+              );
             } else {
               clearInterval(timer);
               controller.enqueue(line({ type: 'done', first_token_ms: 100, total_ms: 4000 }));
@@ -66,9 +71,13 @@ function pageFakes() {
     onerror: Handler<{ error: string }> = null;
     onend: (() => void) | null = null;
     results: Result[] = [];
-    constructor() { recognitions.push(this); }
+    constructor() {
+      recognitions.push(this);
+    }
     start() {}
-    stop() { setTimeout(() => this.onend?.(), 30); }
+    stop() {
+      setTimeout(() => this.onend?.(), 30);
+    }
     abort() {}
   }
   for (const name of ['SpeechRecognition', 'webkitSpeechRecognition']) {
@@ -108,10 +117,17 @@ export function chatRequests(page: Page) {
 }
 
 export async function forgetRequests(page: Page) {
-  await page.evaluate(() => { window.__requests.length = 0; });
+  await page.evaluate(() => {
+    window.__requests.length = 0;
+  });
 }
 
-export async function interviewId(request: { get: (url: string) => Promise<{ json: () => Promise<unknown> }> }, title: string) {
-  const { sessions } = (await (await request.get(`${API}/api/conversations`)).json()) as { sessions: { id: string; title: string }[] };
+export async function interviewId(
+  request: { get: (url: string) => Promise<{ json: () => Promise<unknown> }> },
+  title: string,
+) {
+  const { sessions } = (await (await request.get(`${API}/api/conversations`)).json()) as {
+    sessions: { id: string; title: string }[];
+  };
   return sessions.find(s => s.title === title)!.id;
 }

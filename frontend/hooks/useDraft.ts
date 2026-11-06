@@ -13,12 +13,15 @@ export function useDraft() {
     setDraft(value);
   }, []);
 
-  const appendWords = useCallback((words: string) => {
-    const text = words.trim();
-    if (!text) return;
-    const previous = draftRef.current;
-    updateDraft(previous + (previous && !/\s$/.test(previous) ? ' ' : '') + text);
-  }, [updateDraft]);
+  const appendWords = useCallback(
+    (words: string) => {
+      const text = words.trim();
+      if (!text) return;
+      const previous = draftRef.current;
+      updateDraft(previous + (previous && !/\s$/.test(previous) ? ' ' : '') + text);
+    },
+    [updateDraft],
+  );
 
   return { draft, draftRef, updateDraft, appendWords };
 }

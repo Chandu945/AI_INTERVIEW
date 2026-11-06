@@ -1,0 +1,7 @@
+.next/
+.next-test/
+node_modules/
+test-results/
+playwright-report/
+package-lock.json
+tests/**/*-snapshots/

@@ -10,8 +10,13 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 export const api = {
   listInterviews: () => fetch(`${API}/api/conversations`),
   getInterview: (id: string) => fetch(`${API}/api/conversations/${id}`),
-  createInterview: (fields: { target_role: string; interview_type: InterviewType; mode: AnswerMode; instructions: string; job_description: string }) =>
-    fetch(`${API}/api/conversations`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(fields) }),
+  createInterview: (fields: {
+    target_role: string;
+    interview_type: InterviewType;
+    mode: AnswerMode;
+    instructions: string;
+    job_description: string;
+  }) => fetch(`${API}/api/conversations`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(fields) }),
   uploadResume: (id: string, file: File) => {
     const body = new FormData();
     body.append('file', file);

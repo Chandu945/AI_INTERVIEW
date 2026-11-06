@@ -1,1 +1,34 @@
-{"name":"voice-chatbot-frontend","version":"1.0.0","private":true,"scripts":{"dev":"next dev","build":"next build","start":"next start","test":"playwright test","test:update-screenshots":"playwright test --update-snapshots"},"dependencies":{"next":"^15.5.0","react":"^19.0.0","react-dom":"^19.0.0","react-markdown":"^10.1.0","remark-gfm":"^4.0.1"},"devDependencies":{"@playwright/test":"^1.65.0","@types/node":"^22.0.0","@types/react":"^19.0.0","@types/react-dom":"^19.0.0","typescript":"^5.0.0"}}
+{
+  "name": "voice-chatbot-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "playwright test",
+    "test:update-screenshots": "playwright test --update-snapshots",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^15.5.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.3.7",
+    "@playwright/test": "^1.65.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^15.5.28",
+    "prettier": "^3.9.10",
+    "typescript": "^5.0.0"
+  }
+}

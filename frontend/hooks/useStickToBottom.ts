@@ -25,7 +25,8 @@ export function useStickToBottom(messages: unknown, busy: boolean) {
 
   // On narrow screens the answer panel doesn't scroll on its own; the whole page does.
   const onPageScroll = useCallback(() => {
-    const body = bodyRef.current, marker = bottomRef.current;
+    const body = bodyRef.current,
+      marker = bottomRef.current;
     if (!body || !marker) return;
     const top = window.scrollY;
     if (body.scrollHeight <= body.clientHeight + 1) {
@@ -48,7 +49,9 @@ export function useStickToBottom(messages: unknown, busy: boolean) {
     pageTopRef.current = window.scrollY;
   }, [messages, busy]);
 
-  const followNewest = useCallback(() => { stickRef.current = true; }, []);
+  const followNewest = useCallback(() => {
+    stickRef.current = true;
+  }, []);
 
   return { bodyRef, bottomRef, onPanelScroll, followNewest };
 }

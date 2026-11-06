@@ -42,9 +42,14 @@ export default function Home() {
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
   const speech = useSpeechRecognition({
-    language, appendWords, busyRef, setError,
+    language,
+    appendWords,
+    busyRef,
+    setError,
     // Runs after a later render, by which time sendMessage (defined below) exists.
-    onSilenceStop: () => { if (autoSend) void sendMessage(); },
+    onSilenceStop: () => {
+      if (autoSend) void sendMessage();
+    },
   });
   const { haltRecognition, startListening, stopListening, updateInterim, isListening } = speech;
   const { bodyRef, bottomRef, onPanelScroll, followNewest } = useStickToBottom(messages, busy);
@@ -57,54 +62,90 @@ export default function Home() {
       // Invalidate old callbacks so previous words cannot reappear after Clear.
       haltRecognition(false);
       // Restart on the next tick after disposing the old recognition instance.
-      setTimeout(() => { if (mountedRef.current) startListening(); }, 80);
+      setTimeout(() => {
+        if (mountedRef.current) startListening();
+      }, 80);
     }
     textareaRef.current?.focus();
   }, [haltRecognition, isListening, startListening, updateDraft, updateInterim]);
 
   const refreshSessions = useCallback(async () => {
-    try { const r = await api.listInterviews(); if (r.ok) setSessions((await r.json()).sessions); } catch { /* backend offline */ }
+    try {
+      const r = await api.listInterviews();
+      if (r.ok) setSessions((await r.json()).sessions);
+    } catch {
+      /* backend offline */
+    }
   }, []);
 
-  const openSession = useCallback(async (id: string) => {
-    if (busyRef.current) return;
-    haltRecognition(false);
-    try {
-      const r = await api.getInterview(id);
-      if (!r.ok) throw new Error('Could not open interview');
-      const data = await r.json();
-      followNewest();
-      setConversationId(id); setMessages(data.messages);
-      setAnswerMode(data.session.mode || 'balanced'); setView('interview'); updateDraft(''); setError(''); setStreamMetrics(null);
-    } catch (e) { setError(e instanceof Error ? e.message : 'Could not load history'); }
-  }, [followNewest, haltRecognition, updateDraft]);
+  const openSession = useCallback(
+    async (id: string) => {
+      if (busyRef.current) return;
+      haltRecognition(false);
+      try {
+        const r = await api.getInterview(id);
+        if (!r.ok) throw new Error('Could not open interview');
+        const data = await r.json();
+        followNewest();
+        setConversationId(id);
+        setMessages(data.messages);
+        setAnswerMode(data.session.mode || 'balanced');
+        setView('interview');
+        updateDraft('');
+        setError('');
+        setStreamMetrics(null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Could not load history');
+      }
+    },
+    [followNewest, haltRecognition, updateDraft],
+  );
 
-  const renameSession = useCallback(async (id: string, title: string) => {
-    const next = window.prompt('Interview title', title);
-    if (!next?.trim()) return;
-    await api.updateInterview(id, { title: next.trim() });
-    void refreshSessions();
-  }, [refreshSessions]);
+  const renameSession = useCallback(
+    async (id: string, title: string) => {
+      const next = window.prompt('Interview title', title);
+      if (!next?.trim()) return;
+      await api.updateInterview(id, { title: next.trim() });
+      void refreshSessions();
+    },
+    [refreshSessions],
+  );
 
-  const deleteSession = useCallback(async (id: string) => {
-    if (busyRef.current || !window.confirm('Delete this interview and its saved questions, answers and resume?')) return;
-    const r = await api.deleteInterview(id);
-    if (r.ok) { if (conversationId === id) { setConversationId(null); setMessages([]); } void refreshSessions(); }
-  }, [conversationId, refreshSessions]);
+  const deleteSession = useCallback(
+    async (id: string) => {
+      if (busyRef.current || !window.confirm('Delete this interview and its saved questions, answers and resume?'))
+        return;
+      const r = await api.deleteInterview(id);
+      if (r.ok) {
+        if (conversationId === id) {
+          setConversationId(null);
+          setMessages([]);
+        }
+        void refreshSessions();
+      }
+    },
+    [conversationId, refreshSessions],
+  );
 
   const sendMessage = useCallback(async () => {
     if (busyRef.current) return;
     if (isListening()) await stopListening();
     const text = draftRef.current.trim();
-    if (!text || busyRef.current) { if (!text) setError('Type or speak a message first.'); return; }
+    if (!text || busyRef.current) {
+      if (!text) setError('Type or speak a message first.');
+      return;
+    }
     if (text.length > MAX_QUESTION_CHARS) {
       setFailedDraft(null);
-      setError(`Your question is ${text.length.toLocaleString()} characters. The limit is ${MAX_QUESTION_CHARS.toLocaleString()}.`);
+      setError(
+        `Your question is ${text.length.toLocaleString()} characters. The limit is ${MAX_QUESTION_CHARS.toLocaleString()}.`,
+      );
       return;
     }
     busyRef.current = true;
     setBusy(true);
-    setError(''); setFailedDraft(null);
+    setError('');
+    setFailedDraft(null);
     updateDraft('');
     updateInterim('');
     followNewest(); // show the new question even if the reader had scrolled up
@@ -116,7 +157,10 @@ export default function Home() {
     setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
     let completed = false;
     try {
-      const response = await api.askQuestion({ message: text, conversation_id: conversationId, mode: answerMode }, controller.signal);
+      const response = await api.askQuestion(
+        { message: text, conversation_id: conversationId, mode: answerMode },
+        controller.signal,
+      );
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw new Error(errorMessage(data, `Chat request failed (${response.status})`));
@@ -128,7 +172,7 @@ export default function Home() {
         if (event.type === 'delta' && event.text) {
           received += event.text;
           const next = received;
-          setMessages(prev => prev.map((m, i) => i === prev.length - 1 ? { role: 'assistant', content: next } : m));
+          setMessages(prev => prev.map((m, i) => (i === prev.length - 1 ? { role: 'assistant', content: next } : m)));
         }
         if (event.type === 'done') {
           completed = true;
@@ -142,7 +186,8 @@ export default function Home() {
     } catch (e) {
       if (!controller.signal.aborted && mountedRef.current) {
         setError(e instanceof Error ? e.message : 'Could not send message');
-        updateDraft(text); setFailedDraft(text);
+        updateDraft(text);
+        setFailedDraft(text);
         // Drop the uncompleted answer and unsaved question.
         setMessages(prev => prev.slice(0, -2));
       }
@@ -151,7 +196,17 @@ export default function Home() {
       if (mountedRef.current) setBusy(false);
       if (chatRequestRef.current === controller) chatRequestRef.current = null;
     }
-  }, [answerMode, conversationId, draftRef, followNewest, isListening, refreshSessions, stopListening, updateDraft, updateInterim]);
+  }, [
+    answerMode,
+    conversationId,
+    draftRef,
+    followNewest,
+    isListening,
+    refreshSessions,
+    stopListening,
+    updateDraft,
+    updateInterim,
+  ]);
 
   const copyMessage = useCallback(async (content: string, key: string) => {
     try {
@@ -166,19 +221,30 @@ export default function Home() {
   }, []);
 
   // Saves the answer length on the interview, so reopening it from History keeps the choice.
-  const changeAnswerMode = useCallback((mode: AnswerMode) => {
-    setAnswerMode(mode);
-    if (!conversationId) return;
-    void api.updateInterview(conversationId, { mode })
-      .catch(() => { /* not critical: the next question still uses the new length */ });
-  }, [conversationId]);
+  const changeAnswerMode = useCallback(
+    (mode: AnswerMode) => {
+      setAnswerMode(mode);
+      if (!conversationId) return;
+      void api.updateInterview(conversationId, { mode }).catch(() => {
+        /* not critical: the next question still uses the new length */
+      });
+    },
+    [conversationId],
+  );
 
   const newChat = useCallback(() => {
     if (busyRef.current) return;
-    haltRecognition(false); updateDraft(''); updateInterim('');
-    setMessages([]); setConversationId(null);
-    setAnswerMode('balanced'); setSetupKey(key => key + 1); setError(''); setStreamMetrics(null);
-    setView('setup'); void refreshSessions();
+    haltRecognition(false);
+    updateDraft('');
+    updateInterim('');
+    setMessages([]);
+    setConversationId(null);
+    setAnswerMode('balanced');
+    setSetupKey(key => key + 1);
+    setError('');
+    setStreamMetrics(null);
+    setView('setup');
+    void refreshSessions();
   }, [haltRecognition, refreshSessions, updateDraft, updateInterim]);
 
   const showHistory = useCallback(() => {
@@ -188,32 +254,46 @@ export default function Home() {
     void refreshSessions();
   }, [haltRecognition, refreshSessions]);
 
-  const startInterview = useCallback(async (form: NewInterview) => {
-    if (starting || !form.targetRole.trim()) return;
-    setStarting(true); setError('');
-    // Holds the new interview's id until setup finishes, so a failed resume upload can remove it.
-    let unfinishedId: string | null = null;
-    try {
-      const r = await api.createInterview({
-        target_role: form.targetRole.trim(), interview_type: form.interviewType, mode: answerMode,
-        instructions: form.instructions, job_description: form.jobDescription,
-      });
-      if (!r.ok) throw new Error('Could not create interview');
-      const id = (await r.json()).conversation_id as string;
-      unfinishedId = id;
-      if (form.resume) {
-        const uploaded = await api.uploadResume(id, form.resume);
-        if (!uploaded.ok) { const data = await uploaded.json().catch(() => ({})); throw new Error(errorMessage(data, 'Resume upload failed')); }
+  const startInterview = useCallback(
+    async (form: NewInterview) => {
+      if (starting || !form.targetRole.trim()) return;
+      setStarting(true);
+      setError('');
+      // Holds the new interview's id until setup finishes, so a failed resume upload can remove it.
+      let unfinishedId: string | null = null;
+      try {
+        const r = await api.createInterview({
+          target_role: form.targetRole.trim(),
+          interview_type: form.interviewType,
+          mode: answerMode,
+          instructions: form.instructions,
+          job_description: form.jobDescription,
+        });
+        if (!r.ok) throw new Error('Could not create interview');
+        const id = (await r.json()).conversation_id as string;
+        unfinishedId = id;
+        if (form.resume) {
+          const uploaded = await api.uploadResume(id, form.resume);
+          if (!uploaded.ok) {
+            const data = await uploaded.json().catch(() => ({}));
+            throw new Error(errorMessage(data, 'Resume upload failed'));
+          }
+        }
+        unfinishedId = null;
+        setConversationId(id);
+        setMessages([]);
+        setView('interview');
+        await refreshSessions();
+      } catch (e) {
+        // Remove the half-made interview so retrying doesn't leave empty ones in History.
+        if (unfinishedId) await api.deleteInterview(unfinishedId).catch(() => {});
+        setError(e instanceof Error ? e.message : 'Could not start interview');
+      } finally {
+        setStarting(false);
       }
-      unfinishedId = null;
-      setConversationId(id); setMessages([]); setView('interview');
-      await refreshSessions();
-    } catch (e) {
-      // Remove the half-made interview so retrying doesn't leave empty ones in History.
-      if (unfinishedId) await api.deleteInterview(unfinishedId).catch(() => {});
-      setError(e instanceof Error ? e.message : 'Could not start interview');
-    } finally { setStarting(false); }
-  }, [answerMode, refreshSessions, starting]);
+    },
+    [answerMode, refreshSessions, starting],
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -242,24 +322,64 @@ export default function Home() {
     <main className="app-shell">
       <TopBar view={view} disabled={busy || starting} onNewInterview={newChat} onHistory={showHistory} />
       {view === 'setup' && (
-        <SetupPage key={setupKey} answerMode={answerMode} onAnswerModeChange={setAnswerMode} starting={starting}
-          error={error} setError={setError} onStart={form => void startInterview(form)} />
+        <SetupPage
+          key={setupKey}
+          answerMode={answerMode}
+          onAnswerModeChange={setAnswerMode}
+          starting={starting}
+          error={error}
+          setError={setError}
+          onStart={form => void startInterview(form)}
+        />
       )}
       {view === 'history' && (
-        <HistoryPage sessions={sessions} search={historySearch} onSearchChange={setHistorySearch} error={error}
-          onOpen={id => void openSession(id)} onRename={(id, title) => void renameSession(id, title)}
-          onDelete={id => void deleteSession(id)} onNewInterview={newChat} />
+        <HistoryPage
+          sessions={sessions}
+          search={historySearch}
+          onSearchChange={setHistorySearch}
+          error={error}
+          onOpen={id => void openSession(id)}
+          onRename={(id, title) => void renameSession(id, title)}
+          onDelete={id => void deleteSession(id)}
+          onNewInterview={newChat}
+        />
       )}
       {view === 'interview' && (
         <div className={`workspace ${focusMode ? 'focus-workspace' : ''}`}>
-          <Composer draft={draft} onDraftChange={updateDraft} textareaRef={textareaRef} speech={speech} busy={busy}
-            answerMode={answerMode} onAnswerModeChange={changeAnswerMode} language={language} onLanguageChange={setLanguage}
-            autoSend={autoSend} onAutoSendChange={setAutoSend}
-            error={error} failedDraft={failedDraft} onClear={clearDraft} onSend={() => void sendMessage()} />
-          <ConversationPanel messages={messages} busy={busy} focusMode={focusMode} onToggleFocus={() => setFocusMode(on => !on)}
-            fontSize={fontSize} onFontSizeChange={setFontSize} copiedKey={copiedKey} onCopy={copyMessage}
-            streamMetrics={streamMetrics} sessionInfoOpen={sessionInfoOpen} onToggleSessionInfo={() => setSessionInfoOpen(open => !open)}
-            conversationId={conversationId} bodyRef={bodyRef} bottomRef={bottomRef} onPanelScroll={onPanelScroll} />
+          <Composer
+            draft={draft}
+            onDraftChange={updateDraft}
+            textareaRef={textareaRef}
+            speech={speech}
+            busy={busy}
+            answerMode={answerMode}
+            onAnswerModeChange={changeAnswerMode}
+            language={language}
+            onLanguageChange={setLanguage}
+            autoSend={autoSend}
+            onAutoSendChange={setAutoSend}
+            error={error}
+            failedDraft={failedDraft}
+            onClear={clearDraft}
+            onSend={() => void sendMessage()}
+          />
+          <ConversationPanel
+            messages={messages}
+            busy={busy}
+            focusMode={focusMode}
+            onToggleFocus={() => setFocusMode(on => !on)}
+            fontSize={fontSize}
+            onFontSizeChange={setFontSize}
+            copiedKey={copiedKey}
+            onCopy={copyMessage}
+            streamMetrics={streamMetrics}
+            sessionInfoOpen={sessionInfoOpen}
+            onToggleSessionInfo={() => setSessionInfoOpen(open => !open)}
+            conversationId={conversationId}
+            bodyRef={bodyRef}
+            bottomRef={bottomRef}
+            onPanelScroll={onPanelScroll}
+          />
         </div>
       )}
     </main>

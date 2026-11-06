@@ -28,7 +28,8 @@ test('Remove and + New Interview empty the resume file picker', async ({ page })
 });
 
 test('a resume over 20 pages shows the page limit and leaves no empty interview behind', async ({ page, request }) => {
-  const interviews = async () => ((await (await request.get(`${API}/api/conversations`)).json()) as { sessions: unknown[] }).sessions.length;
+  const interviews = async () =>
+    ((await (await request.get(`${API}/api/conversations`)).json()) as { sessions: unknown[] }).sessions.length;
   const before = await interviews();
   await page.locator('#setup-resume').setInputFiles(PDF_21_PAGES);
   await page.getByRole('button', { name: /Start Interview/ }).click();

@@ -1,5 +1,6 @@
 """Shared test setup: a fresh database for every test and a fake Gemini, so tests never
 touch chat.db or call the real API."""
+
 import os
 from types import SimpleNamespace
 
@@ -40,14 +41,18 @@ class FakeGemini:
         async def aclose():
             pass
 
-        self.aio = SimpleNamespace(models=SimpleNamespace(generate_content_stream=generate_content_stream), aclose=aclose)
+        self.aio = SimpleNamespace(
+            models=SimpleNamespace(generate_content_stream=generate_content_stream), aclose=aclose
+        )
 
 
 @pytest.fixture
 def gemini(client):
     """Call with (text, finish_reason) chunks to make the next answers come from a fake Gemini."""
+
     def install(*chunks):
         fake = FakeGemini(chunks)
         main.app.state.chat_client = fake
         return fake
+
     return install

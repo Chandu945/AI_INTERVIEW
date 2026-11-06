@@ -1,6 +1,6 @@
-
 import os
 import time
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -15,12 +15,7 @@ models = [
 
 client = genai.Client(
     api_key=os.environ["GEMINI_API_KEY"],
-    http_options=types.HttpOptions(
-        timeout=30000,
-        retry_options=types.HttpRetryOptions(
-            attempts=1
-        )
-    )
+    http_options=types.HttpOptions(timeout=30000, retry_options=types.HttpRetryOptions(attempts=1)),
 )
 
 try:
@@ -30,19 +25,11 @@ try:
 
         try:
             response = client.models.generate_content(
-                model=model,
-                contents="Say Hello.",
-                config=types.GenerateContentConfig(
-                    max_output_tokens=30
-                )
+                model=model, contents="Say Hello.", config=types.GenerateContentConfig(max_output_tokens=30)
             )
 
             print("SUCCESS:", response.text)
-            print(
-                "Time:",
-                round(time.monotonic() - start, 2),
-                "seconds"
-            )
+            print("Time:", round(time.monotonic() - start, 2), "seconds")
 
         except Exception as e:
             print("FAILED:", type(e).__name__)

@@ -20,12 +20,22 @@ export const MessageItem = memo(function MessageItem({ message, index, latest, c
   return (
     <article className={`message ${message.role}${latest ? ' latest' : ''}`}>
       <div className="message-label">
-        <span className="message-heading"><span className="message-label-icon">{isQuestion ? '?' : '✦'}</span>{isQuestion ? 'Question' : 'Answer'}</span>
-        <button type="button" className="copy-button" onClick={() => onCopy(message.content, String(index))} aria-label={`Copy ${isQuestion ? 'question' : 'answer'}`}>
+        <span className="message-heading">
+          <span className="message-label-icon">{isQuestion ? '?' : '✦'}</span>
+          {isQuestion ? 'Question' : 'Answer'}
+        </span>
+        <button
+          type="button"
+          className="copy-button"
+          onClick={() => onCopy(message.content, String(index))}
+          aria-label={`Copy ${isQuestion ? 'question' : 'answer'}`}
+        >
           <span aria-hidden="true">{copied ? '✓' : '⧉'}</span> {copied ? 'Copied' : 'Copy'}
         </button>
       </div>
-      <div className="message-text" style={{ fontSize: isQuestion ? fontSize + 2 : fontSize }}><ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{message.content}</ReactMarkdown></div>
+      <div className="message-text" style={{ fontSize: isQuestion ? fontSize + 2 : fontSize }}>
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{message.content}</ReactMarkdown>
+      </div>
     </article>
   );
 });
