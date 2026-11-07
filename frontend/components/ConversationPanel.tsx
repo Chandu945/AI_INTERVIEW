@@ -1,6 +1,16 @@
-import type { RefObject } from 'react';
+import type { Ref } from 'react';
 import type { Message, StreamMetrics } from '../lib/types';
 import { MessageItem } from './MessageItem';
+
+/** The messages as pages: a question with its answer (and the index of its first message). */
+function toPages(messages: Message[]) {
+  const pages: { start: number; messages: Message[] }[] = [];
+  messages.forEach((message, i) => {
+    if (message.role === 'user' || !pages.length) pages.push({ start: i, messages: [] });
+    pages[pages.length - 1].messages.push(message);
+  });
+  return pages;
+}
 
 type Props = {
   messages: Message[];
@@ -15,9 +25,7 @@ type Props = {
   sessionInfoOpen: boolean;
   onToggleSessionInfo: () => void;
   conversationId: string | null;
-  bodyRef: RefObject<HTMLDivElement | null>;
-  bottomRef: RefObject<HTMLDivElement | null>;
-  onPanelScroll: () => void;
+  bodyRef: Ref<HTMLDivElement>;
 };
 
 /** The right panel: Focus Mode and font size controls, the questions and answers, and session info. */
@@ -35,9 +43,14 @@ export function ConversationPanel({
   onToggleSessionInfo,
   conversationId,
   bodyRef,
-  bottomRef,
-  onPanelScroll,
 }: Props) {
+  const pages = toPages(messages);
+  const thinking = busy && (
+    <div className="thinking">
+      <span className="spinner" />{' '}
+      {messages[messages.length - 1]?.content ? 'Generating answer...' : 'Waiting for Gemini...'}{' '}
+    </div>
+  );
   return (
     <section className="conversation-panel" aria-label="AI conversation">
       <div className="conversation-head">
@@ -62,7 +75,8 @@ export function ConversationPanel({
           </select>
         </label>
       </div>
-      <div className="conversation-body" aria-live="polite" ref={bodyRef} onScroll={onPanelScroll}>
+      {/* One question and its answer per page, the newest last (see useQuestionPages). */}
+      <div className="conversation-body" aria-live="polite" ref={bodyRef}>
         {messages.length === 0 && (
           <div className="empty-state">
             <div className="empty-orb">✦</div>
@@ -70,24 +84,26 @@ export function ConversationPanel({
             <p>Your conversation appears here. Start by typing or speaking on the left.</p>
           </div>
         )}
-        {messages.map((message, i) => (
-          <MessageItem
-            key={i}
-            message={message}
-            index={i}
-            latest={i >= messages.length - 2}
-            copied={copiedKey === String(i)}
-            fontSize={fontSize}
-            onCopy={onCopy}
-          />
-        ))}
-        {busy && (
-          <div className="thinking">
-            <span className="spinner" />{' '}
-            {messages[messages.length - 1]?.content ? 'Generating answer...' : 'Waiting for Gemini...'}{' '}
+        {pages.map((page, p) => (
+          <div className="qa-page" key={page.start}>
+            {page.messages.map((message, j) => {
+              const i = page.start + j;
+              return (
+                <MessageItem
+                  key={i}
+                  message={message}
+                  index={i}
+                  latest={i >= messages.length - 2}
+                  copied={copiedKey === String(i)}
+                  fontSize={fontSize}
+                  onCopy={onCopy}
+                />
+              );
+            })}
+            {p === pages.length - 1 && thinking}
           </div>
-        )}
-        <div ref={bottomRef} />
+        ))}
+        {!pages.length && thinking}
       </div>
       <div className="conversation-bottom">
         <span>

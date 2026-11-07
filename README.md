@@ -6,8 +6,10 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
 - **New Interview:** target role, interview type (Technical, HR or Mixed), answer length, and an
   optional resume (PDF or DOCX) and job description for answers to draw on.
 - **Interview:** type or dictate questions (in Chrome) and watch the answers
-  stream in. Optional auto-stop after a 2.2-second pause, with optional hands-free sending.
-  Focus Mode, font sizes and copy buttons.
+  stream in. Each question and its answer have a page of their own: a new question opens at the
+  top of the answers, alone, and scrolling up brings back earlier ones one at a time. Optional
+  auto-stop after a 2.2-second pause, with optional hands-free sending. Focus Mode, font sizes
+  and copy buttons.
 - **Accurate dictation:** Gemini writes down what you say from a recording, using the role and
   the technical terms in your resume and job description as hints: every word, with punctuation
   and terms like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or "fast api".
@@ -113,7 +115,7 @@ Frontend, from `frontend/`:
 - `frontend/components/`: the screens and panels (New Interview, History, the question box,
   the answers).
 - `frontend/hooks/`: speech recognition, sharing a tab's sound, the recording and transcript
-  improvement, the question draft and answer scrolling.
+  improvement, the question draft and the answer pages.
 - `frontend/lib/`: the API client and shared types. Styles are in `frontend/app/style.css`.
 
 ## Security and limitations

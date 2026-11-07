@@ -632,13 +632,24 @@ kbd {
 .conversation-body {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: 20px;
   flex: 1;
   min-height: 420px;
   max-height: calc(100dvh - 177px);
   overflow-y: auto;
   padding: 10px 12px;
   scrollbar-color: #435472 transparent;
+  scroll-snap-type: y mandatory;
+}
+/* One question and its answer: at least as tall as the inside of the panel (--page-height, set by
+   useQuestionPages), so each is alone in view, and scrolling snaps from one to the next. */
+.qa-page {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  min-height: var(--page-height, 0px);
+  scroll-snap-align: start;
+  scroll-margin-top: 10px;
 }
 .empty-state {
   margin: auto;
@@ -934,9 +945,18 @@ kbd {
   .editor-wrap {
     min-height: 240px;
   }
+  /* The panel grows with its questions and the page scrolls. Only the newest page is tall, so
+     that it can come to the top of the screen. */
   .conversation-body {
     max-height: none;
     min-height: 350px;
+    scroll-snap-type: none;
+  }
+  .qa-page {
+    min-height: 0;
+  }
+  .qa-page:last-child {
+    min-height: calc(100dvh - 20px);
   }
   .setup-page,
   .history-page {

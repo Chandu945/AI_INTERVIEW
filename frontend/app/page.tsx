@@ -8,7 +8,7 @@ import { SetupPage, type NewInterview } from '../components/SetupPage';
 import { TopBar } from '../components/TopBar';
 import { useDraft } from '../hooks/useDraft';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
-import { useStickToBottom } from '../hooks/useStickToBottom';
+import { useQuestionPages } from '../hooks/useQuestionPages';
 import { useTabAudio } from '../hooks/useTabAudio';
 import { useTranscriptImprover, type HandOff } from '../hooks/useTranscriptImprover';
 import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
@@ -91,7 +91,7 @@ export default function Home() {
   });
   const { haltRecognition, startListening, stopListening, updateInterim, isListening, pendingWords, stopForSending } =
     speech;
-  const { bodyRef, bottomRef, onPanelScroll, followNewest } = useStickToBottom(messages, busy);
+  const { bodyRef, showNewest } = useQuestionPages(messages);
   // Stop sharing, pressed in Chrome's sharing bar, stops listening as if Stop was pressed.
   const tabAudio = useTabAudio(() => {
     if (isListening()) void finish(stopListening());
@@ -189,7 +189,7 @@ export default function Home() {
         const r = await api.getInterview(id);
         if (!r.ok) throw new Error('Could not open interview');
         const data = await r.json();
-        followNewest();
+        showNewest();
         setConversationId(id);
         setMessages(data.messages);
         setAnswerMode(data.session.mode || 'balanced');
@@ -201,7 +201,7 @@ export default function Home() {
         setError(e instanceof Error ? e.message : 'Could not load history');
       }
     },
-    [discard, followNewest, haltRecognition, updateDraft],
+    [discard, haltRecognition, showNewest, updateDraft],
   );
 
   const renameSession = useCallback(
@@ -275,7 +275,7 @@ export default function Home() {
     setFailedDraft(null);
     updateDraft('');
     updateInterim('');
-    followNewest(); // show the new question even if the reader had scrolled up
+    showNewest(); // the new question at the top of the panel, its answer under it
     setMessages(prev => [...prev, { role: 'user', content: text || '…' }]); // '…' until Gemini writes it down
     setStreamMetrics(null);
     const controller = new AbortController();
@@ -332,8 +332,9 @@ export default function Home() {
         setError(e instanceof Error ? e.message : 'Could not send message');
         updateDraft(question);
         setFailedDraft(question);
-        // Drop the uncompleted answer and unsaved question.
+        // Drop the uncompleted answer and unsaved question, and show the question before.
         setMessages(prev => prev.slice(0, -2));
+        showNewest();
       }
     } finally {
       busyRef.current = false;
@@ -351,7 +352,7 @@ export default function Home() {
     pendingWords,
     stopForSending,
     waitingWords,
-    followNewest,
+    showNewest,
     refreshSessions,
     updateDraft,
     updateInterim,
@@ -547,8 +548,6 @@ export default function Home() {
             onToggleSessionInfo={() => setSessionInfoOpen(open => !open)}
             conversationId={conversationId}
             bodyRef={bodyRef}
-            bottomRef={bottomRef}
-            onPanelScroll={onPanelScroll}
           />
         </div>
       )}
