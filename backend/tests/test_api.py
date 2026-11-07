@@ -16,6 +16,7 @@ from google.genai import errors, types
 from pypdf import PdfWriter
 
 import main
+from database import DatabaseUnavailable
 
 QUESTION = "Tell me about a time you disagreed with a teammate"
 
@@ -58,7 +59,22 @@ def saved_messages(client, cid):
 
 
 def test_health(client):
-    assert client.get("/api/health").json() == {"status": "ok"}
+    database = "PostgreSQL" if os.environ.get("TEST_POSTGRES") == "1" else "SQLite"
+    assert client.get("/api/health").json() == {"status": "ok", "database": database}
+
+
+def test_a_database_out_of_reach_is_said_plainly(client, gemini, monkeypatch):
+    cid = new_interview(client)
+    gemini(("An answer.", "STOP"))
+
+    def out_of_reach(*args):
+        raise DatabaseUnavailable("connection timeout expired")
+
+    monkeypatch.setattr(main, "save_turn", out_of_reach)  # the answer came, but couldn't be saved
+    assert ask(client, cid)[-1] == {"type": "error", "message": main.DATABASE_UNAVAILABLE}
+    monkeypatch.setattr(main, "connect", out_of_reach)
+    response = client.get("/api/conversations")
+    assert (response.status_code, response.json()) == (503, {"detail": main.DATABASE_UNAVAILABLE})
 
 
 def test_new_interview_keeps_its_settings_and_is_listed(client):
@@ -99,7 +115,8 @@ def test_an_interview_can_be_started_again_with_the_same_setup(client, gemini):
     assert again["session"]["resume_name"] == "resume.docx"
     assert (again["session"]["title"], again["messages"]) == ("New Interview", [])
     with main.connect() as db:  # the resume's text came along too, for the answers to draw on
-        texts = [row[0] for row in db.execute("SELECT resume_text FROM sessions WHERE id IN (?, ?)", (cid, copy))]
+        rows = db.execute("SELECT resume_text FROM sessions WHERE id IN (?, ?)", (cid, copy)).fetchall()
+    texts = [row["resume_text"] for row in rows]
     assert texts[0] == texts[1] and "PySpark" in texts[0]
     assert client.post("/api/conversations/missing/copy").status_code == 404
 
@@ -395,6 +412,53 @@ def test_deleting_an_interview_deletes_its_images(client):
     image_id = add_image(client, cid).json()["image_id"]
     client.delete(f"/api/conversations/{cid}")
     assert client.get(f"/api/images/{image_id}").status_code == 404
+
+
+def test_images_are_kept_in_memory_once_uploaded_or_read(client, gemini):
+    """A database far away takes about a second per MB to send an image back, and a question's
+    images go to Gemini again with its next two follow-ups."""
+    cid = new_interview(client)
+    image_id = add_image(client, cid).json()["image_id"]
+    with main.connect() as db:  # changed in the database only, so what's sent shows where it came from
+        db.execute("UPDATE images SET data=? WHERE id=?", (JPEG, image_id))
+    fake = gemini(("An answer.", "STOP"))
+    ask_with(client, cid, "What does this print?", [image_id])
+    assert image_parts(fake.contents[-1])[0].data == PNG
+    assert client.get(f"/api/images/{image_id}").content == PNG
+    main.image_memory.forget(image_id)  # as after a restart: read from the database once, then kept
+    ask(client, cid, "And its time complexity?")
+    assert image_parts(fake.contents[0])[0].data == JPEG
+    assert main.image_memory.get(image_id) == (cid, "image/png", JPEG)
+
+
+def test_image_memory_lets_the_least_recently_used_go_when_full():
+    memory = main.ImageMemory(room=10)
+    memory.keep("a", "one", "image/png", b"aaaaa")
+    memory.keep("b", "one", "image/png", b"bbbbb")
+    memory.get("a")  # used, so "b" is now the least recently used
+    memory.keep("c", "two", "image/png", b"ccccc")
+    assert [memory.get(image_id) is not None for image_id in "abc"] == [True, False, True]
+    memory.forget_interview("one")
+    assert (memory.get("a"), memory.size) == (None, 5)
+
+
+def test_a_question_reads_the_database_all_at_once(client, monkeypatch):
+    """Each read is a trip to the database (about 60 ms to one far away), so a question's three
+    (its interview's settings, the interview so far and its images) go at the same time."""
+    cid = new_interview(client)
+
+    def slowly(read):
+        def slow_read(*args):
+            time.sleep(0.3)
+            return read(*args)
+
+        return slow_read
+
+    for name in ("interview_settings", "interview_so_far", "image_parts"):
+        monkeypatch.setattr(main, name, slowly(getattr(main, name)))
+    started = time.perf_counter()
+    asyncio.run(main.typed_question(cid, "What is RAG?", (), "quick"))
+    assert time.perf_counter() - started < 0.85  # one after another, they'd take over 0.9 s
 
 
 def ask_with(client, cid, message, image_ids):

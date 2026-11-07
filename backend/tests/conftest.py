@@ -1,13 +1,34 @@
 """Shared test setup: a fresh database for every test and a fake Gemini, so tests never
-touch chat.db or call the real API."""
+touch your interviews or call the real API.
+
+The tests use a throwaway SQLite database. With TEST_POSTGRES=1 they use the PostgreSQL database
+in .env's DATABASE_URL instead, in a schema of their own that is emptied before each test and
+dropped at the end, so the interviews kept there are never touched.
+"""
 
 import asyncio
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
-# Set before main is imported, so a developer's .env can't add a real Gemini client,
-# a thinking setting or an access token to the tests.
-for name in ("GEMINI_API_KEY", "GEMINI_THINKING_LEVEL", "GEMINI_THINKING_BUDGET", "INTERACT_ACCESS_TOKEN"):
+from dotenv import dotenv_values
+
+POSTGRES_URL = (
+    dotenv_values(Path(__file__).resolve().parent.parent / ".env").get("DATABASE_URL", "")
+    if os.environ.get("TEST_POSTGRES") == "1"
+    else ""
+)
+TEST_SCHEMA = "ai_interact_tests"
+
+# Set before main is imported, so a developer's .env can't add a real Gemini client, a thinking
+# setting, an access token or their own database to the tests.
+for name in (
+    "GEMINI_API_KEY",
+    "GEMINI_THINKING_LEVEL",
+    "GEMINI_THINKING_BUDGET",
+    "INTERACT_ACCESS_TOKEN",
+    "DATABASE_URL",
+):
     os.environ[name] = ""
 os.environ["GEMINI_BACKUP_MODEL"] = "backup-model"
 
@@ -15,15 +36,28 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import main  # noqa: E402
+from database import Database  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def drop_postgres_test_schema():
+    yield
+    if POSTGRES_URL:
+        Database(POSTGRES_URL, schema=TEST_SCHEMA).drop_schema()
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB", tmp_path / "chat.db")
+    if POSTGRES_URL:
+        monkeypatch.setattr(main, "DATABASE_URL", POSTGRES_URL)
+        monkeypatch.setattr(main, "DATABASE_SCHEMA", TEST_SCHEMA)
     for hedge in (main.ANSWER_HEDGE, main.RECORDED_HEDGE, main.TRANSCRIBE_HEDGE):
         hedge.recent.clear()  # so timings from one test can't change another's retry delay
     monkeypatch.setattr(main, "backup_resting_until", 0.0)
     with TestClient(main.app) as test_client:
+        if POSTGRES_URL:
+            main.database.empty()
         yield test_client
 
 

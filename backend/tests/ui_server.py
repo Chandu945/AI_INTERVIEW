@@ -17,6 +17,7 @@ warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testcli
 DB = Path(tempfile.mkdtemp(prefix="interact-ui-tests-")) / "chat.db"
 os.environ.update(
     INTERACT_DB=str(DB),
+    DATABASE_URL="",  # never the database in .env
     GEMINI_API_KEY="",
     GEMINI_THINKING_LEVEL="",
     INTERACT_ACCESS_TOKEN="",

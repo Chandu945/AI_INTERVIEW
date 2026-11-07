@@ -5,10 +5,10 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
+import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
@@ -22,12 +22,18 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field, model_validator
 
+from database import Database, DatabaseUnavailable
+
 HERE = Path(__file__).parent
 # Read settings from next to this file, so they're found whichever folder the server starts in.
 load_dotenv(dotenv_path=HERE / ".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-chatbot")
-# INTERACT_DB lets tests run against a throwaway database.
+# Where interviews are kept: the PostgreSQL database at DATABASE_URL if set (a hosted one, such as
+# Supabase), and otherwise SQLite, in chat.db next to this file (INTERACT_DB lets tests run against
+# a throwaway one).
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_SCHEMA = ""  # PostgreSQL's public schema; the tests keep their tables in one of their own
 DB = Path(os.getenv("INTERACT_DB") or HERE / "chat.db")
 # The quickest and steadiest of the models tried (November 2026): answers start in about 1 second,
 # and it stalled once in about 50 tries, where Gemini 3.1 Flash-Lite often did, for 5-30 seconds.
@@ -207,41 +213,22 @@ RECORDED_HEDGE = Hedge("Gemini answer to a recording", minimum=2.0, maximum=6.0,
 TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=1.5, maximum=4.0, factor=1.5)
 
 
+database: Optional[Database] = None
+image_memory: Optional["ImageMemory"] = None
+
+
 def connect():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """A connection to the database, for `with connect() as db:` (see database.py)."""
+    return database.connect()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    with connect() as db:
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
-        )
-        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id)")
-        # Images shared with questions: those a question was sent with are listed in its `images`.
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS images (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, mime_type TEXT NOT NULL, data BLOB NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
-        )
-        db.execute("CREATE INDEX IF NOT EXISTS idx_images_conversation ON images(conversation_id)")
-        try:
-            db.execute("ALTER TABLE messages ADD COLUMN images TEXT NOT NULL DEFAULT ''")  # comma-separated ids
-        except sqlite3.OperationalError:
-            pass
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New Interview', resume_name TEXT, resume_text TEXT, mode TEXT NOT NULL DEFAULT 'balanced', created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)"
-        )
-        for col in (
-            "target_role TEXT NOT NULL DEFAULT 'GenAI Developer'",
-            "interview_type TEXT NOT NULL DEFAULT 'Technical'",
-            "instructions TEXT NOT NULL DEFAULT ''",
-            "job_description TEXT NOT NULL DEFAULT ''",
-        ):
-            try:
-                db.execute(f"ALTER TABLE sessions ADD COLUMN {col}")
-            except sqlite3.OperationalError:
-                pass
+    global database, image_memory
+    database = Database(DATABASE_URL, DB, DATABASE_SCHEMA)
+    await asyncio.to_thread(database.open)
+    logger.info("Interviews are kept in %s", database.kind)
+    image_memory = ImageMemory(IMAGE_MEMORY_BYTES)
     app.state.chat_client = get_client() if os.getenv("GEMINI_API_KEY") else None
     warming = asyncio.create_task(warm_up(app.state.chat_client)) if app.state.chat_client else None
     try:
@@ -251,9 +238,20 @@ async def lifespan(app: FastAPI):
             warming.cancel()
         if app.state.chat_client is not None:
             await app.state.chat_client.aio.aclose()
+        await asyncio.to_thread(database.close)
 
 
 app = FastAPI(title="Gemini Voice Chatbot API", lifespan=lifespan)
+
+DATABASE_UNAVAILABLE = (
+    "Can't reach the database. Check your internet connection, or resume your Supabase project if it was paused."
+)
+
+
+@app.exception_handler(DatabaseUnavailable)
+async def database_unavailable(request: Request, exc: DatabaseUnavailable):
+    logger.warning("Database out of reach: %s", exc)
+    return JSONResponse({"detail": DATABASE_UNAVAILABLE}, status_code=503)
 
 
 @app.middleware("http")
@@ -278,6 +276,47 @@ app.add_middleware(
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_QUESTION_IMAGES = 4
+IMAGE_MEMORY_BYTES = 64 * 1024 * 1024  # dozens of screenshots
+
+
+class ImageMemory:
+    """Question images, kept in memory once uploaded or read: a database far away takes about a
+    second per MB to send one back, and a question's images go to Gemini with it and with its next
+    two follow-ups. Images never change, so a kept one is never out of date. When there's no more
+    room, the least recently used go first."""
+
+    def __init__(self, room: int):
+        self.room = room
+        self.size = 0
+        self.images: OrderedDict[str, tuple[str, str, bytes]] = OrderedDict()  # id: (interview, type, data)
+        self.lock = threading.Lock()  # it's used from worker threads
+
+    def keep(self, image_id: str, conversation_id: str, mime_type: str, data: bytes):
+        with self.lock:
+            if image_id not in self.images:
+                self.images[image_id] = (conversation_id, mime_type, data)
+                self.size += len(data)
+            while self.size > self.room:
+                self.size -= len(self.images.popitem(last=False)[1][2])
+
+    def get(self, image_id: str) -> Optional[tuple[str, str, bytes]]:
+        """The image's interview id, type and data, if it's kept."""
+        with self.lock:
+            image = self.images.get(image_id)
+            if image:
+                self.images.move_to_end(image_id)
+            return image
+
+    def forget(self, image_id: str):
+        with self.lock:
+            image = self.images.pop(image_id, None)
+            if image:
+                self.size -= len(image[2])
+
+    def forget_interview(self, conversation_id: str):
+        with self.lock:
+            for image_id in [i for i, image in self.images.items() if image[0] == conversation_id]:
+                self.size -= len(self.images.pop(image_id)[2])
 
 
 class ChatRequest(BaseModel):
@@ -309,7 +348,7 @@ def history(conversation_id: str, limit: int = 20):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "database": database.kind}
 
 
 @app.get("/api/conversations/{conversation_id}")
@@ -372,7 +411,8 @@ def copy_conversation(conversation_id: str):
     with connect() as db:
         result = db.execute(
             "INSERT INTO sessions (id,target_role,interview_type,mode,instructions,job_description,resume_name,resume_text)"
-            " SELECT ?,target_role,interview_type,mode,instructions,job_description,resume_name,resume_text"
+            # CAST: PostgreSQL can't tell the type of a value that's only selected.
+            " SELECT CAST(? AS TEXT),target_role,interview_type,mode,instructions,job_description,resume_name,resume_text"
             " FROM sessions WHERE id=?",
             (cid, conversation_id),
         )
@@ -408,6 +448,7 @@ def delete_conversation(conversation_id: str):
         db.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
         db.execute("DELETE FROM images WHERE conversation_id=?", (conversation_id,))
         db.execute("DELETE FROM sessions WHERE id=?", (conversation_id,))
+    image_memory.forget_interview(conversation_id)
     return {"ok": True}
 
 
@@ -447,14 +488,18 @@ async def upload_resume(conversation_id: str, file: UploadFile = File(...)):
     extracted = re.sub(r"[ \t]+", " ", extracted).strip()
     if len(extracted) < 30:
         raise HTTPException(422, "Resume contains insufficient extractable text")
+    await asyncio.to_thread(store_resume, conversation_id, name, extracted[:30000])
+    return {"resume_name": name, "characters": min(len(extracted), 30000)}
+
+
+def store_resume(conversation_id: str, name: str, text: str):
     with connect() as db:
         result = db.execute(
             "UPDATE sessions SET resume_name=?,resume_text=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (name, extracted[:30000], conversation_id),
+            (name, text, conversation_id),
         )
         if not result.rowcount:
             raise HTTPException(404, "Interview not found")
-    return {"resume_name": name, "characters": min(len(extracted), 30000)}
 
 
 def image_type(data: bytes) -> Optional[str]:
@@ -481,6 +526,12 @@ async def upload_image(conversation_id: str, file: UploadFile = File(...)):
     if not mime_type:
         raise HTTPException(415, "Use a PNG, JPEG, WebP or HEIC image")
     image_id = str(uuid.uuid4())
+    await asyncio.to_thread(store_image, image_id, conversation_id, mime_type, data)
+    image_memory.keep(image_id, conversation_id, mime_type, data)
+    return {"image_id": image_id}
+
+
+def store_image(image_id: str, conversation_id: str, mime_type: str, data: bytes):
     with connect() as db:
         if not db.execute("SELECT 1 FROM sessions WHERE id=?", (conversation_id,)).fetchone():
             raise HTTPException(404, "Interview not found")
@@ -488,17 +539,21 @@ async def upload_image(conversation_id: str, file: UploadFile = File(...)):
             "INSERT INTO images (id, conversation_id, mime_type, data) VALUES (?, ?, ?, ?)",
             (image_id, conversation_id, mime_type, data),
         )
-    return {"image_id": image_id}
 
 
 @app.get("/api/images/{image_id}")
 def get_image(image_id: str):
-    with connect() as db:
-        row = db.execute("SELECT mime_type, data FROM images WHERE id=?", (image_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Image not found")
+    kept = image_memory.get(image_id)
+    if kept:
+        _, mime_type, data = kept
+    else:
+        with connect() as db:
+            row = db.execute("SELECT mime_type, data FROM images WHERE id=?", (image_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Image not found")
+        mime_type, data = row["mime_type"], row["data"]
     # An image never changes, so the browser may keep it.
-    return Response(row["data"], media_type=row["mime_type"], headers={"Cache-Control": "private, max-age=31536000"})
+    return Response(data, media_type=mime_type, headers={"Cache-Control": "private, max-age=31536000"})
 
 
 @app.delete("/api/images/{image_id}")
@@ -508,25 +563,43 @@ def delete_image(image_id: str):
         if db.execute("SELECT 1 FROM messages WHERE ',' || images || ',' LIKE ?", (f"%,{image_id},%",)).fetchone():
             raise HTTPException(409, "The image belongs to a question that was sent")
         db.execute("DELETE FROM images WHERE id=?", (image_id,))
+    image_memory.forget(image_id)
     return {"ok": True}
 
 
-def image_parts(cid: str, image_ids: list[str], strict: bool = True) -> list[types.Part]:
-    """The images, for Gemini. Each must belong to the interview: if one doesn't (or is gone), it's
-    an error when `strict`, and otherwise left out."""
-    if not image_ids:
-        return []
-    with connect() as db:
-        rows = db.execute(
-            f"SELECT id, mime_type, data FROM images WHERE conversation_id=? AND id IN ({','.join('?' * len(image_ids))})",
-            (cid, *image_ids),
-        ).fetchall()
-    found = {row["id"]: row for row in rows}
-    if strict and len(found) < len(set(image_ids)):
+def find_images(cid: str, image_ids: list[str]) -> dict[str, tuple[str, bytes]]:
+    """Those of these images that belong to the interview, as {id: (type, data)}: from memory, or
+    else from the database, in one trip for them all."""
+    found, missing = {}, []
+    for image_id in dict.fromkeys(image_ids):
+        kept = image_memory.get(image_id)
+        if kept is None:
+            missing.append(image_id)
+        elif kept[0] == cid:
+            found[image_id] = kept[1:]
+    if missing:
+        with connect() as db:
+            rows = db.execute(
+                f"SELECT id, mime_type, data FROM images WHERE conversation_id=? AND id IN ({','.join('?' * len(missing))})",
+                (cid, *missing),
+            ).fetchall()
+        for row in rows:
+            image_memory.keep(row["id"], cid, row["mime_type"], row["data"])
+            found[row["id"]] = (row["mime_type"], row["data"])
+    return found
+
+
+def image_part(image: tuple[str, bytes]) -> types.Part:
+    mime_type, data = image
+    return types.Part.from_bytes(data=data, mime_type=mime_type)
+
+
+def image_parts(cid: str, image_ids: list[str]) -> list[types.Part]:
+    """A question's images, for Gemini. Each must belong to the interview."""
+    found = find_images(cid, image_ids)
+    if len(found) < len(set(image_ids)):
         raise HTTPException(404, "Image not found")
-    return [
-        types.Part.from_bytes(data=found[i]["data"], mime_type=found[i]["mime_type"]) for i in image_ids if i in found
-    ]
+    return [image_part(found[i]) for i in image_ids]
 
 
 # Sent after a question's images, so Gemini looks for the question in them too.
@@ -604,19 +677,30 @@ async def read_recording(file: UploadFile) -> bytes:
     return audio
 
 
-def interview_hints(conversation_id: str):
-    """The interview's role and type, and the technical terms its questions may use (common ones,
-    then those in its job description and resume), for writing down recorded questions."""
+def interview_settings(cid: str):
+    """The interview's role, type, preferences, job description and resume, read at once (each read
+    is a trip to the database). None if there's no such interview."""
     with connect() as db:
-        row = db.execute(
-            "SELECT target_role, interview_type, job_description, resume_text FROM sessions WHERE id=?",
-            (conversation_id,),
+        return db.execute(
+            "SELECT target_role, interview_type, instructions, job_description, resume_text FROM sessions WHERE id=?",
+            (cid,),
         ).fetchone()
-    if not row:
-        raise HTTPException(404, "Interview not found")
+
+
+def interview_terms(settings) -> str:
+    """The technical terms the interview's questions may use: common ones, then those in its job
+    description and resume."""
     known = {term.lower() for term in COMMON_TERMS}
-    terms = COMMON_TERMS + [t for t in vocabulary(row["job_description"], row["resume_text"]) if t.lower() not in known]
-    return row["target_role"], row["interview_type"], ", ".join(terms)
+    found = vocabulary(settings["job_description"], settings["resume_text"])
+    return ", ".join(COMMON_TERMS + [term for term in found if term.lower() not in known])
+
+
+def interview_hints(conversation_id: str):
+    """The interview's role and type, and the terms its questions may use, for writing them down."""
+    settings = interview_settings(conversation_id)
+    if not settings:
+        raise HTTPException(404, "Interview not found")
+    return settings["target_role"], settings["interview_type"], interview_terms(settings)
 
 
 def spoken_words(reply: str) -> str:
@@ -637,7 +721,7 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
     audio = await read_recording(file)
-    role, interview_type, terms = interview_hints(conversation_id)
+    role, interview_type, terms = await asyncio.to_thread(interview_hints, conversation_id)
     prompt = TRANSCRIBE_PROMPT.format(role=role, interview_type=interview_type, terms=terms)
     if context.strip():
         prompt += CONTINUES_PROMPT.format(context=context.strip())
@@ -679,15 +763,13 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
 
 def ensure_session(cid: str):
     with connect() as db:
-        db.execute("INSERT OR IGNORE INTO sessions(id) VALUES (?)", (cid,))
+        db.execute("INSERT INTO sessions(id) VALUES (?) ON CONFLICT (id) DO NOTHING", (cid,))
 
 
-def resume_context(cid: str, question: str):
-    with connect() as db:
-        row = db.execute("SELECT resume_text FROM sessions WHERE id=?", (cid,)).fetchone()
-    if not row or not row["resume_text"]:
+def resume_context(settings, question: str):
+    if not settings or not settings["resume_text"]:
         return ""
-    raw = row["resume_text"]
+    raw = settings["resume_text"]
     # Preserve profile header, then retrieve matching paragraphs for project/skill queries.
     sections = [x.strip() for x in re.split(r"\n\s*\n", raw) if x.strip()]
     words = set(re.findall(r"[a-zA-Z][a-zA-Z0-9+#.]{2,}", question.lower()))
@@ -744,28 +826,33 @@ CUT_OFF_NOTE = (
 )
 
 
-def make_contents(cid: str, *question: types.Part):
-    """The interview so far, then the new question: its text, or its recording and what to do with it."""
-    # Only the last 10 messages (5 exchanges), to keep follow-up context without unbounded latency/cost.
+def interview_so_far(cid: str) -> list[types.Content]:
+    """The interview's last 10 messages (5 exchanges): context for follow-ups, without the time and
+    cost growing with the interview. The images of the last two questions go again, for follow-ups
+    about them; older ones don't, as every image makes the answer slower to start."""
     previous = history(cid, 10)
-    # The images of the last two questions go again, for follow-ups about them; older ones don't,
-    # as every image makes the answer slower to start.
     recent = len(previous) - 4
+    images = find_images(cid, [i for m in previous[max(recent, 0) :] for i in m["images"]])
     contents = []
-    for i, m in enumerate(previous):
-        images = image_parts(cid, m["images"], strict=False) if i >= recent else []
-        text = m["content"] or (IMAGE_ONLY_QUESTION if images else "(A question asked with an image.)")
+    for n, m in enumerate(previous):
+        parts = [image_part(images[i]) for i in m["images"] if i in images] if n >= recent else []
+        text = m["content"] or (IMAGE_ONLY_QUESTION if parts else "(A question asked with an image.)")
         role = "model" if m["role"] == "assistant" else "user"
-        contents.append(types.Content(role=role, parts=[*images, types.Part.from_text(text=text)]))
-    contents.append(types.Content(role="user", parts=list(question)))
+        contents.append(types.Content(role=role, parts=[*parts, types.Part.from_text(text=text)]))
     return contents
 
 
-def session_context(cid: str):
-    with connect() as db:
-        row = db.execute(
-            "SELECT target_role,interview_type,instructions,job_description FROM sessions WHERE id=?", (cid,)
-        ).fetchone()
+async def read_for_question(cid: str, image_ids: tuple[str, ...]):
+    """The interview's settings, the interview so far and the question's images, read at the same
+    time in worker threads: each read is a trip to the database, which may be far away."""
+    return await asyncio.gather(
+        asyncio.to_thread(interview_settings, cid),
+        asyncio.to_thread(interview_so_far, cid),
+        asyncio.to_thread(image_parts, cid, list(image_ids)),
+    )
+
+
+def session_context(row):
     if not row:
         return ""
     return (
@@ -837,15 +924,23 @@ async def stream_chat(request: ChatRequest):
     client = app.state.chat_client
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
-    ensure_session(cid)
     image_ids = tuple(dict.fromkeys(request.image_ids))
-    images = image_parts(cid, list(image_ids))
-    question = [*images, images_prompt(len(images))] if images else []
-    question.append(types.Part.from_text(text=request.message if request.message.strip() else IMAGE_ONLY_QUESTION))
-    contents = make_contents(cid, *question)
-    config = chat_config(request.mode, session_context(cid) + resume_context(cid, request.message))
+    contents, config = await typed_question(cid, request.message, image_ids, request.mode)
     events = answer_events(client, cid, request.mode, contents, config, request.message.strip(), image_ids=image_ids)
     return answer_response(events)
+
+
+async def typed_question(cid: str, message: str, image_ids: tuple[str, ...], mode: str):
+    """What an answer to a typed question is asked with: the interview so far and the question
+    (with its images), and the interview's settings."""
+    settings, previous, images = await read_for_question(cid, image_ids)
+    if not settings:  # an interview the app didn't make beforehand, as older versions didn't
+        await asyncio.to_thread(ensure_session, cid)
+        settings = await asyncio.to_thread(interview_settings, cid)
+    question = [*images, images_prompt(len(images))] if images else []
+    question.append(types.Part.from_text(text=message if message.strip() else IMAGE_ONLY_QUESTION))
+    contents = [*previous, types.Content(role="user", parts=question)]
+    return contents, chat_config(mode, session_context(settings) + resume_context(settings, message))
 
 
 RECORDED_QUESTION_PROMPT = (
@@ -874,20 +969,27 @@ async def stream_chat_from_recording(
     ids = tuple(dict.fromkeys(i.strip() for i in image_ids.split(",") if i.strip()))
     if len(ids) > MAX_QUESTION_IMAGES:
         raise HTTPException(422, f"Send at most {MAX_QUESTION_IMAGES} images with a question")
-    images = image_parts(conversation_id, list(ids))
-    _, _, terms = interview_hints(conversation_id)
     heard = heard.strip()
-    contents = make_contents(
-        conversation_id,
-        types.Part.from_bytes(data=audio, mime_type="audio/wav"),
-        *([*images, images_prompt(len(images))] if images else []),
-        types.Part.from_text(text=RECORDED_QUESTION_PROMPT.format(terms=terms)),
-    )
-    config = chat_config(mode, session_context(conversation_id) + resume_context(conversation_id, heard))
-    # Room for the question's line on top of the answer.
-    config = config.model_copy(update={"max_output_tokens": config.max_output_tokens + 200})
+    contents, config = await recorded_question(conversation_id, audio, ids, heard, mode)
     events = answer_events(client, conversation_id, mode, contents, config, heard, True, ids)
     return answer_response(events)
+
+
+async def recorded_question(cid: str, audio: bytes, image_ids: tuple[str, ...], heard: str, mode: str):
+    """What an answer to a recorded question is asked with: the interview so far, the recording
+    (with the question's images) and what to do with it, and the interview's settings."""
+    settings, previous, images = await read_for_question(cid, image_ids)
+    if not settings:
+        raise HTTPException(404, "Interview not found")
+    question = [
+        types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+        *([*images, images_prompt(len(images))] if images else []),
+        types.Part.from_text(text=RECORDED_QUESTION_PROMPT.format(terms=interview_terms(settings))),
+    ]
+    contents = [*previous, types.Content(role="user", parts=question)]
+    config = chat_config(mode, session_context(settings) + resume_context(settings, heard))
+    # Room for the question's line on top of the answer.
+    return contents, config.model_copy(update={"max_output_tokens": config.max_output_tokens + 200})
 
 
 QUESTION_LINE = re.compile(r"\s*(?:\*\*)?Q(?:uestion)?(?:\*\*)?\s*:\s*(?:\*\*)?\s*", re.IGNORECASE)
@@ -1033,6 +1135,9 @@ async def answer_events(client, cid, mode, contents, config, question, from_reco
     except asyncio.CancelledError:
         logger.info("Chat stream disconnected; incomplete response not saved")
         raise
+    except DatabaseUnavailable:
+        logger.exception("The answer couldn't be saved")
+        yield json.dumps({"type": "error", "message": DATABASE_UNAVAILABLE}) + "\n"
     except Exception:
         logger.exception("Gemini streaming chat failed")
         yield json.dumps({"type": "error", "message": "Gemini request failed; check backend logs"}) + "\n"

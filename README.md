@@ -62,7 +62,8 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   example, a free daily quota is used up), the retry goes to the main model instead, and the
   second model is left alone until Google says to try again. The connection to Gemini
   stays open between questions, so each question doesn't wait for a new one.
-- **Saved locally:** interviews are stored in SQLite on this computer.
+- **Saved in a database:** PostgreSQL (a hosted one, such as Supabase) when `DATABASE_URL` is
+  set, and otherwise SQLite, a file on this computer. See [Database](#database).
 
 ## First-time setup (macOS)
 
@@ -104,13 +105,52 @@ that, set `NEXT_PUBLIC_API_URL` in `frontend/.env.local` (see `frontend/.env.loc
 | `GEMINI_BACKUP_MODEL` | Optional: the model a slow or failed request is also sent to (default `gemini-3.1-flash-lite`). It answers with minimal thinking, so it must be a Gemini 3 model. If it refuses (say, a free-tier daily limit is used up), retries go to `GEMINI_MODEL` until Google says to try again. Set it empty to always retry with `GEMINI_MODEL`. |
 | `FRONTEND_ORIGIN` | Where the frontend runs, for CORS (default `http://localhost:3000`). |
 | `INTERACT_ACCESS_TOKEN` | Optional: require an `X-Interact-Token` header on API calls. The bundled frontend doesn't send one. |
-| `INTERACT_DB` | Optional: a database file to use instead of `backend/chat.db`. |
+| `DATABASE_URL` | Optional: the PostgreSQL database to keep interviews in, such as `postgresql://USER:PASSWORD@HOST:6543/postgres`. Without it, they're kept in SQLite. |
+| `INTERACT_DB` | Optional: the SQLite file to use instead of `backend/chat.db` (when there's no `DATABASE_URL`). |
+
+## Database
+
+Interviews (their settings and resume, questions, answers and images) are kept in **PostgreSQL**
+when `DATABASE_URL` is set in `backend/.env`, and otherwise in **SQLite**, in `backend/chat.db`.
+The backend makes the tables itself the first time it starts, and `/api/health` says which
+database it uses.
+
+To use a free hosted PostgreSQL database on [Supabase](https://supabase.com):
+
+1. Create a project, choosing the region nearest you (for India, Mumbai), and note its database
+   password.
+2. Press **Connect** and copy the **Transaction pooler** or **Session pooler** connection string
+   (both work on any network; the direct one needs IPv6). Put your password in place of
+   `[YOUR-PASSWORD]`. A `?pgbouncer=true` at the end is fine.
+3. Add it to `backend/.env` as `DATABASE_URL=...` and restart the backend.
+4. Copy your existing interviews over, once, from `backend/`:
+   `.venv/bin/python copy_to_postgres.py`. It leaves interviews already there alone, so it's
+   safe to run again.
+
+Each trip to a database far away is a wait (about 60 ms from India to Mumbai), and it sends data
+at about 1 MB a second. So the backend keeps its connections open, reads what a question needs
+(the interview's settings, its last messages and the question's images) at the same time, in
+one trip, and keeps question images in memory once they're uploaded or read. An answer starts
+about 0.1 s later than with SQLite and is saved about 0.25 s after it ends, and an image takes
+about a second per MB to upload when you add it to a question.
+
+Supabase's web API can reach the tables in a project's public schema with the project's public
+key, so the backend turns on row level security on its tables: with no rules, that API gets
+nothing from them. The backend connects as their owner, which the rules don't apply to.
+
+A free Supabase project holds up to 500 MB (images take the most room) and is paused after a
+week without use. The app then says it can't reach the database, until you resume the project
+in Supabase.
 
 ## Tests and code checks
 
 Backend, from `backend/` (install the dev tools once with `.venv/bin/python -m pip install -r requirements-dev.txt`):
 
-- `.venv/bin/python -m pytest`: API tests, using a fake Gemini and a throwaway database.
+- `.venv/bin/python -m pytest`: API tests, using a fake Gemini and a throwaway SQLite database.
+  `TEST_POSTGRES=1 .venv/bin/python -m pytest` runs them against the PostgreSQL database in
+  `DATABASE_URL` instead, in a schema of their own (`ai_interact_tests`) that's dropped
+  afterwards, so your interviews there are never touched. That takes a few minutes, as each
+  test connects anew.
 - `.venv/bin/ruff check .` and `.venv/bin/ruff format .`: lint and format.
 
 Frontend, from `frontend/`:
@@ -124,6 +164,8 @@ Frontend, from `frontend/`:
 ## Project layout
 
 - `backend/main.py`: the API. Interviews, resume parsing, prompts, and answers streamed from Gemini.
+- `backend/database.py`: the database (PostgreSQL or SQLite), and `backend/copy_to_postgres.py`,
+  which copies interviews from SQLite to PostgreSQL.
 - `frontend/app/page.tsx`: the app's state and the actions that connect the screens.
 - `frontend/components/`: the screens and panels (Interviews, New interview, the top bar, the
   question box, the answers).
@@ -133,8 +175,9 @@ Frontend, from `frontend/`:
 
 ## Security and limitations
 
-**Single-user local use only by default.** SQLite history and extracted resume text are not
-encrypted at rest, and there is no account login or per-user authorization. Do not expose the
+**Single-user local use only by default.** Interviews and extracted resume text are not
+encrypted by the app (a hosted database encrypts its disks; keep its connection string, which
+holds the password, out of anything shared), and there is no account login or per-user authorization. Do not expose the
 backend publicly without authentication, TLS, access controls and secure storage. The optional
 `INTERACT_ACCESS_TOKEN` needs a client that sends `X-Interact-Token`; the bundled frontend does
 not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
@@ -146,5 +189,5 @@ seconds while you speak, and slow requests are sent twice. These count toward yo
 rate limits and bill. Model names in `.env.example` may need updating to models available to
 your API key.
 
-Before updating an existing installation, back up `backend/chat.db`. Database columns are
-migrated at startup.
+Before updating an existing installation, back up `backend/chat.db` (or your PostgreSQL
+database). New tables and columns are added at startup.
