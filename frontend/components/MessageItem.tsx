@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { api } from '../lib/api';
 import type { Message } from '../lib/types';
 
 const REMARK_PLUGINS = [remarkGfm];
@@ -33,9 +34,22 @@ export const MessageItem = memo(function MessageItem({ message, index, latest, c
           <span aria-hidden="true">{copied ? '✓' : '⧉'}</span> {copied ? 'Copied' : 'Copy'}
         </button>
       </div>
-      <div className="message-text" style={{ fontSize: isQuestion ? fontSize + 2 : fontSize }}>
-        <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{message.content}</ReactMarkdown>
-      </div>
+      {message.images?.length ? (
+        <div className="message-images">
+          {message.images.map(imageId => (
+            <a key={imageId} href={api.imageUrl(imageId)} target="_blank" rel="noreferrer" title="Open the image">
+              {/* On the backend, which next/image can't optimize. */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={api.imageUrl(imageId)} alt="Shared with the question" loading="lazy" />
+            </a>
+          ))}
+        </div>
+      ) : null}
+      {(message.content || !message.images?.length) && (
+        <div className="message-text" style={{ fontSize: isQuestion ? fontSize + 2 : fontSize }}>
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{message.content}</ReactMarkdown>
+        </div>
+      )}
     </article>
   );
 });

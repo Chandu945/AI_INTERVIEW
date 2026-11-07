@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent, type RefObject } from 'react';
+import { MAX_IMAGES, isImage, type Attachment } from '../hooks/useImageAttachments';
 import type { Speech } from '../hooks/useSpeechRecognition';
 import type { ImproveStatus } from '../hooks/useTranscriptImprover';
 import { MAX_QUESTION_CHARS } from '../lib/api';
@@ -49,6 +50,10 @@ type Props = {
   failedDraft: string | null;
   onClear: () => void;
   onSend: () => void;
+  /** Images to ask the question with (a screenshot of a coding problem, say). */
+  attachments: Attachment[];
+  onAddImages: (files: File[]) => void;
+  onRemoveImage: (key: number) => void;
 };
 
 /** The left panel: the question box, Speak / Clear / Send, and the answer-length and voice settings. */
@@ -79,6 +84,9 @@ export function Composer({
   failedDraft,
   onClear,
   onSend,
+  attachments,
+  onAddImages,
+  onRemoveImage,
 }: Props) {
   const { listening, status, elapsed, supported, autoPause, changeAutoPause } = speech;
   const shownStatus = !listening && improveStatus !== 'idle' ? IMPROVE_MESSAGES[improveStatus] : status;
@@ -130,6 +138,10 @@ export function Composer({
       box.scrollTop = box.scrollHeight;
     scrollGhost();
   }, [draft, preview, listening, fitGhost, scrollGhost, textareaRef]);
+  // Images come from the Add image button, a paste, or a drop on the box.
+  const pickerRef = useRef<HTMLInputElement | null>(null);
+  const [dropping, setDropping] = useState(false);
+  const carriesFiles = (event: DragEvent) => event.dataTransfer.types.includes('Files');
   const time = `${Math.floor(elapsed / 60)
     .toString()
     .padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}`;
@@ -143,7 +155,23 @@ export function Composer({
         </div>
         <span className="panel-icon">✎</span>
       </div>
-      <div className={`editor-wrap ${listening ? 'active' : ''}`}>
+      <div
+        className={`editor-wrap ${listening ? 'active' : ''} ${attachments.length ? 'has-images' : ''} ${dropping ? 'dropping' : ''}`}
+        onDragOver={event => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          setDropping(true);
+        }}
+        onDragLeave={event => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropping(false);
+        }}
+        onDrop={event => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          setDropping(false);
+          onAddImages([...event.dataTransfer.files]);
+        }}
+      >
         <div className="editor-top">
           <span className={`status-dot ${listening ? 'pulse' : ''}`} />
           <span className="status-text" title={shownStatus}>
@@ -160,11 +188,18 @@ export function Composer({
               preview
                 ? ''
                 : fromTab
-                  ? 'Type a question, or press Listen to tab to write down what a tab is saying...'
-                  : 'Type a question, or tap the microphone to speak...'
+                  ? 'Type a question or paste a screenshot, or press Listen to tab to write down what a tab is saying...'
+                  : 'Type a question, paste a screenshot, or tap the microphone to speak...'
             }
             value={draft}
             onChange={e => onDraftChange(e.target.value)}
+            onPaste={event => {
+              // A pasted screenshot is attached; pasted text goes in as usual.
+              const images = [...event.clipboardData.files].filter(isImage);
+              if (!images.length) return;
+              event.preventDefault();
+              onAddImages(images);
+            }}
             onScroll={scrollGhost}
             spellCheck
             rows={10}
@@ -176,11 +211,60 @@ export function Composer({
             </div>
           )}
         </div>
+        {attachments.length > 0 && (
+          <ul className="attachments" aria-label="Images with the question">
+            {attachments.map(attachment => (
+              <li
+                key={attachment.key}
+                className={`attachment ${attachment.status}`}
+                title={attachment.error || attachment.name}
+              >
+                {/* A local file or one on the backend, which next/image can't optimize. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={attachment.url} alt={attachment.name} />
+                {attachment.status === 'uploading' && <span className="spinner" aria-label="Uploading" />}
+                {attachment.status === 'failed' && (
+                  <span className="attachment-failed" aria-label={attachment.error}>
+                    !
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="attachment-remove"
+                  aria-label={`Remove ${attachment.name}`}
+                  onClick={() => onRemoveImage(attachment.key)}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="editor-foot">
           <span className={draft.length > MAX_QUESTION_CHARS ? 'over-limit' : undefined}>
             {draft.length.toLocaleString()} / {MAX_QUESTION_CHARS.toLocaleString()} characters
           </span>
-          <span>Editable even while listening</span>
+          <button
+            type="button"
+            className="text-button attach-button"
+            onClick={() => pickerRef.current?.click()}
+            disabled={busy || attachments.length >= MAX_IMAGES}
+            title="Ask about a screenshot, a diagram or a photo: add it here, paste it, or drop it on the box"
+          >
+            <span aria-hidden="true">🖼</span> Add image
+          </button>
+          <input
+            ref={pickerRef}
+            type="file"
+            accept="image/*,.heic,.heif"
+            multiple
+            hidden
+            aria-label="Images to add"
+            onChange={event => {
+              onAddImages([...(event.target.files ?? [])]);
+              event.target.value = ''; // so the same image can be picked again
+            }}
+          />
         </div>
       </div>
       <div className="controls">
@@ -199,7 +283,11 @@ export function Composer({
           Clear
         </button>
         {/* Pressable while listening, even before any words: sending waits for the last of them. */}
-        <button className="btn primary" onClick={onSend} disabled={busy || (!listening && !draft.trim() && !preview)}>
+        <button
+          className="btn primary"
+          onClick={onSend}
+          disabled={busy || (!listening && !draft.trim() && !preview && !attachments.length)}
+        >
           {' '}
           {busy ? 'Sending…' : 'Send ↗'}
         </button>
@@ -287,7 +375,7 @@ export function Composer({
       {error && (
         <div className="error-banner" role="alert">
           {error}{' '}
-          {failedDraft && (
+          {failedDraft !== null && (
             <button className="btn subtle" onClick={onSend} disabled={busy}>
               Retry question
             </button>

@@ -17,6 +17,12 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   top of the answers, alone, and scrolling up brings back earlier ones one at a time. Optional
   auto-stop after a 2.2-second pause, with optional hands-free sending. Focus Mode, font sizes
   and copy buttons.
+- **Questions with images:** add a screenshot, a diagram or a photo to a question (Add image,
+  paste it into the box, or drop it on the box), up to 4 per question; an image alone can be
+  the question, such as a screenshot of a coding problem. Gemini reads the images with the
+  question, typed or spoken. Each image uploads as soon as it's added (a big one is shrunk to
+  2048 pixels first), so Send doesn't wait for it, and it's saved with the interview and shown
+  with the question. The next two questions get the image too, for follow-ups about it.
 - **Accurate dictation:** Gemini writes down what you say from a recording, using the role and
   the technical terms in your resume and job description as hints: every word, with punctuation
   and terms like "LangChain", "RAG" or "FastAPI" instead of "lang chain", "rag" or "fast api".

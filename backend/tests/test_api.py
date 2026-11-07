@@ -210,8 +210,8 @@ def test_streamed_answer_is_saved_and_names_the_interview(client, gemini):
     events = ask(client, cid, "What is RAG?")
     assert [e["type"] for e in events] == ["start", "delta", "delta", "done"]
     assert saved_messages(client, cid) == [
-        {"role": "user", "content": "What is RAG?"},
-        {"role": "assistant", "content": "First part. Second part."},
+        {"role": "user", "content": "What is RAG?", "images": []},
+        {"role": "assistant", "content": "First part. Second part.", "images": []},
     ]
     assert client.get(f"/api/conversations/{cid}").json()["session"]["title"] == "What is RAG?"
 
@@ -306,6 +306,101 @@ def test_invalid_thinking_level_stops_startup():
 
 
 # Transcribing recorded questions
+
+
+# Images shared with questions
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64  # enough of a PNG for the type check
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+
+
+def add_image(client, cid, data=PNG, name="screenshot.png"):
+    return client.post(f"/api/conversations/{cid}/images", files={"file": (name, data, "application/octet-stream")})
+
+
+def image_parts(content):
+    return [part.inline_data for part in content.parts if part.inline_data]
+
+
+def test_an_image_is_kept_and_served_by_its_id(client):
+    cid = new_interview(client)
+    image_id = add_image(client, cid, JPEG, "photo.jpg").json()["image_id"]
+    served = client.get(f"/api/images/{image_id}")
+    assert (served.status_code, served.headers["content-type"], served.content) == (200, "image/jpeg", JPEG)
+    assert client.get("/api/images/missing").status_code == 404
+
+
+def test_an_upload_must_be_an_image_of_a_known_kind_and_not_too_big(client):
+    cid = new_interview(client)
+    assert add_image(client, cid, b"GIF89a" + b"\x00" * 64, "anim.gif").status_code == 415
+    assert add_image(client, cid, b"just some text", "notes.png").status_code == 415  # the name doesn't count
+    assert add_image(client, cid, PNG + b"\x00" * main.MAX_IMAGE_BYTES).status_code == 413
+    assert add_image(client, "missing").status_code == 404
+
+
+def test_a_question_goes_to_gemini_with_its_images_and_is_saved_with_them(client, gemini):
+    cid = new_interview(client)
+    first, second = (add_image(client, cid, data).json()["image_id"] for data in (PNG, JPEG))
+    fake = gemini(("An answer.", "STOP"))
+    events = ask_with(client, cid, "What does this code print?", [first, second])
+    assert events[-1]["type"] == "done"
+    question = fake.contents[-1]
+    assert [image.mime_type for image in image_parts(question)] == ["image/png", "image/jpeg"]
+    assert question.parts[2].text.startswith("The candidate shared 2 images with this question")
+    assert question.parts[3].text == "What does this code print?"
+    assert saved_messages(client, cid)[0] == {
+        "role": "user",
+        "content": "What does this code print?",
+        "images": [first, second],
+    }
+    # A follow-up still has the images, to ask about them; two questions later, they're left out.
+    ask(client, cid, "And its time complexity?")
+    assert [image.mime_type for image in image_parts(fake.contents[0])] == ["image/png", "image/jpeg"]
+    ask(client, cid, "Could it be faster?")
+    assert image_parts(fake.contents[0])
+    ask(client, cid, "Tell me about yourself.")
+    assert not image_parts(fake.contents[0])
+    assert fake.contents[0].parts[0].text == "What does this code print?"
+    # Sent with a question, it stays; an image taken off before sending goes.
+    assert client.delete(f"/api/images/{first}").status_code == 409
+    unsent = add_image(client, cid).json()["image_id"]
+    assert client.delete(f"/api/images/{unsent}").json() == {"ok": True}
+    assert client.get(f"/api/images/{unsent}").status_code == 404
+
+
+def test_an_image_can_be_the_whole_question(client, gemini):
+    cid = new_interview(client)
+    image_id = add_image(client, cid).json()["image_id"]
+    fake = gemini(("Use a hash map.", "STOP"))
+    assert ask_with(client, cid, "", [image_id])[-1]["type"] == "done"
+    assert fake.contents[-1].parts[-1].text == main.IMAGE_ONLY_QUESTION
+    assert saved_messages(client, cid)[0] == {"role": "user", "content": "", "images": [image_id]}
+    session = next(s for s in client.get("/api/conversations").json()["sessions"] if s["id"] == cid)
+    assert (session["title"], session["last_question"]) == ("Image question", "(an image)")
+
+
+def test_a_question_needs_words_or_an_image_and_only_its_own_interview_images(client, gemini):
+    cid, other = new_interview(client), new_interview(client)
+    gemini(("An answer.", "STOP"))
+    assert client.post("/api/chat/stream", json={"message": " ", "conversation_id": cid}).status_code == 422
+    elsewhere = add_image(client, other).json()["image_id"]
+    response = client.post("/api/chat/stream", json={"message": "Hi", "conversation_id": cid, "image_ids": [elsewhere]})
+    assert response.status_code == 404
+    too_many = {"message": "Hi", "conversation_id": cid, "image_ids": ["a", "b", "c", "d", "e"]}
+    assert client.post("/api/chat/stream", json=too_many).status_code == 422
+
+
+def test_deleting_an_interview_deletes_its_images(client):
+    cid = new_interview(client)
+    image_id = add_image(client, cid).json()["image_id"]
+    client.delete(f"/api/conversations/{cid}")
+    assert client.get(f"/api/images/{image_id}").status_code == 404
+
+
+def ask_with(client, cid, message, image_ids):
+    body = {"message": message, "conversation_id": cid, "mode": "quick", "image_ids": image_ids}
+    response = client.post("/api/chat/stream", json=body)
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
 
 
 def silence_wav(seconds=0.1):
@@ -423,6 +518,23 @@ def test_a_recorded_question_is_written_down_and_answered_in_one_go(client, gemi
         "What is RAG?",
         "RAG pairs a retriever with a model.",
     ]
+
+
+def test_a_recorded_question_goes_with_its_images(client, gemini):
+    cid = new_interview(client)
+    image_id = add_image(client, cid).json()["image_id"]
+    fake = gemini(("Q: What does this print?\n\nIt prints 3.", "STOP"))
+    response = client.post(
+        "/api/chat/stream-recording",
+        data={"conversation_id": cid, "mode": "quick", "heard": "what does this print", "image_ids": image_id},
+        files={"file": ("question.wav", silence_wav(), "audio/wav")},
+    )
+    assert events_of(response)[-1]["type"] == "done"
+    audio, image, about_images, prompt = fake.contents[-1].parts
+    assert (audio.inline_data.mime_type, image.inline_data.mime_type) == ("audio/wav", "image/png")
+    assert about_images.text.startswith("The candidate shared an image with this question")
+    assert 'starting with "Q: "' in prompt.text
+    assert saved_messages(client, cid)[0] == {"role": "user", "content": "What does this print?", "images": [image_id]}
 
 
 def test_without_a_question_line_the_live_words_are_kept_as_the_question(client, gemini):

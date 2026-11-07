@@ -22,6 +22,7 @@ declare global {
     __stopSharing: () => void;
     __heard: string | null;
     __contexts: string[];
+    __chatBodies: Record<string, unknown>[];
     __pieceTimings: { min: number; max: number; quiet: number; silence: number };
     __cutPiece?: () => boolean;
     __tabPauses: boolean;
@@ -44,6 +45,8 @@ function pageFakes() {
   window.__heard = null;
   // The text so far sent with each piece.
   window.__contexts = [];
+  // What each faked question was sent with (its JSON, or its form's text fields).
+  window.__chatBodies = [];
   // Pieces are cut only when a test says so (see cutPiece), and "stop after silence" goes by the
   // fake recognition alone (the fake mic beeps on and on).
   window.__pieceTimings = { min: 1e9, max: 1e9, quiet: 1e9, silence: 0 };
@@ -63,6 +66,11 @@ function pageFakes() {
       return new Promise(resolve => setTimeout(() => resolve(response), delay));
     }
     if (window.__fakeStream && url.includes('/api/chat/stream')) {
+      window.__chatBodies.push(
+        init?.body instanceof FormData
+          ? Object.fromEntries([...init.body.entries()].filter(([, value]) => typeof value === 'string'))
+          : JSON.parse(String(init?.body ?? '{}')),
+      );
       const heard = init?.body instanceof FormData ? String(init.body.get('heard') ?? '') : '';
       if (url.endsWith('/stream-recording')) window.__heard = heard;
       return Promise.resolve(window.__fakeStream(url, heard));

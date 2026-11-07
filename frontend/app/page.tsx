@@ -7,6 +7,7 @@ import { InterviewsPage, type TypeFilter } from '../components/InterviewsPage';
 import { SetupPage, type NewInterview } from '../components/SetupPage';
 import { TopBar } from '../components/TopBar';
 import { useDraft } from '../hooks/useDraft';
+import { useImageAttachments } from '../hooks/useImageAttachments';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useQuestionPages } from '../hooks/useQuestionPages';
 import { useTabAudio } from '../hooks/useTabAudio';
@@ -66,6 +67,16 @@ export default function Home() {
     discard,
     waitingWords,
   } = improver;
+  // Images to ask the question with, uploaded as they are attached.
+  const images = useImageAttachments(conversationId, setError);
+  const {
+    add: addImages,
+    remove: removeImage,
+    clear: clearImages,
+    hasImages,
+    take: takeImages,
+    restore: restoreImages,
+  } = images;
   // Chrome's words, when they are the text (Gemini's improvement is off). Only real words count
   // (stopping also flushes an often-empty last phrase).
   const appendDictated = useCallback(
@@ -163,6 +174,7 @@ export default function Home() {
 
   const clearDraft = useCallback(() => {
     discard(); // words still being written down must not come back
+    clearImages();
     updateDraft('');
     updateInterim('');
     setError('');
@@ -175,7 +187,7 @@ export default function Home() {
       }, 80);
     }
     textareaRef.current?.focus();
-  }, [discard, haltRecognition, isListening, startDictation, updateDraft, updateInterim]);
+  }, [clearImages, discard, haltRecognition, isListening, startDictation, updateDraft, updateInterim]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -194,6 +206,7 @@ export default function Home() {
       if (busyRef.current) return;
       haltRecognition(false);
       discard();
+      clearImages(); // ones not sent belong to the interview being left
       try {
         const r = await api.getInterview(id);
         if (!r.ok) throw new Error('Could not open interview');
@@ -211,7 +224,7 @@ export default function Home() {
         setError(e instanceof Error ? e.message : 'Could not open the interview');
       }
     },
-    [discard, haltRecognition, showNewest, updateDraft],
+    [clearImages, discard, haltRecognition, showNewest, updateDraft],
   );
 
   const renameSession = useCallback(async (id: string, title: string) => {
@@ -289,8 +302,8 @@ export default function Home() {
       busyRef.current = false;
     }
     const text = recording ? recording.heard : (spoken ?? draftRef.current.trim());
-    if ((!text && !recording) || busyRef.current) {
-      if (!text && !recording) setError('Type or speak a message first.');
+    if ((!text && !recording && !hasImages()) || busyRef.current) {
+      if (!text && !recording && !hasImages()) setError('Type or speak a question, or add an image.');
       return;
     }
     if (text.length > MAX_QUESTION_CHARS) {
@@ -302,12 +315,23 @@ export default function Home() {
     }
     busyRef.current = true;
     setBusy(true);
+    // The question's images, once uploaded (usually they are by now).
+    const imageIds = await takeImages();
+    if (!imageIds) {
+      busyRef.current = false;
+      setBusy(false);
+      return;
+    }
     setError('');
     setFailedDraft(null);
     updateDraft('');
     updateInterim('');
     showNewest(); // the new question at the top of the panel, its answer under it
-    setMessages(prev => [...prev, { role: 'user', content: text || '…' }]); // '…' until Gemini writes it down
+    setMessages(prev => [
+      ...prev,
+      // '…' for a recording, until Gemini writes it down.
+      { role: 'user', content: text || (recording ? '…' : ''), images: imageIds.length ? imageIds : undefined },
+    ]);
     setStreamMetrics(null);
     const controller = new AbortController();
     chatRequestRef.current = controller;
@@ -320,11 +344,17 @@ export default function Home() {
       const response =
         recording && conversationId
           ? await api.askRecordedQuestion(
-              { audio: recording.audio, heard: text, conversation_id: conversationId, mode: answerMode },
+              {
+                audio: recording.audio,
+                heard: text,
+                conversation_id: conversationId,
+                mode: answerMode,
+                image_ids: imageIds,
+              },
               controller.signal,
             )
           : await api.askQuestion(
-              { message: text, conversation_id: conversationId, mode: answerMode },
+              { message: text, conversation_id: conversationId, mode: answerMode, image_ids: imageIds },
               controller.signal,
             );
       if (!response.ok) {
@@ -338,7 +368,7 @@ export default function Home() {
         if (event.type === 'question' && event.text) {
           const written = event.text;
           question = written;
-          setMessages(prev => prev.map((m, i) => (i === prev.length - 2 ? { role: 'user', content: written } : m)));
+          setMessages(prev => prev.map((m, i) => (i === prev.length - 2 ? { ...m, content: written } : m)));
         }
         if (event.type === 'restart') {
           received = '';
@@ -363,6 +393,7 @@ export default function Home() {
         setError(e instanceof Error ? e.message : 'Could not send message');
         updateDraft(question);
         setFailedDraft(question);
+        restoreImages(imageIds);
         // Drop the uncompleted answer and unsaved question, and show the question before.
         setMessages(prev => prev.slice(0, -2));
         showNewest();
@@ -373,6 +404,9 @@ export default function Home() {
       if (chatRequestRef.current === controller) chatRequestRef.current = null;
     }
   }, [
+    hasImages,
+    restoreImages,
+    takeImages,
     answerMode,
     conversationId,
     draftRef,
@@ -417,6 +451,7 @@ export default function Home() {
     if (busyRef.current) return;
     haltRecognition(false);
     discard();
+    clearImages();
     updateDraft('');
     updateInterim('');
     setMessages([]);
@@ -426,17 +461,18 @@ export default function Home() {
     setError('');
     setStreamMetrics(null);
     setView('setup');
-  }, [discard, haltRecognition, updateDraft, updateInterim]);
+  }, [clearImages, discard, haltRecognition, updateDraft, updateInterim]);
 
   // Back to the Interviews page, from an interview or the New interview form.
   const goHome = useCallback(() => {
     if (busyRef.current) return;
     haltRecognition(false);
     discard();
+    clearImages();
     setError('');
     setView('home');
     void refreshSessions();
-  }, [discard, haltRecognition, refreshSessions]);
+  }, [clearImages, discard, haltRecognition, refreshSessions]);
 
   const startInterview = useCallback(
     async (form: NewInterview) => {
@@ -589,6 +625,9 @@ export default function Home() {
             failedDraft={failedDraft}
             onClear={clearDraft}
             onSend={() => void sendMessage()}
+            attachments={images.attachments}
+            onAddImages={addImages}
+            onRemoveImage={removeImage}
           />
           <ConversationPanel
             messages={messages}
