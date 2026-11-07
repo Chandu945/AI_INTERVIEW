@@ -3,8 +3,15 @@
 Interview practice with Gemini: type or say an interview question and get an answer you could
 give out loud. Next.js frontend, FastAPI backend, Google Gemini.
 
-- **New Interview:** target role, interview type (Technical, HR or Mixed), answer length, and an
-  optional resume (PDF or DOCX) and job description for answers to draw on.
+- **Interviews:** the app opens on your interviews, latest first and grouped by day, each with
+  its role, type, number of questions and the last one asked. Search them, filter by type, and
+  from each one's menu open, rename, delete (after confirming) or start a new interview with the
+  same setup, to practice again for the same job.
+- **New interview:** the role, interview type (Technical, HR or Mixed), answer length, and an
+  optional resume (PDF or DOCX, dropped or browsed) and job description for answers to draw on,
+  with a summary beside them. The last role, type and length you chose are filled in next time.
+  During an interview, the top bar shows only the way back to Interviews and the interview's
+  title (click it to rename) and details.
 - **Interview:** type or dictate questions (in Chrome) and watch the answers
   stream in. Each question and its answer have a page of their own: a new question opens at the
   top of the answers, alone, and scrolling up brings back earlier ones one at a time. Optional
@@ -49,7 +56,7 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   example, a free daily quota is used up), the retry goes to the main model instead, and the
   second model is left alone until Google says to try again. The connection to Gemini
   stays open between questions, so each question doesn't wait for a new one.
-- **History:** reopen, search, rename or delete past interviews, stored locally in SQLite.
+- **Saved locally:** interviews are stored in SQLite on this computer.
 
 ## First-time setup (macOS)
 
@@ -112,8 +119,8 @@ Frontend, from `frontend/`:
 
 - `backend/main.py`: the API. Interviews, resume parsing, prompts, and answers streamed from Gemini.
 - `frontend/app/page.tsx`: the app's state and the actions that connect the screens.
-- `frontend/components/`: the screens and panels (New Interview, History, the question box,
-  the answers).
+- `frontend/components/`: the screens and panels (Interviews, New interview, the top bar, the
+  question box, the answers).
 - `frontend/hooks/`: speech recognition, sharing a tab's sound, the recording and transcript
   improvement, the question draft and the answer pages.
 - `frontend/lib/`: the API client and shared types. Styles are in `frontend/app/style.css`.

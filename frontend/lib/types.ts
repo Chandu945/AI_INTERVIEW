@@ -1,4 +1,5 @@
-export type View = 'setup' | 'interview' | 'history';
+/** The Interviews page (the start page), the New interview form, or an interview. */
+export type View = 'home' | 'setup' | 'interview';
 export type AnswerMode = 'quick' | 'balanced' | 'detailed';
 export type InterviewType = 'Technical' | 'HR' | 'Mixed';
 /** What dictation listens to: the microphone, or the sound of a shared browser tab. */
@@ -15,6 +16,9 @@ export type Session = {
   interview_type?: string;
   created_at: string;
   updated_at: string;
+  /** How many questions it has, and the last one asked (in the list only). */
+  questions?: number;
+  last_question?: string | null;
 };
 
 /** One line of a streamed answer (see /api/chat/stream in backend/main.py). */

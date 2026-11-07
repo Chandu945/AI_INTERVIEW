@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Composer } from '../components/Composer';
 import { ConversationPanel } from '../components/ConversationPanel';
-import { HistoryPage } from '../components/HistoryPage';
+import { InterviewsPage, type TypeFilter } from '../components/InterviewsPage';
 import { SetupPage, type NewInterview } from '../components/SetupPage';
 import { TopBar } from '../components/TopBar';
 import { useDraft } from '../hooks/useDraft';
@@ -17,11 +17,17 @@ import type { AnswerMode, Message, Session, StreamMetrics, View, VoiceSource } f
 // Remembers in this browser whether dictation listens to the mic or a tab.
 const SOURCE_KEY = 'ai-interact.voice-source';
 
-/** The whole app: New Interview, History and the interview itself, plus the actions that connect them. */
+/** The whole app: the Interviews page, the New interview form and the interview itself, and what connects them. */
 export default function Home() {
-  const [view, setView] = useState<View>('setup');
+  const [view, setView] = useState<View>('home');
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [historySearch, setHistorySearch] = useState('');
+  // Whether the list of interviews has loaded, and why it couldn't.
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [sessionsError, setSessionsError] = useState('');
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('All');
+  // The interview being held, as last loaded (the list's copy, when it has one, is newer).
+  const [currentSession, setCurrentSession] = useState<Session | null>(null);
   // Changing this key remounts the New Interview form, which resets its fields.
   const [setupKey, setSetupKey] = useState(0);
   const [starting, setStarting] = useState(false);
@@ -174,9 +180,12 @@ export default function Home() {
   const refreshSessions = useCallback(async () => {
     try {
       const r = await api.listInterviews();
-      if (r.ok) setSessions((await r.json()).sessions);
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      setSessions((await r.json()).sessions);
+      setSessionsLoaded(true);
+      setSessionsError('');
     } catch {
-      /* backend offline */
+      setSessionsError("Couldn't load your interviews. Is the backend running?");
     }
   }, []);
 
@@ -190,6 +199,7 @@ export default function Home() {
         if (!r.ok) throw new Error('Could not open interview');
         const data = await r.json();
         showNewest();
+        setCurrentSession(data.session);
         setConversationId(id);
         setMessages(data.messages);
         setAnswerMode(data.session.mode || 'balanced');
@@ -198,36 +208,57 @@ export default function Home() {
         setError('');
         setStreamMetrics(null);
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not load history');
+        setError(e instanceof Error ? e.message : 'Could not open the interview');
       }
     },
     [discard, haltRecognition, showNewest, updateDraft],
   );
 
-  const renameSession = useCallback(
-    async (id: string, title: string) => {
-      const next = window.prompt('Interview title', title);
-      if (!next?.trim()) return;
-      await api.updateInterview(id, { title: next.trim() });
-      void refreshSessions();
-    },
-    [refreshSessions],
-  );
+  const renameSession = useCallback(async (id: string, title: string) => {
+    try {
+      const r = await api.updateInterview(id, { title });
+      if (!r.ok) throw new Error('Could not rename the interview');
+      setSessions(list => list.map(session => (session.id === id ? { ...session, title } : session)));
+      setCurrentSession(current => (current?.id === id ? { ...current, title } : current));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not rename the interview');
+    }
+  }, []);
 
   const deleteSession = useCallback(
     async (id: string) => {
-      if (busyRef.current || !window.confirm('Delete this interview and its saved questions, answers and resume?'))
-        return;
-      const r = await api.deleteInterview(id);
-      if (r.ok) {
+      if (busyRef.current) return;
+      try {
+        const r = await api.deleteInterview(id);
+        if (!r.ok) throw new Error('Could not delete the interview');
+        setSessions(list => list.filter(session => session.id !== id));
         if (conversationId === id) {
           setConversationId(null);
+          setCurrentSession(null);
           setMessages([]);
         }
         void refreshSessions();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Could not delete the interview');
       }
     },
     [conversationId, refreshSessions],
+  );
+
+  // A new interview with the same setup as another, opened straight away.
+  const copySession = useCallback(
+    async (id: string) => {
+      if (busyRef.current) return;
+      try {
+        const r = await api.copyInterview(id);
+        if (!r.ok) throw new Error('Could not start a new interview');
+        await openSession((await r.json()).conversation_id);
+        void refreshSessions();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Could not start a new interview');
+      }
+    },
+    [openSession, refreshSessions],
   );
 
   const sendMessage = useCallback(async () => {
@@ -370,7 +401,7 @@ export default function Home() {
     }
   }, []);
 
-  // Saves the answer length on the interview, so reopening it from History keeps the choice.
+  // Saves the answer length on the interview, so reopening it keeps the choice.
   const changeAnswerMode = useCallback(
     (mode: AnswerMode) => {
       setAnswerMode(mode);
@@ -382,7 +413,7 @@ export default function Home() {
     [conversationId],
   );
 
-  const newChat = useCallback(() => {
+  const newInterview = useCallback(() => {
     if (busyRef.current) return;
     haltRecognition(false);
     discard();
@@ -390,19 +421,20 @@ export default function Home() {
     updateInterim('');
     setMessages([]);
     setConversationId(null);
-    setAnswerMode('balanced');
+    setCurrentSession(null);
     setSetupKey(key => key + 1);
     setError('');
     setStreamMetrics(null);
     setView('setup');
-    void refreshSessions();
-  }, [discard, haltRecognition, refreshSessions, updateDraft, updateInterim]);
+  }, [discard, haltRecognition, updateDraft, updateInterim]);
 
-  const showHistory = useCallback(() => {
+  // Back to the Interviews page, from an interview or the New interview form.
+  const goHome = useCallback(() => {
+    if (busyRef.current) return;
     haltRecognition(false);
     discard();
     setError('');
-    setView('history');
+    setView('home');
     void refreshSessions();
   }, [discard, haltRecognition, refreshSessions]);
 
@@ -417,7 +449,7 @@ export default function Home() {
         const r = await api.createInterview({
           target_role: form.targetRole.trim(),
           interview_type: form.interviewType,
-          mode: answerMode,
+          mode: form.answerMode,
           instructions: form.instructions,
           job_description: form.jobDescription,
         });
@@ -432,19 +464,32 @@ export default function Home() {
           }
         }
         unfinishedId = null;
+        setCurrentSession({
+          id,
+          title: 'New Interview',
+          resume_name: form.resume?.name ?? null,
+          target_role: form.targetRole.trim(),
+          interview_type: form.interviewType,
+          mode: form.answerMode,
+          created_at: '',
+          updated_at: '',
+        });
         setConversationId(id);
+        setAnswerMode(form.answerMode);
         setMessages([]);
+        setFailedDraft(null);
+        setStreamMetrics(null);
         setView('interview');
         await refreshSessions();
       } catch (e) {
-        // Remove the half-made interview so retrying doesn't leave empty ones in History.
+        // Remove the half-made interview so retrying doesn't leave empty ones on the Interviews page.
         if (unfinishedId) await api.deleteInterview(unfinishedId).catch(() => {});
         setError(e instanceof Error ? e.message : 'Could not start interview');
       } finally {
         setStarting(false);
       }
     },
-    [answerMode, refreshSessions, starting],
+    [refreshSessions, starting],
   );
 
   useEffect(() => {
@@ -478,30 +523,41 @@ export default function Home() {
     return () => window.removeEventListener('keydown', onKey);
   }, [sendMessage, view]);
 
+  // The list's copy is the newest: Gemini titles an interview after its first question.
+  const current = sessions.find(session => session.id === conversationId) ?? currentSession;
   return (
     <main className="app-shell">
-      <TopBar view={view} disabled={busy || starting} onNewInterview={newChat} onHistory={showHistory} />
+      <TopBar
+        interview={view === 'interview' ? current : null}
+        busy={busy || starting}
+        onBack={goHome}
+        onRename={title => {
+          if (conversationId) void renameSession(conversationId, title);
+        }}
+      />
+      {view === 'home' && (
+        <InterviewsPage
+          sessions={sessions}
+          loaded={sessionsLoaded}
+          search={search}
+          onSearchChange={setSearch}
+          filter={typeFilter}
+          onFilterChange={setTypeFilter}
+          error={error || sessionsError}
+          onOpen={id => void openSession(id)}
+          onRename={(id, title) => void renameSession(id, title)}
+          onCopy={id => void copySession(id)}
+          onDelete={id => void deleteSession(id)}
+          onNewInterview={newInterview}
+        />
+      )}
       {view === 'setup' && (
         <SetupPage
           key={setupKey}
-          answerMode={answerMode}
-          onAnswerModeChange={setAnswerMode}
           starting={starting}
           error={error}
-          setError={setError}
           onStart={form => void startInterview(form)}
-        />
-      )}
-      {view === 'history' && (
-        <HistoryPage
-          sessions={sessions}
-          search={historySearch}
-          onSearchChange={setHistorySearch}
-          error={error}
-          onOpen={id => void openSession(id)}
-          onRename={(id, title) => void renameSession(id, title)}
-          onDelete={id => void deleteSession(id)}
-          onNewInterview={newChat}
+          onCancel={goHome}
         />
       )}
       {view === 'interview' && (

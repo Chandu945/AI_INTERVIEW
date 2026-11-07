@@ -4,29 +4,75 @@ import { ANSWER_MODES, INTERVIEW_TYPES, answerModeLabel, type AnswerMode, type I
 export type NewInterview = {
   targetRole: string;
   interviewType: InterviewType;
+  answerMode: AnswerMode;
   instructions: string;
   jobDescription: string;
   resume: File | null;
 };
 
 type Props = {
-  answerMode: AnswerMode;
-  onAnswerModeChange: (mode: AnswerMode) => void;
   starting: boolean;
+  /** Why the interview couldn't start (say, the resume couldn't be read). */
   error: string;
-  setError: (message: string) => void;
   onStart: (form: NewInterview) => void;
+  onCancel: () => void;
 };
 
 const MAX_RESUME_BYTES = 5 * 1024 * 1024;
+const MAX_JOB_DESCRIPTION = 12_000;
+const MAX_INSTRUCTIONS = 2_000;
+// The role, type and answer length of the last interview set up in this browser, to start from.
+const LAST_SETUP_KEY = 'ai-interact.last-setup';
 
-/** The New Interview form. It keeps its own fields; the page remounts it to start fresh. */
-export function SetupPage({ answerMode, onAnswerModeChange, starting, error, setError, onStart }: Props) {
-  const [targetRole, setTargetRole] = useState('GenAI Developer');
-  const [interviewType, setInterviewType] = useState<InterviewType>('Technical');
+const TYPE_TEXT: Record<InterviewType, string> = {
+  Technical: 'Concepts, tools and system design',
+  HR: 'Behavioral questions, answered from your resume',
+  Mixed: 'Technical and behavioral questions',
+};
+// How long each answer takes to say (see MODE_GUIDANCE in backend/main.py).
+const LENGTH_TEXT: Record<AnswerMode, string> = {
+  quick: 'A few sentences, about 15–30 seconds to say',
+  balanced: 'A short paragraph, about 30–60 seconds',
+  detailed: 'With an example and tradeoffs, about a minute or more',
+};
+
+type LastSetup = { targetRole: string; interviewType: InterviewType; answerMode: AnswerMode };
+
+function lastSetup(): LastSetup {
+  const setup: LastSetup = { targetRole: 'GenAI Developer', interviewType: 'Technical', answerMode: 'balanced' };
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAST_SETUP_KEY) || '{}') as Partial<LastSetup>;
+    if (typeof saved.targetRole === 'string' && saved.targetRole.trim()) setup.targetRole = saved.targetRole;
+    if (INTERVIEW_TYPES.includes(saved.interviewType as InterviewType)) setup.interviewType = saved.interviewType!;
+    if (ANSWER_MODES.includes(saved.answerMode as AnswerMode)) setup.answerMode = saved.answerMode!;
+  } catch {
+    /* nothing saved, or storage is blocked */
+  }
+  return setup;
+}
+
+function remember(setup: LastSetup) {
+  try {
+    localStorage.setItem(LAST_SETUP_KEY, JSON.stringify(setup));
+  } catch {
+    /* storage is blocked: the defaults are used next time */
+  }
+}
+
+const fileSize = (bytes: number) =>
+  bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+
+/** The New interview form. It keeps its own fields; the page remounts it to start afresh. */
+export function SetupPage({ starting, error, onStart, onCancel }: Props) {
+  const [initial] = useState(lastSetup);
+  const [targetRole, setTargetRole] = useState(initial.targetRole);
+  const [interviewType, setInterviewType] = useState<InterviewType>(initial.interviewType);
+  const [answerMode, setAnswerMode] = useState<AnswerMode>(initial.answerMode);
   const [instructions, setInstructions] = useState('');
   const [jobDescription, setJobDescription] = useState('');
   const [resume, setResume] = useState<File | null>(null);
+  const [resumeError, setResumeError] = useState('');
+  const [dragging, setDragging] = useState(false);
   const resumeInputRef = useRef<HTMLInputElement | null>(null);
 
   // The file picker isn't controlled by React, so empty it whenever the attached resume is removed.
@@ -34,115 +80,216 @@ export function SetupPage({ answerMode, onAnswerModeChange, starting, error, set
     if (!resume && resumeInputRef.current) resumeInputRef.current.value = '';
   }, [resume]);
 
+  const pickResume = (file: File | null) => {
+    setResumeError('');
+    if (!file) return;
+    if (!/\.(pdf|docx)$/i.test(file.name)) {
+      setResumeError('Use a PDF or Word (.docx) file.');
+    } else if (file.size > MAX_RESUME_BYTES) {
+      setResumeError(`That file is ${fileSize(file.size)}. The limit is 5 MB.`);
+    } else {
+      setResume(file);
+      return;
+    }
+    if (resumeInputRef.current) resumeInputRef.current.value = '';
+  };
+
+  const start = () => {
+    const role = targetRole.trim();
+    if (!role || starting) return;
+    remember({ targetRole: role, interviewType, answerMode });
+    onStart({ targetRole: role, interviewType, answerMode, instructions, jobDescription, resume });
+  };
+
+  const jobWords = jobDescription.trim() ? jobDescription.trim().split(/\s+/).length : 0;
+
   return (
     <section className="setup-page">
-      <div className="setup-card">
-        <span className="eyebrow">START A NEW SESSION</span>
-        <h2>New Interview</h2>
-        <p className="setup-subtitle">
-          Set up your interview before entering the focused workspace. A resume is optional and belongs only to this
-          session.
-        </p>
-        <label className="setup-field">
-          Target role
-          <input
-            value={targetRole}
-            maxLength={100}
-            onChange={e => setTargetRole(e.target.value)}
-            placeholder="e.g. GenAI Developer"
-          />
-        </label>
-        <fieldset className="setup-field">
-          <legend>Interview type</legend>
-          <div className="setup-choice-row">
-            {INTERVIEW_TYPES.map(t => (
-              <button
-                type="button"
-                key={t}
-                className={`choice ${interviewType === t ? 'selected' : ''}`}
-                onClick={() => setInterviewType(t)}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-        </fieldset>
-        <div className="setup-field">
-          <label htmlFor="setup-resume">
-            Candidate resume <span className="optional">Optional · PDF or DOCX · up to 5 MB</span>
-          </label>
-          <input
-            ref={resumeInputRef}
-            id="setup-resume"
-            type="file"
-            accept=".pdf,.docx"
-            onChange={e => {
-              const file = e.target.files?.[0] || null;
-              if (file && file.size > MAX_RESUME_BYTES) {
-                setError('Resume must be 5 MB or smaller');
-                e.target.value = '';
-                return;
-              }
-              setResume(file);
-              setError('');
-            }}
-          />
-          {resume && (
-            <span className="attached-file">
-              📄 {resume.name}{' '}
-              <button type="button" onClick={() => setResume(null)}>
-                Remove
-              </button>
+      <button type="button" className="back-link" onClick={onCancel}>
+        <span aria-hidden="true">←</span> Interviews
+      </button>
+      <div className="page-head">
+        <div>
+          <h2>New interview</h2>
+          <p>Tell Gemini about the role, so its answers fit it. Only the role is needed.</p>
+        </div>
+      </div>
+
+      <div className="setup-layout">
+        <div className="setup-form">
+          <section className="setup-section">
+            <label className="field-label" htmlFor="setup-role">
+              Role
+            </label>
+            <input
+              id="setup-role"
+              className="text-field"
+              value={targetRole}
+              maxLength={100}
+              onChange={event => setTargetRole(event.target.value)}
+              placeholder="e.g. Senior Backend Engineer"
+            />
+          </section>
+
+          <fieldset className="setup-section">
+            <legend className="field-label">Interview type</legend>
+            <div className="option-grid">
+              {INTERVIEW_TYPES.map(type => (
+                <label key={type} className={`option-card ${interviewType === type ? 'selected' : ''}`}>
+                  <input
+                    type="radio"
+                    name="interview-type"
+                    checked={interviewType === type}
+                    onChange={() => setInterviewType(type)}
+                  />
+                  <span className="option-title">{type}</span>
+                  <span className="option-text">{TYPE_TEXT[type]}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset className="setup-section">
+            <legend className="field-label">Answer length</legend>
+            <div className="option-grid">
+              {ANSWER_MODES.map(mode => (
+                <label key={mode} className={`option-card ${answerMode === mode ? 'selected' : ''}`}>
+                  <input
+                    type="radio"
+                    name="answer-length"
+                    checked={answerMode === mode}
+                    onChange={() => setAnswerMode(mode)}
+                  />
+                  <span className="option-title">{answerModeLabel(mode)}</span>
+                  <span className="option-text">{LENGTH_TEXT[mode]}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <section className="setup-section">
+            <h3 className="field-label">
+              Your background <span className="optional">Optional</span>
+            </h3>
+            <p className="field-note">Answers draw on these, and never make up experience you don’t have.</p>
+            <div
+              className={`dropzone ${dragging ? 'dragging' : ''} ${resume ? 'filled' : ''}`}
+              onDragOver={event => {
+                event.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={event => {
+                event.preventDefault();
+                setDragging(false);
+                pickResume(event.dataTransfer.files[0] ?? null);
+              }}
+            >
+              <input
+                ref={resumeInputRef}
+                id="setup-resume"
+                className="visually-hidden"
+                type="file"
+                accept=".pdf,.docx"
+                onChange={event => pickResume(event.target.files?.[0] ?? null)}
+              />
+              {resume ? (
+                <div className="file-chip">
+                  <span className="file-icon" aria-hidden="true">
+                    📄
+                  </span>
+                  <span className="file-name">{resume.name}</span>
+                  <span className="file-size">{fileSize(resume.size)}</span>
+                  <button type="button" className="text-button" onClick={() => setResume(null)}>
+                    Remove
+                  </button>
+                </div>
+              ) : (
+                <label htmlFor="setup-resume" className="dropzone-label">
+                  <span>
+                    <strong>Drop your resume here</strong> or <span className="link-text">browse</span>
+                  </span>
+                  <small>PDF or Word (.docx), up to 5 MB</small>
+                </label>
+              )}
+            </div>
+            {resumeError && (
+              <p className="field-error" role="alert">
+                {resumeError}
+              </p>
+            )}
+            <label className="field-label sub" htmlFor="setup-job">
+              Job description
+            </label>
+            <textarea
+              id="setup-job"
+              className="text-field"
+              rows={5}
+              maxLength={MAX_JOB_DESCRIPTION}
+              value={jobDescription}
+              onChange={event => setJobDescription(event.target.value)}
+              placeholder="Paste the job description, so answers focus on what the role needs."
+            />
+            <span className="field-count">
+              {jobDescription.length.toLocaleString()} / {MAX_JOB_DESCRIPTION.toLocaleString()}
             </span>
+          </section>
+
+          <details className="setup-section setup-more">
+            <summary>
+              Extra instructions <span className="optional">Optional</span>
+            </summary>
+            <textarea
+              className="text-field"
+              aria-label="Extra instructions"
+              rows={3}
+              maxLength={MAX_INSTRUCTIONS}
+              value={instructions}
+              onChange={event => setInstructions(event.target.value)}
+              placeholder="e.g. Focus on my recent projects and keep answers conversational."
+            />
+          </details>
+        </div>
+
+        <aside className="setup-summary" aria-label="Summary">
+          <h3>Summary</h3>
+          <dl>
+            <div>
+              <dt>Role</dt>
+              <dd>{targetRole.trim() || '—'}</dd>
+            </div>
+            <div>
+              <dt>Interview type</dt>
+              <dd>{interviewType}</dd>
+            </div>
+            <div>
+              <dt>Answer length</dt>
+              <dd>{answerModeLabel(answerMode)}</dd>
+            </div>
+            <div>
+              <dt>Resume</dt>
+              <dd>{resume ? resume.name : 'None'}</dd>
+            </div>
+            <div>
+              <dt>Job description</dt>
+              <dd>{jobWords ? `${jobWords.toLocaleString()} words` : 'None'}</dd>
+            </div>
+          </dl>
+          {error && (
+            <div className="error-banner" role="alert">
+              {error}
+            </div>
           )}
-        </div>
-        <div className="setup-field">
-          <label>Answer mode</label>
-          <div className="setup-choice-row">
-            {ANSWER_MODES.map(m => (
-              <button
-                type="button"
-                key={m}
-                className={`choice ${answerMode === m ? 'selected' : ''}`}
-                onClick={() => onAnswerModeChange(m)}
-              >
-                {answerModeLabel(m)}
-              </button>
-            ))}
-          </div>
-        </div>
-        <label className="setup-field">
-          Job description <span className="optional">Optional · paste the role requirements</span>
-          <textarea
-            rows={4}
-            maxLength={12000}
-            value={jobDescription}
-            onChange={e => setJobDescription(e.target.value)}
-            placeholder="Paste a job description to tailor technical topics without inventing experience."
-          />
-        </label>
-        <label className="setup-field">
-          Additional instructions <span className="optional">Optional</span>
-          <textarea
-            rows={3}
-            maxLength={2000}
-            value={instructions}
-            onChange={e => setInstructions(e.target.value)}
-            placeholder="e.g. Focus on my recent projects and keep answers conversational."
-          />
-        </label>
-        {error && (
-          <div className="error-banner" role="alert">
-            {error}
-          </div>
-        )}
-        <button
-          className="btn primary start-interview"
-          onClick={() => onStart({ targetRole, interviewType, instructions, jobDescription, resume })}
-          disabled={starting || !targetRole.trim()}
-        >
-          {starting ? 'Preparing interview…' : 'Start Interview →'}
-        </button>
+          <button
+            type="button"
+            className="btn primary start-button"
+            onClick={start}
+            disabled={starting || !targetRole.trim()}
+          >
+            {starting ? 'Preparing interview…' : 'Start interview →'}
+          </button>
+          <p className="summary-note">You can change the answer length during the interview too.</p>
+        </aside>
       </div>
     </section>
   );

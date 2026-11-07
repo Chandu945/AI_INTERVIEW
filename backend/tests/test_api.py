@@ -73,6 +73,37 @@ def test_new_interview_keeps_its_settings_and_is_listed(client):
     assert [s["id"] for s in client.get("/api/conversations").json()["sessions"]] == [cid]
 
 
+def test_the_list_shows_how_many_questions_each_interview_has_and_the_last_one(client, gemini):
+    empty = new_interview(client)
+    cid = new_interview(client)
+    gemini(("An answer.", "STOP"))
+    ask(client, cid, "What is a pod?")
+    ask(client, cid, "What is a deployment? " + "x" * 300)
+    listed = {s["id"]: s for s in client.get("/api/conversations").json()["sessions"]}
+    assert (listed[cid]["questions"], listed[cid]["last_question"]) == (2, ("What is a deployment? " + "x" * 300)[:200])
+    assert (listed[empty]["questions"], listed[empty]["last_question"]) == (0, None)
+
+
+def test_an_interview_can_be_started_again_with_the_same_setup(client, gemini):
+    cid = new_interview(
+        client, target_role="Data Engineer", interview_type="HR", mode="detailed",
+        instructions="Keep it short.", job_description="Spark and Airflow.",
+    )  # fmt: skip
+    upload(client, cid, "resume.docx", docx_with("Built ETL pipelines in PySpark at Acme for five years."))
+    gemini(("An answer.", "STOP"))
+    ask(client, cid)
+    copy = client.post(f"/api/conversations/{cid}/copy").json()["conversation_id"]
+    original, again = (client.get(f"/api/conversations/{c}").json() for c in (cid, copy))
+    fields = ("target_role", "interview_type", "mode", "instructions", "job_description", "resume_name")
+    assert [again["session"][f] for f in fields] == [original["session"][f] for f in fields]
+    assert again["session"]["resume_name"] == "resume.docx"
+    assert (again["session"]["title"], again["messages"]) == ("New Interview", [])
+    with main.connect() as db:  # the resume's text came along too, for the answers to draw on
+        texts = [row[0] for row in db.execute("SELECT resume_text FROM sessions WHERE id IN (?, ?)", (cid, copy))]
+    assert texts[0] == texts[1] and "PySpark" in texts[0]
+    assert client.post("/api/conversations/missing/copy").status_code == 404
+
+
 def test_answer_length_is_saved_and_renaming_keeps_it(client):
     cid = new_interview(client)
     assert client.patch(f"/api/conversations/{cid}", json={"mode": "detailed"}).status_code == 200

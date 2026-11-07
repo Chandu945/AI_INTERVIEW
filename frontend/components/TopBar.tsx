@@ -1,39 +1,78 @@
-import type { View } from '../lib/types';
+import { useState } from 'react';
+import type { Session } from '../lib/types';
+import { TitleEditor } from './TitleEditor';
 
 type Props = {
-  view: View;
-  disabled: boolean;
-  onNewInterview: () => void;
-  onHistory: () => void;
+  /** The interview being held; null on the other pages. */
+  interview: Session | null;
+  /** While an answer is being written, the interview can't be left or renamed. */
+  busy: boolean;
+  onBack: () => void;
+  onRename: (title: string) => void;
 };
 
-export function TopBar({ view, disabled, onNewInterview, onHistory }: Props) {
-  return (
-    <header className="topbar">
-      <div className="brand">
-        <span className="brand-mark">✦</span>
-        <div>
-          <h1>AI Interact</h1>
-          <p>Interview practice with Gemini</p>
-        </div>
-      </div>
-      <nav className="top-actions" aria-label="Main navigation">
-        <button
-          className={`btn ${view === 'setup' ? 'primary' : 'subtle'}`}
-          onClick={onNewInterview}
-          disabled={disabled}
-        >
-          + New Interview
-        </button>
-        <button className={`btn ${view === 'history' ? 'primary' : 'subtle'}`} onClick={onHistory} disabled={disabled}>
-          History
-        </button>
-        {view === 'interview' && (
-          <span className="online">
-            <span className="online-dot" /> Interview workspace
+/**
+ * The bar across the top. On the Interviews page and the New interview form it shows the app's
+ * name; during an interview, only the way back to Interviews and the interview's title and
+ * details, so nothing there pulls you out of it by mistake.
+ */
+export function TopBar({ interview, busy, onBack, onRename }: Props) {
+  const [renaming, setRenaming] = useState(false);
+  if (!interview)
+    return (
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">
+            ✦
           </span>
+          <div>
+            <h1>AI Interact</h1>
+            <p>Interview practice with Gemini</p>
+          </div>
+        </div>
+      </header>
+    );
+  const details = [interview.target_role, interview.interview_type].filter(Boolean).join(' · ');
+  return (
+    <header className="topbar interview-bar">
+      <span className="brand-mark small" aria-hidden="true">
+        ✦
+      </span>
+      <button type="button" className="back-button" onClick={onBack} disabled={busy} aria-label="Back to interviews">
+        <span aria-hidden="true">←</span> Interviews
+      </button>
+      <div className="interview-heading">
+        {renaming ? (
+          <TitleEditor
+            title={interview.title}
+            onDone={title => {
+              setRenaming(false);
+              if (title) onRename(title);
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            className="title-button"
+            onClick={() => setRenaming(true)}
+            disabled={busy}
+            title="Rename this interview"
+          >
+            <h1>{interview.title}</h1>
+            <span className="pencil" aria-hidden="true">
+              ✎
+            </span>
+          </button>
         )}
-      </nav>
+        <p>
+          {details}
+          {interview.resume_name && (
+            <span className="resume-tag">
+              <span aria-hidden="true">📄</span> {interview.resume_name}
+            </span>
+          )}
+        </p>
+      </div>
     </header>
   );
 }

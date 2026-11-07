@@ -301,9 +301,14 @@ def get_conversation(conversation_id: str):
 
 @app.get("/api/conversations")
 def list_conversations():
+    """The interviews, latest first, each with how many questions it has and the last one asked."""
     with connect() as db:
         rows = db.execute(
-            "SELECT id,title,resume_name,mode,target_role,interview_type,instructions,job_description,created_at,updated_at FROM sessions ORDER BY updated_at DESC LIMIT 300"
+            "SELECT id,title,resume_name,mode,target_role,interview_type,instructions,job_description,created_at,updated_at,"
+            " (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=s.id AND m.role='user') AS questions,"
+            " (SELECT substr(content,1,200) FROM messages m WHERE m.conversation_id=s.id AND m.role='user'"
+            "  ORDER BY m.id DESC LIMIT 1) AS last_question"
+            " FROM sessions s ORDER BY updated_at DESC LIMIT 300"
         ).fetchall()
     return {"sessions": [dict(row) for row in rows]}
 
@@ -331,6 +336,23 @@ def create_conversation(request: NewInterviewRequest):
                 request.job_description.strip(),
             ),
         )
+    return {"conversation_id": cid}
+
+
+@app.post("/api/conversations/{conversation_id}/copy")
+def copy_conversation(conversation_id: str):
+    """Starts a new interview with the same setup (role, type, answer length, job description,
+    instructions and resume), to practice again for the same job. Its questions aren't copied."""
+    cid = str(uuid.uuid4())
+    with connect() as db:
+        result = db.execute(
+            "INSERT INTO sessions (id,target_role,interview_type,mode,instructions,job_description,resume_name,resume_text)"
+            " SELECT ?,target_role,interview_type,mode,instructions,job_description,resume_name,resume_text"
+            " FROM sessions WHERE id=?",
+            (cid, conversation_id),
+        )
+        if not result.rowcount:
+            raise HTTPException(404, "Interview not found")
     return {"conversation_id": cid}
 
 

@@ -25,6 +25,8 @@ export const api = {
   updateInterview: (id: string, fields: { title?: string; mode?: AnswerMode }) =>
     fetch(`${API}/api/conversations/${id}`, { method: 'PATCH', headers: JSON_HEADERS, body: JSON.stringify(fields) }),
   deleteInterview: (id: string) => fetch(`${API}/api/conversations/${id}`, { method: 'DELETE' }),
+  /** Starts a new interview with the same setup as this one (role, type, resume, and so on). */
+  copyInterview: (id: string) => fetch(`${API}/api/conversations/${id}/copy`, { method: 'POST' }),
   /** `context`: the end of the text so far, which the recording continues. */
   transcribe: (id: string, audio: Blob, signal?: AbortSignal, context = '') => {
     const body = new FormData();

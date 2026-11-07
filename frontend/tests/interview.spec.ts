@@ -15,16 +15,16 @@ test.beforeEach(async ({ page }) => {
   await openInterview(page, 'Demo interview');
 });
 
-test('Cmd+Enter sends from the interview page only, never a leftover draft from History', async ({ page }) => {
+test('Cmd+Enter sends from the interview page only, never a leftover draft from another page', async ({ page }) => {
   await page.getByLabel('Your message').fill('leftover draft that should not be sent');
-  await page.getByRole('button', { name: 'History', exact: true }).click();
-  await page.getByPlaceholder(/Search interview titles/).click();
+  await page.getByRole('button', { name: 'Back to interviews' }).click();
+  await page.getByLabel('Search interviews').click();
   await forgetRequests(page);
   await page.keyboard.press('Meta+Enter');
   await page.waitForTimeout(500);
   expect(await chatRequests(page)).toBe(0);
 
-  await page.locator('.history-card-open', { hasText: 'Demo interview' }).click();
+  await page.locator('.interview-open', { hasText: 'Demo interview' }).click();
   await page.getByLabel('Your message').fill('A short question');
   await page.keyboard.press('Meta+Enter');
   await expect.poll(() => chatRequests(page)).toBe(1); // the test backend has no key, so it then fails with 503

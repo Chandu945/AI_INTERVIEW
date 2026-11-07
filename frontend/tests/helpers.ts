@@ -7,7 +7,6 @@ declare global {
   interface Window {
     __requests: string[];
     __fakeStream: null | ((url: string, heard: string) => Response);
-    __emptyHistory: boolean;
     __streams: (intervalMs?: number, count?: number) => void;
     __replay: (events: object[], intervalMs?: number) => void;
     __say: (text: string) => void;
@@ -30,14 +29,12 @@ declare global {
 }
 
 /**
- * Runs in the page before the app loads. Records every fetch, can fake a streamed answer and
- * an empty History list, and replaces speech recognition and Chrome's tab-sharing picker with
- * fakes the tests can control.
+ * Runs in the page before the app loads. Records every fetch, can fake a streamed answer, and
+ * replaces speech recognition and Chrome's tab-sharing picker with fakes the tests can control.
  */
 function pageFakes() {
   window.__requests = [];
   window.__fakeStream = null;
-  window.__emptyHistory = false;
   // When set, recordings are "transcribed" as this text instead of being sent to the test backend
   // (which has no Gemini key, so it answers 503). __transcripts and __transcriptDelays, when not
   // empty, give each request its own text and delay instead, in turn; a null text fails.
@@ -64,10 +61,6 @@ function pageFakes() {
       const body = JSON.stringify({ text });
       const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
       return new Promise(resolve => setTimeout(() => resolve(response), delay));
-    }
-    if (window.__emptyHistory && !init?.method && url.endsWith('/api/conversations')) {
-      const body = JSON.stringify({ sessions: [] });
-      return Promise.resolve(new Response(body, { headers: { 'Content-Type': 'application/json' } }));
     }
     if (window.__fakeStream && url.includes('/api/chat/stream')) {
       const heard = init?.body instanceof FormData ? String(init.body.get('heard') ?? '') : '';
@@ -212,9 +205,11 @@ export async function openApp(page: Page) {
   await page.waitForFunction(() => window.__requests.some(url => url.endsWith('/api/conversations')));
 }
 
+/** Opens an interview from the Interviews page, going back to it first from an interview. */
 export async function openInterview(page: Page, title: string) {
-  await page.getByRole('button', { name: 'History', exact: true }).click();
-  await page.locator('.history-card-open', { hasText: title }).click();
+  const back = page.getByRole('button', { name: 'Back to interviews' });
+  if (await back.isVisible()) await back.click();
+  await page.locator('.interview-open', { hasText: title }).click();
   await expect(page.locator('.conversation-body .message').first()).toBeVisible();
 }
 
