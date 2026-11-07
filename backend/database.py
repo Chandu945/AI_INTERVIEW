@@ -115,6 +115,12 @@ def read_times_as_sqlite_does(connection):
         connection.adapters.register_loader("timestamptz", Loader)
 
 
+def postgres_execute(connection, sql: str, params=()):
+    """Runs the app's SQL, with ? for each value, on a psycopg connection. SQL without values goes as
+    it is (as text): it may hold several statements."""
+    return connection.execute(sql.replace("?", "%s"), params or None, binary=bool(params))
+
+
 class PostgresConnection:
     """A pooled PostgreSQL connection that takes the app's SQL, with ? for each value."""
 
@@ -137,8 +143,7 @@ class PostgresConnection:
     def execute(self, sql: str, params=()):
         if sql.lstrip()[:6].upper() in WRITES:
             self.begin()
-        # SQL without values goes as it is (as text): it may hold several statements.
-        return self.connection.execute(sql.replace("?", "%s"), params or None, binary=bool(params))
+        return postgres_execute(self.connection, sql, params)
 
     def executemany(self, sql: str, rows):
         self.begin()
@@ -250,6 +255,20 @@ class Database:
                 yield connection
         finally:
             connection.close()
+
+    def run(self, sql: str, params=()):
+        """One statement on its own, saved at once; returns it, for its rowcount. With PostgreSQL
+        that's one trip: a single statement is all or nothing anyway, so it needs no BEGIN and
+        COMMIT around it."""
+        if self.postgres and not self.schema:
+            try:
+                with self.pool.connection() as connection:
+                    connection.last_used = time.monotonic()
+                    return postgres_execute(connection, sql, params)
+            except self.unavailable as exc:
+                raise DatabaseUnavailable(str(exc)) from exc
+        with self.connect() as db:
+            return db.execute(sql, params)
 
     def drop_schema(self):
         """For the tests: removes their schema, and everything in it."""

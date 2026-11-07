@@ -128,11 +128,19 @@ To use a free hosted PostgreSQL database on [Supabase](https://supabase.com):
    safe to run again.
 
 Each trip to a database far away is a wait (about 60 ms from India to Mumbai), and it sends data
-at about 1 MB a second. So the backend keeps its connections open, reads what a question needs
-(the interview's settings, its last messages and the question's images) at the same time, in
-one trip, and keeps question images in memory once they're uploaded or read. An answer starts
-about 0.1 s later than with SQLite and is saved about 0.25 s after it ends, and an image takes
-about a second per MB to upload when you add it to a question.
+at about 1 MB a second, so the backend keeps the database out of an interview's way:
+
+- It keeps the interviews in use in memory (each one's settings and last messages) and the
+  questions' images. Once an interview is open, its questions and dictation read nothing from
+  the database.
+- It saves questions, answers and images in the background, in order, so nothing waits for that.
+  While the database is out of reach it keeps trying, and the interview goes on meanwhile.
+- Opening an interview and the Interviews page read from the database, once what's waiting to be
+  saved is.
+
+When the backend stops, it waits up to 10 seconds for anything still waiting to be saved (only
+while the database is out of reach would there be any). Changes made to an interview outside
+the app, in Supabase's table editor, say, count once you reopen it.
 
 Supabase's web API can reach the tables in a project's public schema with the project's public
 key, so the backend turns on row level security on its tables: with no rules, that API gets

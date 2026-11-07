@@ -63,15 +63,10 @@ def test_health(client):
     assert client.get("/api/health").json() == {"status": "ok", "database": database}
 
 
-def test_a_database_out_of_reach_is_said_plainly(client, gemini, monkeypatch):
-    cid = new_interview(client)
-    gemini(("An answer.", "STOP"))
-
-    def out_of_reach(*args):
+def test_a_database_out_of_reach_is_said_plainly(client, monkeypatch):
+    def out_of_reach():
         raise DatabaseUnavailable("connection timeout expired")
 
-    monkeypatch.setattr(main, "save_turn", out_of_reach)  # the answer came, but couldn't be saved
-    assert ask(client, cid)[-1] == {"type": "error", "message": main.DATABASE_UNAVAILABLE}
     monkeypatch.setattr(main, "connect", out_of_reach)
     response = client.get("/api/conversations")
     assert (response.status_code, response.json()) == (503, {"detail": main.DATABASE_UNAVAILABLE})
@@ -419,6 +414,7 @@ def test_images_are_kept_in_memory_once_uploaded_or_read(client, gemini):
     images go to Gemini again with its next two follow-ups."""
     cid = new_interview(client)
     image_id = add_image(client, cid).json()["image_id"]
+    settled(client)
     with main.connect() as db:  # changed in the database only, so what's sent shows where it came from
         db.execute("UPDATE images SET data=? WHERE id=?", (JPEG, image_id))
     fake = gemini(("An answer.", "STOP"))
@@ -442,23 +438,160 @@ def test_image_memory_lets_the_least_recently_used_go_when_full():
     assert (memory.get("a"), memory.size) == (None, 5)
 
 
-def test_a_question_reads_the_database_all_at_once(client, monkeypatch):
-    """Each read is a trip to the database (about 60 ms to one far away), so a question's three
-    (its interview's settings, the interview so far and its images) go at the same time."""
+# The database never holds up an interview (each trip to one far away takes about 60 ms)
+
+
+def settled(client):
+    """Waits until the backend has saved everything waiting to be saved."""
+    client.portal.call(main.saver.all_saved.wait)
+
+
+def slowly(write, seconds=0.5):
+    """`write`, taking longer, as with a database far away."""
+
+    def slow_write(*args, **kwargs):
+        time.sleep(seconds)
+        write(*args, **kwargs)
+
+    return slow_write
+
+
+def test_questions_and_transcriptions_read_nothing_from_the_database(client, gemini, monkeypatch):
+    """Once an interview is open, all they need is in memory: its settings and last messages."""
+    cid = new_interview(client, job_description="Kafka streams into FlinkSQL.")
+    gemini(("An answer.", "STOP"))
+    ask(client, cid, "What is Kafka?")
+    client.get(f"/api/conversations/{cid}")  # opened, as the app does
+    settled(client)
+    reads = []
+    connect = main.connect
+    monkeypatch.setattr(main, "connect", lambda: reads.append(1) or connect())
+    monkeypatch.setattr(main, "save_turn", lambda *args, **kwargs: None)  # saving isn't reading
+    fake = gemini(("Another answer.", "STOP"))
+    fake.transcript = "SPEECH: yes\nHow does it scale?"
+    assert send_recording(client, cid).json() == {"text": "How does it scale?"}
+    assert "FlinkSQL" in fake.contents[0].parts[0].text  # a term to spell, from the job description
+    ask(client, cid, "How does it scale?")
+    assert [content.parts[-1].text for content in fake.contents[:2]] == ["What is Kafka?", "An answer."]
+    assert reads == []
+
+
+def test_an_answer_doesnt_wait_to_be_saved(client, gemini, monkeypatch):
+    """It's saved in the background: the next question already has it as context, and opening the
+    interview waits for it."""
     cid = new_interview(client)
-
-    def slowly(read):
-        def slow_read(*args):
-            time.sleep(0.3)
-            return read(*args)
-
-        return slow_read
-
-    for name in ("interview_settings", "interview_so_far", "image_parts"):
-        monkeypatch.setattr(main, name, slowly(getattr(main, name)))
+    monkeypatch.setattr(main, "save_turn", slowly(main.save_turn))
+    fake = gemini(("An answer.", "STOP"))
     started = time.perf_counter()
-    asyncio.run(main.typed_question(cid, "What is RAG?", (), "quick"))
-    assert time.perf_counter() - started < 0.85  # one after another, they'd take over 0.9 s
+    assert ask(client, cid, "First?")[-1]["type"] == "done"
+    ask(client, cid, "Second?")
+    assert time.perf_counter() - started < 0.5  # waiting for the two saves would take a second
+    assert [content.parts[-1].text for content in fake.contents[:2]] == ["First?", "An answer."]
+    assert [m["content"] for m in saved_messages(client, cid)] == ["First?", "An answer.", "Second?", "An answer."]
+    assert client.get(f"/api/conversations/{cid}").json()["session"]["title"] == "First?"
+
+
+def test_saving_is_tried_again_until_the_database_is_back(client, gemini, monkeypatch):
+    cid = new_interview(client)
+    monkeypatch.setattr(main.Saver, "RETRY_SECONDS", (0.05,))
+    save_turn, tries = main.save_turn, []
+
+    def save_once_back(*args, retrying=False):
+        tries.append(retrying)
+        if len(tries) < 3:
+            raise DatabaseUnavailable("connection timeout expired")
+        save_turn(*args, retrying=retrying)
+
+    monkeypatch.setattr(main, "save_turn", save_once_back)
+    gemini(("An answer.", "STOP"))
+    assert ask(client, cid, "What is RAG?")[-1]["type"] == "done"  # the interview goes on meanwhile
+    settled(client)
+    assert tries == [False, True, True]
+    assert [m["content"] for m in saved_messages(client, cid)] == ["What is RAG?", "An answer."]
+
+
+def test_a_save_tried_again_after_it_went_through_isnt_saved_twice(client, gemini, monkeypatch):
+    """The connection can break after the database saved something but before it said so."""
+    cid = new_interview(client)
+    monkeypatch.setattr(main.Saver, "RETRY_SECONDS", (0.05,))
+    save_turn = main.save_turn
+
+    def reply_lost(*args, retrying=False):
+        save_turn(*args, retrying=retrying)
+        if not retrying:
+            raise DatabaseUnavailable("server closed the connection unexpectedly")
+
+    monkeypatch.setattr(main, "save_turn", reply_lost)
+    gemini(("An answer.", "STOP"))
+    ask(client, cid, "What is RAG?")
+    settled(client)
+    assert [m["content"] for m in saved_messages(client, cid)] == ["What is RAG?", "An answer."]
+
+
+def test_an_image_is_ready_at_once_and_saved_in_the_background(client, gemini, monkeypatch):
+    """Uploading one to a database far away takes about a second per MB; a question can go with it
+    straight away."""
+    cid = new_interview(client)
+    monkeypatch.setattr(main, "store_image", slowly(main.store_image))
+    started = time.perf_counter()
+    image_id = add_image(client, cid).json()["image_id"]
+    fake = gemini(("An answer.", "STOP"))
+    ask_with(client, cid, "What does this print?", [image_id])
+    assert time.perf_counter() - started < 0.4
+    assert image_parts(fake.contents[-1])[0].data == PNG
+    settled(client)
+    with main.connect() as db:
+        assert db.execute("SELECT data FROM images WHERE id=?", (image_id,)).fetchone()["data"] == PNG
+
+
+def test_deleting_an_interview_leaves_none_of_its_waiting_writes_behind(client, gemini, monkeypatch):
+    cid = new_interview(client)
+    monkeypatch.setattr(main, "store_image", slowly(main.store_image, 0.3))
+    add_image(client, cid)
+    add_image(client, cid)  # waits while the first is saved
+    gemini(("An answer.", "STOP"))
+    ask(client, cid)
+    assert client.delete(f"/api/conversations/{cid}").json() == {"ok": True}
+    settled(client)
+    with main.connect() as db:
+        left = [
+            db.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE conversation_id=?", (cid,)).fetchone()["n"]
+            for table in ("messages", "images")
+        ]
+    assert left == [0, 0]
+
+
+def test_stopping_the_backend_saves_what_is_waiting_first(client, gemini, monkeypatch):
+    cid = new_interview(client)
+    monkeypatch.setattr(main, "save_turn", slowly(main.save_turn, 0.3))
+    gemini(("An answer.", "STOP"))
+    ask(client, cid)
+    client.portal.call(main.saver.stop)  # as when the backend stops
+    with main.connect() as db:
+        assert db.execute("SELECT COUNT(*) AS n FROM messages WHERE conversation_id=?", (cid,)).fetchone()["n"] == 2
+
+
+def test_after_a_restart_an_interview_is_read_from_the_database_once(client, gemini):
+    cid = new_interview(client, target_role="Data Engineer")
+    fake = gemini(("An answer.", "STOP"))
+    ask(client, cid, "First?")
+    settled(client)
+    main.interviews.forget(cid)  # as after a restart
+    ask(client, cid, "Second?")
+    assert [content.parts[-1].text for content in fake.contents[:2]] == ["First?", "An answer."]
+    assert "Interview target role: Data Engineer." in fake.config.system_instruction
+    assert main.interviews.get(cid) is not None  # and kept for the next question
+
+
+def test_opening_an_interview_reads_it_afresh(client, gemini):
+    """So changes made outside the app (in Supabase's table editor, say) count from then on."""
+    cid = new_interview(client, target_role="Data Engineer")
+    with main.connect() as db:
+        db.execute("UPDATE sessions SET target_role=? WHERE id=?", ("ML Engineer", cid))
+    client.get(f"/api/conversations/{cid}")
+    fake = gemini(("An answer.", "STOP"))
+    ask(client, cid)
+    assert "Interview target role: ML Engineer." in fake.config.system_instruction
 
 
 def ask_with(client, cid, message, image_ids):

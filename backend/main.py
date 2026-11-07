@@ -1,5 +1,6 @@
 import asyncio
 import io
+import itertools
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ import uuid
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -215,6 +216,8 @@ TRANSCRIBE_HEDGE = Hedge("Gemini transcription", minimum=1.5, maximum=4.0, facto
 
 database: Optional[Database] = None
 image_memory: Optional["ImageMemory"] = None
+interviews: Optional["InterviewMemory"] = None
+saver: Optional["Saver"] = None
 
 
 def connect():
@@ -222,13 +225,170 @@ def connect():
     return database.connect()
 
 
+# Sent with each question, as context for follow-ups: 5 exchanges, so the time and cost of an
+# answer don't grow with the interview.
+RECENT_MESSAGES = 10
+# What a question or a transcription needs to know about its interview.
+SETTINGS = ("target_role", "interview_type", "instructions", "job_description", "resume_text")
+INTERVIEWS_IN_MEMORY = 50
+
+
+class Interview:
+    """An interview in use, as kept in memory: its settings and its last messages."""
+
+    def __init__(self, settings, messages: list[dict]):
+        self.settings = {name: settings[name] for name in SETTINGS}
+        self.messages = messages[-RECENT_MESSAGES:]
+        self.known_terms: Optional[str] = None
+
+    def terms(self) -> str:
+        """The technical terms its questions may use, worked out once."""
+        if self.known_terms is None:
+            self.known_terms = interview_terms(self.settings)
+        return self.known_terms
+
+
+class InterviewMemory:
+    """The interviews in use, with all a question or a transcription needs to know (each one's
+    settings and last messages), so neither waits for the database. This backend is the only thing
+    that changes them, and keeps this up to date as it does: a new question and answer goes here at
+    once, and to the database in the background. Opening an interview reads it from the database
+    afresh. When there are too many, the least recently used go first."""
+
+    def __init__(self, room: int):
+        self.room = room
+        self.interviews: OrderedDict[str, Interview] = OrderedDict()
+        self.lock = threading.Lock()  # it's used from worker threads too
+
+    def keep(self, cid: str, interview: Interview):
+        with self.lock:
+            self.interviews[cid] = interview
+            self.interviews.move_to_end(cid)
+            while len(self.interviews) > self.room:
+                self.interviews.popitem(last=False)
+
+    def get(self, cid: str) -> Optional[Interview]:
+        with self.lock:
+            interview = self.interviews.get(cid)
+            if interview:
+                self.interviews.move_to_end(cid)
+            return interview
+
+    def add_turn(self, cid: str, question: str, answer: str, image_ids: tuple[str, ...]):
+        with self.lock:
+            interview = self.interviews.get(cid)
+            if interview:
+                turn = [
+                    {"role": "user", "content": question, "images": list(image_ids)},
+                    {"role": "assistant", "content": answer, "images": []},
+                ]
+                # A new list, so a question being prepared from the old one isn't changed under it.
+                interview.messages = (interview.messages + turn)[-RECENT_MESSAGES:]
+
+    def set_resume(self, cid: str, text: str):
+        with self.lock:
+            interview = self.interviews.get(cid)
+            if interview:
+                interview.settings = {**interview.settings, "resume_text": text}
+                interview.known_terms = None
+
+    def forget(self, cid: str):
+        with self.lock:
+            self.interviews.pop(cid, None)
+
+
+class Saver:
+    """Saves to the database in the background (a question and its answer, an image), one write at
+    a time in the order they came, so an interview never waits for it. A write that fails because
+    the database is out of reach is tried again, a little later each time, until it works. Reading
+    from the database for the app (opening an interview, the list) waits for the writes before it,
+    so it's up to date."""
+
+    RETRY_SECONDS = (0.5, 1, 2, 5, 10, 20)
+    MOST_SECONDS_TO_WAIT = 30  # for what's waiting to be saved, before a read gives up
+
+    def __init__(self):
+        self.waiting: deque[tuple[str, Callable, tuple]] = deque()  # (interview id, write, its values)
+        self.saving: Optional[tuple[str, Callable, tuple]] = None
+        self.more = asyncio.Event()
+        self.all_saved = asyncio.Event()
+        self.all_saved.set()
+        self.out_of_reach = False
+        self.task: Optional[asyncio.Task] = None
+
+    def start(self):
+        self.task = asyncio.create_task(self._save_all())
+
+    def add(self, cid: str, write: Callable, *values):
+        self.waiting.append((cid, write, values))
+        self.all_saved.clear()
+        self.more.set()
+
+    def forget(self, cid: str):
+        """Drops the interview's writes still waiting: it's being deleted."""
+        self.waiting = deque(job for job in self.waiting if job[0] != cid)
+        if not self.waiting and self.saving is None:
+            self.all_saved.set()
+
+    async def saved(self):
+        """Waits until everything so far is saved. While the database is out of reach, says so at
+        once instead."""
+        if self.out_of_reach and not self.all_saved.is_set():
+            raise DatabaseUnavailable("writes are waiting for the database to be back")
+        try:
+            await asyncio.wait_for(self.all_saved.wait(), self.MOST_SECONDS_TO_WAIT)
+        except asyncio.TimeoutError:
+            raise DatabaseUnavailable("saving is taking too long") from None
+
+    async def stop(self, timeout: float = 10):
+        """When the backend stops: waits a while for what's still waiting to be saved."""
+        try:
+            await asyncio.wait_for(self.all_saved.wait(), timeout)
+        except asyncio.TimeoutError:
+            unsaved = len(self.waiting) + (self.saving is not None)
+            logger.error("Stopping with %s writes not saved to the database (it's out of reach)", unsaved)
+        if self.task:
+            self.task.cancel()
+
+    async def _save_all(self):
+        while True:
+            await self.more.wait()
+            self.more.clear()
+            while self.waiting:
+                self.saving = self.waiting.popleft()
+                await self._save(*self.saving)
+                self.saving = None
+            self.all_saved.set()
+
+    async def _save(self, cid: str, write: Callable, values: tuple):
+        for attempt in itertools.count():
+            try:
+                await asyncio.to_thread(write, *values, retrying=attempt > 0)
+                if attempt:
+                    logger.info("Saved to the database after %s tries", attempt + 1)
+                self.out_of_reach = False
+                return
+            except DatabaseUnavailable as exc:
+                self.out_of_reach = True
+                wait = self.RETRY_SECONDS[min(attempt, len(self.RETRY_SECONDS) - 1)]
+                logger.warning("Couldn't save to the database (%s); trying again in %s s", exc, wait)
+                await asyncio.sleep(wait)
+            except Exception:
+                logger.exception("Couldn't save to the database (interview %s); this write is dropped", cid)
+                self.out_of_reach = False
+                return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global database, image_memory
+    global database, image_memory, interviews, saver
     database = Database(DATABASE_URL, DB, DATABASE_SCHEMA)
     await asyncio.to_thread(database.open)
     logger.info("Interviews are kept in %s", database.kind)
     image_memory = ImageMemory(IMAGE_MEMORY_BYTES)
+    interviews = InterviewMemory(INTERVIEWS_IN_MEMORY)
+    saver = Saver()
+    saver.start()
     app.state.chat_client = get_client() if os.getenv("GEMINI_API_KEY") else None
     warming = asyncio.create_task(warm_up(app.state.chat_client)) if app.state.chat_client else None
     try:
@@ -238,6 +398,7 @@ async def lifespan(app: FastAPI):
             warming.cancel()
         if app.state.chat_client is not None:
             await app.state.chat_client.aio.aclose()
+        await saver.stop()
         await asyncio.to_thread(database.close)
 
 
@@ -352,20 +513,40 @@ def health():
 
 
 @app.get("/api/conversations/{conversation_id}")
-def get_conversation(conversation_id: str):
-    with connect() as db:
-        session = db.execute(
-            "SELECT id,title,resume_name,mode,target_role,interview_type,instructions,job_description,created_at,updated_at FROM sessions WHERE id=?",
-            (conversation_id,),
-        ).fetchone()
+async def get_conversation(conversation_id: str):
+    """Opens an interview: its settings and every question and answer, read afresh from the
+    database (once what's waiting to be saved is), and kept in memory for its questions."""
+    await saver.saved()
+    session, messages = await asyncio.gather(
+        asyncio.to_thread(read_session, conversation_id),
+        asyncio.to_thread(history, conversation_id, 10000),
+    )
     if not session:
         raise HTTPException(404, "Interview not found")
-    return {"conversation_id": conversation_id, "session": dict(session), "messages": history(conversation_id, 10000)}
+    session = dict(session)
+    interviews.keep(conversation_id, Interview(session, messages))
+    del session["resume_text"]  # for the answers, not the browser
+    return {"conversation_id": conversation_id, "session": session, "messages": messages}
+
+
+def read_session(cid: str):
+    with connect() as db:
+        return db.execute(
+            "SELECT id,title,resume_name,mode,target_role,interview_type,instructions,job_description,resume_text,"
+            "created_at,updated_at FROM sessions WHERE id=?",
+            (cid,),
+        ).fetchone()
 
 
 @app.get("/api/conversations")
-def list_conversations():
-    """The interviews, latest first, each with how many questions it has and the last one asked."""
+async def list_conversations():
+    """The interviews, latest first, each with how many questions it has and the last one asked
+    (once what's waiting to be saved is, so it's up to date)."""
+    await saver.saved()
+    return {"sessions": await asyncio.to_thread(interview_list)}
+
+
+def interview_list():
     with connect() as db:
         rows = db.execute(
             "SELECT id,title,resume_name,mode,target_role,interview_type,instructions,job_description,created_at,updated_at,"
@@ -374,7 +555,7 @@ def list_conversations():
             "  WHERE m.conversation_id=s.id AND m.role='user' ORDER BY m.id DESC LIMIT 1) AS last_question"
             " FROM sessions s ORDER BY updated_at DESC LIMIT 300"
         ).fetchall()
-    return {"sessions": [dict(row) for row in rows]}
+    return [dict(row) for row in rows]
 
 
 class NewInterviewRequest(BaseModel):
@@ -388,18 +569,25 @@ class NewInterviewRequest(BaseModel):
 @app.post("/api/conversations")
 def create_conversation(request: NewInterviewRequest):
     cid = str(uuid.uuid4())
-    with connect() as db:
-        db.execute(
-            "INSERT INTO sessions (id,target_role,interview_type,mode,instructions,job_description) VALUES (?,?,?,?,?,?)",
-            (
-                cid,
-                request.target_role.strip(),
-                request.interview_type,
-                request.mode,
-                request.instructions.strip(),
-                request.job_description.strip(),
-            ),
-        )
+    settings = {
+        "target_role": request.target_role.strip(),
+        "interview_type": request.interview_type,
+        "instructions": request.instructions.strip(),
+        "job_description": request.job_description.strip(),
+        "resume_text": None,
+    }
+    database.run(
+        "INSERT INTO sessions (id,target_role,interview_type,mode,instructions,job_description) VALUES (?,?,?,?,?,?)",
+        (
+            cid,
+            settings["target_role"],
+            settings["interview_type"],
+            request.mode,
+            settings["instructions"],
+            settings["job_description"],
+        ),
+    )
+    interviews.keep(cid, Interview(settings, []))  # so its first question needn't read the database
     return {"conversation_id": cid}
 
 
@@ -408,16 +596,15 @@ def copy_conversation(conversation_id: str):
     """Starts a new interview with the same setup (role, type, answer length, job description,
     instructions and resume), to practice again for the same job. Its questions aren't copied."""
     cid = str(uuid.uuid4())
-    with connect() as db:
-        result = db.execute(
-            "INSERT INTO sessions (id,target_role,interview_type,mode,instructions,job_description,resume_name,resume_text)"
-            # CAST: PostgreSQL can't tell the type of a value that's only selected.
-            " SELECT CAST(? AS TEXT),target_role,interview_type,mode,instructions,job_description,resume_name,resume_text"
-            " FROM sessions WHERE id=?",
-            (cid, conversation_id),
-        )
-        if not result.rowcount:
-            raise HTTPException(404, "Interview not found")
+    result = database.run(
+        "INSERT INTO sessions (id,target_role,interview_type,mode,instructions,job_description,resume_name,resume_text)"
+        # CAST: PostgreSQL can't tell the type of a value that's only selected.
+        " SELECT CAST(? AS TEXT),target_role,interview_type,mode,instructions,job_description,resume_name,resume_text"
+        " FROM sessions WHERE id=?",
+        (cid, conversation_id),
+    )
+    if not result.rowcount:
+        raise HTTPException(404, "Interview not found")
     return {"conversation_id": cid}
 
 
@@ -432,24 +619,32 @@ def update_conversation(conversation_id: str, request: UpdateRequest):
     if request.title is None and request.mode is None:
         raise HTTPException(422, "Nothing to update")
     title = request.title.strip() if request.title is not None else None
-    with connect() as db:
-        result = db.execute(
-            "UPDATE sessions SET title=COALESCE(?,title),mode=COALESCE(?,mode),updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (title, request.mode, conversation_id),
-        )
-        if not result.rowcount:
-            raise HTTPException(404, "Interview not found")
+    result = database.run(
+        "UPDATE sessions SET title=COALESCE(?,title),mode=COALESCE(?,mode),updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (title, request.mode, conversation_id),
+    )
+    if not result.rowcount:
+        raise HTTPException(404, "Interview not found")
     return {"ok": True}
 
 
 @app.delete("/api/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str):
-    with connect() as db:
-        db.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
-        db.execute("DELETE FROM images WHERE conversation_id=?", (conversation_id,))
-        db.execute("DELETE FROM sessions WHERE id=?", (conversation_id,))
+async def delete_conversation(conversation_id: str):
+    if saver.out_of_reach:  # deleting needs the database, so the interview stays as it is for now
+        raise DatabaseUnavailable("the database is out of reach")
+    saver.forget(conversation_id)  # its writes still waiting aren't needed now
+    await saver.saved()  # and one under way finishes first, so none of it is left behind
+    await asyncio.to_thread(delete_interview, conversation_id)
+    interviews.forget(conversation_id)
     image_memory.forget_interview(conversation_id)
     return {"ok": True}
+
+
+def delete_interview(cid: str):
+    with connect() as db:
+        db.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+        db.execute("DELETE FROM images WHERE conversation_id=?", (cid,))
+        db.execute("DELETE FROM sessions WHERE id=?", (cid,))
 
 
 def extract_resume_text(ext: str, raw: bytes) -> str:
@@ -493,13 +688,13 @@ async def upload_resume(conversation_id: str, file: UploadFile = File(...)):
 
 
 def store_resume(conversation_id: str, name: str, text: str):
-    with connect() as db:
-        result = db.execute(
-            "UPDATE sessions SET resume_name=?,resume_text=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (name, text, conversation_id),
-        )
-        if not result.rowcount:
-            raise HTTPException(404, "Interview not found")
+    result = database.run(
+        "UPDATE sessions SET resume_name=?,resume_text=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (name, text, conversation_id),
+    )
+    if not result.rowcount:
+        raise HTTPException(404, "Interview not found")
+    interviews.set_resume(conversation_id, text)
 
 
 def image_type(data: bytes) -> Optional[str]:
@@ -525,30 +720,32 @@ async def upload_image(conversation_id: str, file: UploadFile = File(...)):
     mime_type = image_type(data)
     if not mime_type:
         raise HTTPException(415, "Use a PNG, JPEG, WebP or HEIC image")
+    if await interview_in_memory(conversation_id) is None:
+        raise HTTPException(404, "Interview not found")
     image_id = str(uuid.uuid4())
-    await asyncio.to_thread(store_image, image_id, conversation_id, mime_type, data)
+    # Ready at once, for the question; saved to the database in the background (about a second per
+    # MB to one far away).
     image_memory.keep(image_id, conversation_id, mime_type, data)
+    saver.add(conversation_id, store_image, image_id, conversation_id, mime_type, data)
     return {"image_id": image_id}
 
 
-def store_image(image_id: str, conversation_id: str, mime_type: str, data: bytes):
-    with connect() as db:
-        if not db.execute("SELECT 1 FROM sessions WHERE id=?", (conversation_id,)).fetchone():
-            raise HTTPException(404, "Interview not found")
-        db.execute(
-            "INSERT INTO images (id, conversation_id, mime_type, data) VALUES (?, ?, ?, ?)",
-            (image_id, conversation_id, mime_type, data),
-        )
+def store_image(image_id: str, conversation_id: str, mime_type: str, data: bytes, retrying: bool = False):
+    # ON CONFLICT: trying again after a try that was saved after all changes nothing.
+    database.run(
+        "INSERT INTO images (id, conversation_id, mime_type, data) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+        (image_id, conversation_id, mime_type, data),
+    )
 
 
 @app.get("/api/images/{image_id}")
-def get_image(image_id: str):
+async def get_image(image_id: str):
     kept = image_memory.get(image_id)
     if kept:
         _, mime_type, data = kept
     else:
-        with connect() as db:
-            row = db.execute("SELECT mime_type, data FROM images WHERE id=?", (image_id,)).fetchone()
+        await saver.saved()
+        row = await asyncio.to_thread(read_image, image_id)
         if not row:
             raise HTTPException(404, "Image not found")
         mime_type, data = row["mime_type"], row["data"]
@@ -556,15 +753,25 @@ def get_image(image_id: str):
     return Response(data, media_type=mime_type, headers={"Cache-Control": "private, max-age=31536000"})
 
 
+def read_image(image_id: str):
+    with connect() as db:
+        return db.execute("SELECT mime_type, data FROM images WHERE id=?", (image_id,)).fetchone()
+
+
 @app.delete("/api/images/{image_id}")
-def delete_image(image_id: str):
+async def delete_image(image_id: str):
     """Removes an image taken off a question before it was sent. One a question was sent with stays."""
+    await saver.saved()  # it may still be on its way to the database
+    await asyncio.to_thread(delete_unsent_image, image_id)
+    image_memory.forget(image_id)
+    return {"ok": True}
+
+
+def delete_unsent_image(image_id: str):
     with connect() as db:
         if db.execute("SELECT 1 FROM messages WHERE ',' || images || ',' LIKE ?", (f"%,{image_id},%",)).fetchone():
             raise HTTPException(409, "The image belongs to a question that was sent")
         db.execute("DELETE FROM images WHERE id=?", (image_id,))
-    image_memory.forget(image_id)
-    return {"ok": True}
 
 
 def find_images(cid: str, image_ids: list[str]) -> dict[str, tuple[str, bytes]]:
@@ -681,10 +888,23 @@ def interview_settings(cid: str):
     """The interview's role, type, preferences, job description and resume, read at once (each read
     is a trip to the database). None if there's no such interview."""
     with connect() as db:
-        return db.execute(
-            "SELECT target_role, interview_type, instructions, job_description, resume_text FROM sessions WHERE id=?",
-            (cid,),
-        ).fetchone()
+        return db.execute(f"SELECT {', '.join(SETTINGS)} FROM sessions WHERE id=?", (cid,)).fetchone()
+
+
+async def interview_in_memory(cid: str) -> Optional[Interview]:
+    """The interview, from memory; read from the database the first time it's needed (once what's
+    waiting to be saved is, so it's up to date). None if there's no such interview."""
+    interview = interviews.get(cid)
+    if interview is None:
+        await saver.saved()
+        settings, messages = await asyncio.gather(
+            asyncio.to_thread(interview_settings, cid),
+            asyncio.to_thread(history, cid, RECENT_MESSAGES),
+        )
+        if settings:
+            interview = Interview(settings, messages)
+            interviews.keep(cid, interview)
+    return interview
 
 
 def interview_terms(settings) -> str:
@@ -693,14 +913,6 @@ def interview_terms(settings) -> str:
     known = {term.lower() for term in COMMON_TERMS}
     found = vocabulary(settings["job_description"], settings["resume_text"])
     return ", ".join(COMMON_TERMS + [term for term in found if term.lower() not in known])
-
-
-def interview_hints(conversation_id: str):
-    """The interview's role and type, and the terms its questions may use, for writing them down."""
-    settings = interview_settings(conversation_id)
-    if not settings:
-        raise HTTPException(404, "Interview not found")
-    return settings["target_role"], settings["interview_type"], interview_terms(settings)
 
 
 def spoken_words(reply: str) -> str:
@@ -721,8 +933,13 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
     audio = await read_recording(file)
-    role, interview_type, terms = await asyncio.to_thread(interview_hints, conversation_id)
-    prompt = TRANSCRIBE_PROMPT.format(role=role, interview_type=interview_type, terms=terms)
+    interview = await interview_in_memory(conversation_id)
+    if interview is None:
+        raise HTTPException(404, "Interview not found")
+    settings = interview.settings
+    prompt = TRANSCRIBE_PROMPT.format(
+        role=settings["target_role"], interview_type=settings["interview_type"], terms=interview.terms()
+    )
     if context.strip():
         prompt += CONTINUES_PROMPT.format(context=context.strip())
     prompt += SPEECH_PROMPT
@@ -762,8 +979,7 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
 
 
 def ensure_session(cid: str):
-    with connect() as db:
-        db.execute("INSERT INTO sessions(id) VALUES (?) ON CONFLICT (id) DO NOTHING", (cid,))
+    database.run("INSERT INTO sessions(id) VALUES (?) ON CONFLICT (id) DO NOTHING", (cid,))
 
 
 def resume_context(settings, question: str):
@@ -826,15 +1042,14 @@ CUT_OFF_NOTE = (
 )
 
 
-def interview_so_far(cid: str) -> list[types.Content]:
-    """The interview's last 10 messages (5 exchanges): context for follow-ups, without the time and
-    cost growing with the interview. The images of the last two questions go again, for follow-ups
-    about them; older ones don't, as every image makes the answer slower to start."""
-    previous = history(cid, 10)
-    recent = len(previous) - 4
-    images = find_images(cid, [i for m in previous[max(recent, 0) :] for i in m["images"]])
+def interview_so_far(cid: str, messages: list[dict]) -> list[types.Content]:
+    """The interview's last messages, for Gemini: context for follow-ups. The images of the last two
+    questions go again, for follow-ups about them; older ones don't, as every image makes the
+    answer slower to start."""
+    recent = len(messages) - 4
+    images = find_images(cid, [i for m in messages[max(recent, 0) :] for i in m["images"]])
     contents = []
-    for n, m in enumerate(previous):
+    for n, m in enumerate(messages):
         parts = [image_part(images[i]) for i in m["images"] if i in images] if n >= recent else []
         text = m["content"] or (IMAGE_ONLY_QUESTION if parts else "(A question asked with an image.)")
         role = "model" if m["role"] == "assistant" else "user"
@@ -843,13 +1058,17 @@ def interview_so_far(cid: str) -> list[types.Content]:
 
 
 async def read_for_question(cid: str, image_ids: tuple[str, ...]):
-    """The interview's settings, the interview so far and the question's images, read at the same
-    time in worker threads: each read is a trip to the database, which may be far away."""
-    return await asyncio.gather(
-        asyncio.to_thread(interview_settings, cid),
-        asyncio.to_thread(interview_so_far, cid),
+    """What a question needs: its interview's settings and last messages, and the images (all from
+    memory, unless the backend has restarted since the interview was opened). In worker threads,
+    as an image not in memory is read from the database."""
+    interview = await interview_in_memory(cid)
+    if interview is None:
+        return None, [], []
+    previous, images = await asyncio.gather(
+        asyncio.to_thread(interview_so_far, cid, interview.messages),
         asyncio.to_thread(image_parts, cid, list(image_ids)),
     )
+    return interview, previous, images
 
 
 def session_context(row):
@@ -880,17 +1099,27 @@ def chat_config(mode: str, resume: str = ""):
     return types.GenerateContentConfig(**kwargs)
 
 
-def save_turn(cid: str, question: str, answer: str, image_ids: tuple[str, ...] = ()):
+def save_turn(cid: str, question: str, answer: str, image_ids: tuple[str, ...] = (), retrying: bool = False):
+    """Saves a question and its answer, and names the interview after its first question."""
     title = question[:75] or "Image question"
     with connect() as db:
+        if retrying and saved_already(db, cid, question, answer):
+            return  # the last try was saved after all: only the word that it was got lost
         db.execute(
             "UPDATE sessions SET updated_at=CURRENT_TIMESTAMP, title=CASE WHEN title='New Interview' THEN ? ELSE title END WHERE id=?",
             (title, cid),
         )
-        db.executemany(
-            "INSERT INTO messages (conversation_id, role, content, images) VALUES (?, ?, ?, ?)",
-            [(cid, "user", question, ",".join(image_ids)), (cid, "assistant", answer, "")],
+        db.execute(
+            "INSERT INTO messages (conversation_id, role, content, images) VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+            (cid, "user", question, ",".join(image_ids), cid, "assistant", answer, ""),
         )
+
+
+def saved_already(db, cid: str, question: str, answer: str) -> bool:
+    last = db.execute(
+        "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 2", (cid,)
+    ).fetchall()
+    return [(row["role"], row["content"]) for row in last] == [("assistant", answer), ("user", question)]
 
 
 async def start_answer(client, contents, config, model):
@@ -933,10 +1162,13 @@ async def stream_chat(request: ChatRequest):
 async def typed_question(cid: str, message: str, image_ids: tuple[str, ...], mode: str):
     """What an answer to a typed question is asked with: the interview so far and the question
     (with its images), and the interview's settings."""
-    settings, previous, images = await read_for_question(cid, image_ids)
-    if not settings:  # an interview the app didn't make beforehand, as older versions didn't
+    interview, previous, images = await read_for_question(cid, image_ids)
+    if interview is None:  # an interview the app didn't make beforehand, as older versions didn't
+        if image_ids:
+            raise HTTPException(404, "Image not found")
         await asyncio.to_thread(ensure_session, cid)
-        settings = await asyncio.to_thread(interview_settings, cid)
+        interview = await interview_in_memory(cid)
+    settings = interview.settings
     question = [*images, images_prompt(len(images))] if images else []
     question.append(types.Part.from_text(text=message if message.strip() else IMAGE_ONLY_QUESTION))
     contents = [*previous, types.Content(role="user", parts=question)]
@@ -978,13 +1210,14 @@ async def stream_chat_from_recording(
 async def recorded_question(cid: str, audio: bytes, image_ids: tuple[str, ...], heard: str, mode: str):
     """What an answer to a recorded question is asked with: the interview so far, the recording
     (with the question's images) and what to do with it, and the interview's settings."""
-    settings, previous, images = await read_for_question(cid, image_ids)
-    if not settings:
+    interview, previous, images = await read_for_question(cid, image_ids)
+    if interview is None:
         raise HTTPException(404, "Interview not found")
+    settings = interview.settings
     question = [
         types.Part.from_bytes(data=audio, mime_type="audio/wav"),
         *([*images, images_prompt(len(images))] if images else []),
-        types.Part.from_text(text=RECORDED_QUESTION_PROMPT.format(terms=interview_terms(settings))),
+        types.Part.from_text(text=RECORDED_QUESTION_PROMPT.format(terms=interview.terms())),
     ]
     contents = [*previous, types.Content(role="user", parts=question)]
     config = chat_config(mode, session_context(settings) + resume_context(settings, heard))
@@ -1115,8 +1348,11 @@ async def answer_events(client, cid, mode, contents, config, question, from_reco
         answer = "".join(chunks).strip()
         if not answer:
             raise ValueError("Gemini returned an empty answer")
-        # Save only completed responses; failed or interrupted streams are not persisted.
-        await asyncio.to_thread(save_turn, cid, question, answer, tuple(image_ids))
+        # Only a complete answer is kept (failed or interrupted ones aren't): in memory at once, as
+        # context for the next question, and in the database in the background, so the next
+        # question needn't wait for that.
+        interviews.add_turn(cid, question, answer, tuple(image_ids))
+        saver.add(cid, save_turn, cid, question, answer, tuple(image_ids))
         total_ms = round((time.perf_counter() - started) * 1000)
         first_ms = round((first_token - started) * 1000) if first_token else None
         logger.info(
@@ -1135,9 +1371,6 @@ async def answer_events(client, cid, mode, contents, config, question, from_reco
     except asyncio.CancelledError:
         logger.info("Chat stream disconnected; incomplete response not saved")
         raise
-    except DatabaseUnavailable:
-        logger.exception("The answer couldn't be saved")
-        yield json.dumps({"type": "error", "message": DATABASE_UNAVAILABLE}) + "\n"
     except Exception:
         logger.exception("Gemini streaming chat failed")
         yield json.dumps({"type": "error", "message": "Gemini request failed; check backend logs"}) + "\n"
