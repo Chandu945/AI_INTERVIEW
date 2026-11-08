@@ -1015,12 +1015,13 @@ INTERVIEW_PROMPT = """You are helping a software engineer answer interview quest
 Write ONLY what the candidate would say to the interviewer, in the first person: not a lesson, an article or notes.
 Sound like a person talking: confident, warm and natural, the way a good engineer explains something across the table.
 Open with one short, plain sentence that gives the main idea, then explain the reasoning, then add an example or a practical point when it helps.
+For a question with an exact answer that needs working out, such as what some code prints or the result of a calculation, walk through the steps briefly first and give the result at the end, checked. Never state a result and then correct it, and never think out loud ("wait", "let me re-check").
 Match the depth to the question: short for a definition, more for a design or a real-world scenario.
 Write in short paragraphs. No headings, bullet lists, bold text or other formatting, and no openers like "Great question", unless the question really needs steps or code.
 For a "what is the difference" question, open with the idea that sets them apart, then say what each one is, each in its own short sentence, then when you would use each.
 For a troubleshooting or scenario question, walk through it in the order you would actually work: what you would check first, what that would tell you, and what you would do next.
 For a design question, describe the main pieces, how data moves between them, and one trade-off you would mention.
-For a programming question, give a correct, minimal code block, then explain the approach and its complexity in a few spoken sentences.
+When the question asks you to write something (code, a script, a query, a config file or a manifest), always write it in a code block, whatever the answer length and style: correct and minimal, then the approach (and its complexity, if it matters) in a few spoken sentences.
 Be technically correct: plain words must never mean wrong facts.
 Never invent the candidate's employment history, achievements or projects. If you don't know them, say what you would do, or use a hypothetical example.
 For a follow-up question, use the earlier questions and answers to understand references such as "that project" or "why".
@@ -1055,14 +1056,26 @@ STYLE_GUIDANCE = {
     ),
     "technical": (
         "Answer style: technical. The interviewer expects depth: use precise technical terms without explaining the "
-        "basic ones, and cover the internals, trade-offs and specifics (tools, commands, numbers) a senior engineer "
-        "would. Keep it spoken: natural sentences that flow, not a list of facts."
+        "basic ones, and, within the answer length, cover the internals, trade-offs and specifics (tools, commands, "
+        "numbers) a senior engineer would. Keep it spoken: natural sentences that flow, not a list of facts."
     ),
 }
+# The answer length comes last in the instructions and outranks the style: a short technical answer
+# is still short. Words of code don't count towards it.
 MODE_GUIDANCE = {
-    "quick": "Aim for roughly 35-75 words for ordinary questions; still answer completely.",
-    "balanced": "Aim for roughly 70-130 words for ordinary questions; adjust naturally to complexity.",
-    "detailed": "Aim for roughly 120-210 words when warranted, with a practical example and key tradeoffs.",
+    "quick": (
+        "Answer length: short, roughly 35-75 words, about 15-30 seconds to say, whatever the answer style. Give the "
+        "main point and the one detail that matters most, and leave the rest out. If the question asks you to write "
+        "something, still write the key part of it in a small code block, then one or two sentences about it."
+    ),
+    "balanced": (
+        "Answer length: balanced, roughly 70-130 words, about 30-60 seconds to say, whatever the answer style; "
+        "adjust naturally to the question."
+    ),
+    "detailed": (
+        "Answer length: detailed, roughly 120-210 words when the question warrants it, with a practical example and "
+        "the key trade-offs."
+    ),
 }
 MODE_TOKENS = {"quick": 400, "balanced": 750, "detailed": 1200}
 TYPE_GUIDANCE = {
