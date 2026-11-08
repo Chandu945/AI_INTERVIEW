@@ -20,7 +20,7 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   During an interview, the top bar shows only the way back to Interviews and the interview's
   title (click it to rename) and details.
 - **Interview:** type or dictate questions (in Chrome) and watch the answers
-  stream in. Each question and its answer have a page of their own: a new question opens at the
+  stream in. Enter sends a question (Shift+Enter starts a new line). Each question and its answer have a page of their own: a new question opens at the
   top of the answers, alone, and scrolling up brings back earlier ones one at a time. Optional
   auto-stop after a 2.2-second pause, with optional hands-free sending. Focus Mode, font sizes
   and copy buttons.

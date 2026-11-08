@@ -109,6 +109,8 @@ export function Composer({
   const { listening, status, elapsed, supported, autoPause, changeAutoPause } = speech;
   const shownStatus = !listening && improveStatus !== 'idle' ? IMPROVE_MESSAGES[improveStatus] : status;
   const fromTab = source === 'tab';
+  // What Send needs: something to send (words, an image, or a question being spoken), and no answer under way.
+  const canSend = !busy && (listening || Boolean(draft.trim()) || Boolean(preview) || attachments.length > 0);
   // Words still being recognized are shown in gray right after the text, on a see-through copy of
   // the box's text laid over it: the same size, the same wrapping, and scrolled with it.
   const ghostRef = useRef<HTMLDivElement | null>(null);
@@ -211,6 +213,13 @@ export function Composer({
             }
             value={draft}
             onChange={e => onDraftChange(e.target.value)}
+            onKeyDown={event => {
+              // Enter sends, as in a chat; Shift+Enter starts a new line. (⌘/Ctrl+Enter is the page's own shortcut.)
+              if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) return;
+              if (event.nativeEvent.isComposing) return; // still choosing a character in an input method
+              event.preventDefault();
+              if (canSend) onSend();
+            }}
             onPaste={event => {
               // A pasted screenshot is attached; pasted text goes in as usual.
               const images = [...event.clipboardData.files].filter(isImage);
@@ -288,7 +297,13 @@ export function Composer({
       <div className="controls">
         <button
           className={`btn mic-btn ${listening ? 'recording' : ''}`}
-          onClick={() => (listening ? onStopDictation() : onStartDictation())}
+          onClick={() => {
+            if (listening) onStopDictation();
+            else onStartDictation();
+            // With a mouse, the cursor goes back to the question box, so Enter sends the question rather than
+            // pressing this button again. Not on touch screens, where it would bring up the keyboard.
+            if (window.matchMedia('(pointer: fine)').matches) textareaRef.current?.focus();
+          }}
           disabled={!supported || busy}
           aria-pressed={listening}
         >
@@ -301,11 +316,7 @@ export function Composer({
           Clear
         </button>
         {/* Pressable while listening, even before any words: sending waits for the last of them. */}
-        <button
-          className="btn primary"
-          onClick={onSend}
-          disabled={busy || (!listening && !draft.trim() && !preview && !attachments.length)}
-        >
+        <button className="btn primary" onClick={onSend} disabled={!canSend}>
           {' '}
           {busy ? 'Sending…' : 'Send ↗'}
         </button>
@@ -406,7 +417,7 @@ export function Composer({
             ? 'Listen to tab: pick the tab in Chrome\'s list and keep "Also share tab audio" on. You still hear the tab as usual.'
             : 'Words appear in the box as they are heard, in gray until they are final. You can edit the text at any time.'}
         <br />
-        Shortcut: <kbd>⌘ / Ctrl</kbd> + <kbd>Enter</kbd> to send.
+        Shortcut: <kbd>Enter</kbd> to send, <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line.
       </div>
       {error && (
         <div className="error-banner" role="alert">

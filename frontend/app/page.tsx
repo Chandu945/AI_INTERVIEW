@@ -572,17 +572,26 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    // The shortcut sends a question, so it only works on the interview page.
+    // The shortcuts send a question, so they only work on the interview page: ⌘/Ctrl+Enter anywhere, and
+    // Enter anywhere but a control (the question box handles its own Enter; a button's Enter presses it).
     if (view !== 'interview') return;
     function onKey(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      if (event.key !== 'Enter' || event.isComposing) return;
+      if (event.metaKey || event.ctrlKey) {
         event.preventDefault();
         void sendMessage();
+        return;
       }
+      if (event.shiftKey || event.altKey) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('input, textarea, select, button, a, summary, dialog, [contenteditable="true"]')) return;
+      if (!isListening() && !draftRef.current.trim() && !hasImages()) return; // nothing to send
+      event.preventDefault();
+      void sendMessage();
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [sendMessage, view]);
+  }, [draftRef, hasImages, isListening, sendMessage, view]);
 
   // The list's copy is the newest: Gemini titles an interview after its first question.
   const current = sessions.find(session => session.id === conversationId) ?? currentSession;

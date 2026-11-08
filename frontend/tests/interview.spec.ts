@@ -30,6 +30,50 @@ test('Cmd+Enter sends from the interview page only, never a leftover draft from 
   await expect.poll(() => chatRequests(page)).toBe(1); // the test backend has no key, so it then fails with 503
 });
 
+test('Enter sends the question, and Shift+Enter starts a new line', async ({ page }) => {
+  const box = page.getByLabel('Your message');
+  await box.click();
+  await page.keyboard.type('First line');
+  await page.keyboard.press('Shift+Enter');
+  await page.keyboard.type('second line');
+  await expect(box).toHaveValue('First line\nsecond line');
+  await forgetRequests(page);
+  await page.keyboard.press('Enter');
+  await expect.poll(() => chatRequests(page)).toBe(1); // the test backend has no key, so it then fails with 503
+});
+
+test('Enter with nothing to send does nothing', async ({ page }) => {
+  await page.getByLabel('Your message').click();
+  await forgetRequests(page);
+  await page.keyboard.press('Enter');
+  await page.locator('.conversation-head').click(); // away from the box
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(500);
+  expect(await chatRequests(page)).toBe(0);
+  await expect(page.locator('.error-banner')).toHaveCount(0);
+  await expect(page.getByLabel('Your message')).toHaveValue('');
+});
+
+test('Enter sends after clicking away from the box, but a focused button keeps its own Enter', async ({ page }) => {
+  await page.getByLabel('Your message').fill('A question');
+  await page.getByRole('button', { name: 'Focus Mode' }).focus();
+  await forgetRequests(page);
+  await page.keyboard.press('Enter'); // presses Focus Mode, as Enter on a button does
+  await expect(page.getByRole('button', { name: 'Exit Focus' })).toBeVisible();
+  expect(await chatRequests(page)).toBe(0);
+  await page.locator('.conversation-head').click(); // nothing in particular focused
+  await page.keyboard.press('Enter');
+  await expect.poll(() => chatRequests(page)).toBe(1);
+});
+
+test('clicking the microphone leaves the cursor in the question box', async ({ page }) => {
+  await page.locator('.mic-btn').click();
+  await expect(page.locator('.mic-btn')).toContainText('Stop listening');
+  expect(await page.evaluate(() => document.activeElement?.getAttribute('aria-label'))).toBe('Your message');
+  await page.locator('.mic-btn').click();
+  await expect(page.locator('.mic-btn')).not.toContainText('Stop listening');
+});
+
 test('a question over 10,000 characters gets a clear error and is not sent', async ({ page }) => {
   await page.getByLabel('Your message').fill('x'.repeat(10001));
   const counter = page.locator('.editor-foot span').first();
