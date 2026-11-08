@@ -22,6 +22,7 @@ SESSION_COLUMNS = (
     "resume_name",
     "resume_text",
     "mode",
+    "style",
     "target_role",
     "interview_type",
     "instructions",

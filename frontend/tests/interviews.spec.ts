@@ -92,17 +92,27 @@ test('deleting asks first, and Cancel keeps the interview', async ({ page, reque
   expect((await listed(request)).some(session => session.target_role === 'Throwaway Role')).toBe(false);
 });
 
-test('"Start new with same setup" opens a fresh interview with the same role, type and length', async ({
+test('"Start new with same setup" opens a fresh interview with the same role, type, length and style', async ({
   page,
   request,
 }) => {
-  await makeInterview(page, request, { target_role: 'Data Engineer', interview_type: 'HR', mode: 'detailed' });
+  await makeInterview(page, request, {
+    target_role: 'Data Engineer',
+    interview_type: 'HR',
+    mode: 'detailed',
+    style: 'technical',
+  });
   await menu(page, 'Data Engineer', 'Start new with same setup');
   const bar = page.locator('.topbar');
   await expect(bar).toContainText('New Interview');
   await expect(bar).toContainText('Data Engineer · HR');
   await expect(page.locator('.empty-state')).toContainText('Ready when you are');
-  await expect(page.locator('.answer-mode-button.selected')).toHaveText('Detailed');
+  await expect(
+    page.getByRole('group', { name: 'Interview answer length' }).locator('.answer-mode-button.selected'),
+  ).toHaveText('Detailed');
+  await expect(page.getByRole('group', { name: 'Answer style' }).locator('.answer-mode-button.selected')).toHaveText(
+    'Technical',
+  );
   await page.getByRole('button', { name: 'Back to interviews' }).click();
   await expect(row(page, 'Data Engineer')).toHaveCount(2);
 });

@@ -1,4 +1,4 @@
-import type { AnswerMode, InterviewType, StreamEvent } from './types';
+import type { AnswerMode, AnswerStyle, InterviewType, StreamEvent } from './types';
 
 export const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 // Must match ChatRequest.message max_length in backend/main.py.
@@ -14,6 +14,7 @@ export const api = {
     target_role: string;
     interview_type: InterviewType;
     mode: AnswerMode;
+    style: AnswerStyle;
     instructions: string;
     job_description: string;
   }) => fetch(`${API}/api/conversations`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(fields) }),
@@ -22,7 +23,7 @@ export const api = {
     body.append('file', file);
     return fetch(`${API}/api/conversations/${id}/resume`, { method: 'POST', body });
   },
-  updateInterview: (id: string, fields: { title?: string; mode?: AnswerMode }) =>
+  updateInterview: (id: string, fields: { title?: string; mode?: AnswerMode; style?: AnswerStyle }) =>
     fetch(`${API}/api/conversations/${id}`, { method: 'PATCH', headers: JSON_HEADERS, body: JSON.stringify(fields) }),
   deleteInterview: (id: string) => fetch(`${API}/api/conversations/${id}`, { method: 'DELETE' }),
   /** Starts a new interview with the same setup as this one (role, type, resume, and so on). */
@@ -44,12 +45,25 @@ export const api = {
     return fetch(`${API}/api/conversations/${id}/transcribe`, { method: 'POST', body, signal });
   },
   askQuestion: (
-    body: { message: string; conversation_id: string | null; mode: AnswerMode; image_ids: string[] },
+    body: {
+      message: string;
+      conversation_id: string | null;
+      mode: AnswerMode;
+      style: AnswerStyle;
+      image_ids: string[];
+    },
     signal: AbortSignal,
   ) => fetch(`${API}/api/chat/stream`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body), signal }),
   /** Asks a question by its recording (with its live words): Gemini writes it down and answers it. */
   askRecordedQuestion: (
-    fields: { audio: Blob; heard: string; conversation_id: string; mode: AnswerMode; image_ids: string[] },
+    fields: {
+      audio: Blob;
+      heard: string;
+      conversation_id: string;
+      mode: AnswerMode;
+      style: AnswerStyle;
+      image_ids: string[];
+    },
     signal: AbortSignal,
   ) => {
     const body = new FormData();
@@ -57,6 +71,7 @@ export const api = {
     body.append('heard', fields.heard);
     body.append('conversation_id', fields.conversation_id);
     body.append('mode', fields.mode);
+    body.append('style', fields.style);
     body.append('image_ids', fields.image_ids.join(','));
     return fetch(`${API}/api/chat/stream-recording`, { method: 'POST', body, signal });
   },

@@ -7,9 +7,15 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   its role, type, number of questions and the last one asked. Search them, filter by type, and
   from each one's menu open, rename, delete (after confirming) or start a new interview with the
   same setup, to practice again for the same job.
-- **New interview:** the role, interview type (Technical, HR or Mixed), answer length, and an
-  optional resume (PDF or DOCX, dropped or browsed) and job description for answers to draw on,
-  with a summary beside them. The last role, type and length you chose are filled in next time.
+- **New interview:** the role, interview type (Technical, HR or Mixed), answer length and style,
+  and an optional resume (PDF or DOCX, dropped or browsed) and job description for answers to
+  draw on, with a summary beside them. The last role, type, length and style you chose are
+  filled in next time.
+- **Answer style:** Simple (the default) answers the way you'd explain it to a person: a plain
+  first sentence, everyday words, short sentences, technical terms explained, an everyday
+  comparison where it helps. Technical uses precise terms and more depth, for senior
+  interviews. Both are written to be said out loud. Change it during an interview too, beside
+  the answer length.
   During an interview, the top bar shows only the way back to Interviews and the interview's
   title (click it to rename) and details.
 - **Interview:** type or dictate questions (in Chrome) and watch the answers

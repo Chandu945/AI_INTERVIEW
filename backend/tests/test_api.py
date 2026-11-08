@@ -124,6 +124,38 @@ def test_answer_length_is_saved_and_renaming_keeps_it(client):
     assert (session["title"], session["mode"]) == ("Mock round 1", "detailed")
 
 
+def test_answer_style_is_saved_with_the_interview_and_copied_with_it(client):
+    cid = new_interview(client, style="technical")
+    assert client.get(f"/api/conversations/{cid}").json()["session"]["style"] == "technical"
+    copy = client.post(f"/api/conversations/{cid}/copy").json()["conversation_id"]
+    assert client.get(f"/api/conversations/{copy}").json()["session"]["style"] == "technical"
+    assert client.patch(f"/api/conversations/{cid}", json={"style": "simple"}).status_code == 200
+    plain = new_interview(client)
+    listed = {s["id"]: s["style"] for s in client.get("/api/conversations").json()["sessions"]}
+    assert (listed[cid], listed[copy], listed[plain]) == ("simple", "technical", "simple")
+    assert client.patch(f"/api/conversations/{cid}", json={"style": "fancy"}).status_code == 422
+
+
+def test_answers_are_simple_unless_technical_is_chosen(client, gemini):
+    """Simple: everyday words and short sentences. Technical: precise terms and depth."""
+    cid = new_interview(client)
+    fake = gemini(("An answer.", "STOP"))
+    ask(client, cid)
+    assert main.STYLE_GUIDANCE["simple"] in fake.config.system_instruction
+    assert main.STYLE_GUIDANCE["technical"] not in fake.config.system_instruction
+    body = {"message": QUESTION, "conversation_id": cid, "mode": "quick", "style": "technical"}
+    client.post("/api/chat/stream", json=body)
+    assert main.STYLE_GUIDANCE["technical"] in fake.config.system_instruction
+    assert main.STYLE_GUIDANCE["simple"] not in fake.config.system_instruction
+    client.post(
+        "/api/chat/stream-recording",
+        data={"conversation_id": cid, "mode": "quick", "style": "technical", "heard": "what is rag"},
+        files={"file": ("question.wav", silence_wav(), "audio/wav")},
+    )
+    assert main.STYLE_GUIDANCE["technical"] in fake.config.system_instruction
+    assert client.post("/api/chat/stream", json={**body, "style": "fancy"}).status_code == 422
+
+
 def test_update_rejects_bad_requests(client):
     cid = new_interview(client)
     assert client.patch(f"/api/conversations/{cid}", json={}).status_code == 422
@@ -267,7 +299,7 @@ def test_hr_interview_gets_behavioral_guidance(client, gemini):
     ask(client, new_interview(client, interview_type="HR"))
     prompt = fake.config.system_instruction
     assert "HR or behavioral interview" in prompt and "situation, action and result" in prompt
-    assert "practice answering real interview questions" in prompt
+    assert "answer interview questions out loud" in prompt
 
 
 def test_technical_interview_says_so(client, gemini):
@@ -298,12 +330,12 @@ def test_only_the_last_10_messages_are_sent_as_history(client, gemini):
 
 def test_thinking_settings(monkeypatch):
     monkeypatch.setattr(main, "THINKING_LEVEL", "MINIMAL")
-    assert main.chat_config("balanced").thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
+    assert main.chat_config("balanced", "simple").thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
     monkeypatch.setattr(main, "THINKING_LEVEL", "")
     monkeypatch.setattr(main, "THINKING_BUDGET", "0")
-    assert main.chat_config("balanced").thinking_config.thinking_budget == 0
+    assert main.chat_config("balanced", "simple").thinking_config.thinking_budget == 0
     monkeypatch.setattr(main, "THINKING_BUDGET", "")
-    assert main.chat_config("balanced").thinking_config is None
+    assert main.chat_config("balanced", "simple").thinking_config is None
 
 
 def test_invalid_thinking_level_stops_startup():

@@ -89,22 +89,30 @@ test('the summary follows the choices, and the next new interview starts from th
   await page.getByLabel('Role', { exact: true }).fill('Platform Engineer');
   await page.getByRole('radio', { name: /^HR/ }).check();
   await page.getByRole('radio', { name: /^Detailed/ }).check();
+  await page.getByRole('radio', { name: /^Technical.*senior/ }).check();
   await page.getByLabel('Job description').fill('Kubernetes, Terraform and on-call.');
   await expect(summaryOf(page, 'Role')).toHaveText('Platform Engineer');
   await expect(summaryOf(page, 'Interview type')).toHaveText('HR');
   await expect(summaryOf(page, 'Answer length')).toHaveText('Detailed');
+  await expect(summaryOf(page, 'Answer style')).toHaveText('Technical');
   await expect(summaryOf(page, 'Job description')).toHaveText('4 words');
 
   await page.getByRole('button', { name: /Start interview/ }).click();
   await expect(page.locator('.topbar')).toContainText('Platform Engineer · HR');
-  await expect(page.locator('.answer-mode-button.selected')).toHaveText('Detailed');
+  await expect(
+    page.getByRole('group', { name: 'Interview answer length' }).locator('.answer-mode-button.selected'),
+  ).toHaveText('Detailed');
+  await expect(page.getByRole('group', { name: 'Answer style' }).locator('.answer-mode-button.selected')).toHaveText(
+    'Technical',
+  );
 
   await page.getByRole('button', { name: 'Back to interviews' }).click();
   await openForm(page);
   await expect(page.getByLabel('Role', { exact: true })).toHaveValue('Platform Engineer');
   await expect(page.getByRole('radio', { name: /^HR/ })).toBeChecked();
   await expect(page.getByRole('radio', { name: /^Detailed/ })).toBeChecked();
-  await expect(page.getByLabel('Job description')).toHaveValue(''); // only the role, type and length carry over
+  await expect(page.getByRole('radio', { name: /^Technical.*senior/ })).toBeChecked();
+  await expect(page.getByLabel('Job description')).toHaveValue(''); // only the role, type, length and style carry over
 });
 
 test('the interview needs a role to start', async ({ page }) => {

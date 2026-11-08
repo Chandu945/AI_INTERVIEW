@@ -13,7 +13,7 @@ import { useQuestionPages } from '../hooks/useQuestionPages';
 import { useTabAudio } from '../hooks/useTabAudio';
 import { useTranscriptImprover, type HandOff } from '../hooks/useTranscriptImprover';
 import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
-import type { AnswerMode, Message, Session, StreamMetrics, View, VoiceSource } from '../lib/types';
+import type { AnswerMode, AnswerStyle, Message, Session, StreamMetrics, View, VoiceSource } from '../lib/types';
 
 // Remembers in this browser whether dictation listens to the mic or a tab.
 const SOURCE_KEY = 'ai-interact.voice-source';
@@ -35,6 +35,7 @@ export default function Home() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [answerMode, setAnswerMode] = useState<AnswerMode>('balanced');
+  const [answerStyle, setAnswerStyle] = useState<AnswerStyle>('simple');
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [streamMetrics, setStreamMetrics] = useState<StreamMetrics | null>(null);
@@ -216,6 +217,7 @@ export default function Home() {
         setConversationId(id);
         setMessages(data.messages);
         setAnswerMode(data.session.mode || 'balanced');
+        setAnswerStyle(data.session.style || 'simple');
         setView('interview');
         updateDraft('');
         setError('');
@@ -349,12 +351,19 @@ export default function Home() {
                 heard: text,
                 conversation_id: conversationId,
                 mode: answerMode,
+                style: answerStyle,
                 image_ids: imageIds,
               },
               controller.signal,
             )
           : await api.askQuestion(
-              { message: text, conversation_id: conversationId, mode: answerMode, image_ids: imageIds },
+              {
+                message: text,
+                conversation_id: conversationId,
+                mode: answerMode,
+                style: answerStyle,
+                image_ids: imageIds,
+              },
               controller.signal,
             );
       if (!response.ok) {
@@ -408,6 +417,7 @@ export default function Home() {
     restoreImages,
     takeImages,
     answerMode,
+    answerStyle,
     conversationId,
     draftRef,
     finishDictation,
@@ -442,6 +452,18 @@ export default function Home() {
       if (!conversationId) return;
       void api.updateInterview(conversationId, { mode }).catch(() => {
         /* not critical: the next question still uses the new length */
+      });
+    },
+    [conversationId],
+  );
+
+  // Saves the answer style on the interview, so reopening it keeps the choice.
+  const changeAnswerStyle = useCallback(
+    (style: AnswerStyle) => {
+      setAnswerStyle(style);
+      if (!conversationId) return;
+      void api.updateInterview(conversationId, { style }).catch(() => {
+        /* not critical: the next question still uses the new style */
       });
     },
     [conversationId],
@@ -486,6 +508,7 @@ export default function Home() {
           target_role: form.targetRole.trim(),
           interview_type: form.interviewType,
           mode: form.answerMode,
+          style: form.answerStyle,
           instructions: form.instructions,
           job_description: form.jobDescription,
         });
@@ -507,11 +530,13 @@ export default function Home() {
           target_role: form.targetRole.trim(),
           interview_type: form.interviewType,
           mode: form.answerMode,
+          style: form.answerStyle,
           created_at: '',
           updated_at: '',
         });
         setConversationId(id);
         setAnswerMode(form.answerMode);
+        setAnswerStyle(form.answerStyle);
         setMessages([]);
         setFailedDraft(null);
         setStreamMetrics(null);
@@ -617,6 +642,8 @@ export default function Home() {
             busy={busy}
             answerMode={answerMode}
             onAnswerModeChange={changeAnswerMode}
+            answerStyle={answerStyle}
+            onAnswerStyleChange={changeAnswerStyle}
             language={language}
             onLanguageChange={setLanguage}
             autoSend={autoSend}

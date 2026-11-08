@@ -3,7 +3,20 @@ import { MAX_IMAGES, isImage, type Attachment } from '../hooks/useImageAttachmen
 import type { Speech } from '../hooks/useSpeechRecognition';
 import type { ImproveStatus } from '../hooks/useTranscriptImprover';
 import { MAX_QUESTION_CHARS } from '../lib/api';
-import { ANSWER_MODES, answerModeLabel, type AnswerMode, type VoiceSource } from '../lib/types';
+import {
+  ANSWER_MODES,
+  ANSWER_STYLES,
+  answerModeLabel,
+  answerStyleLabel,
+  type AnswerMode,
+  type AnswerStyle,
+  type VoiceSource,
+} from '../lib/types';
+
+const STYLE_HINTS: Record<AnswerStyle, string> = {
+  simple: 'Everyday words and short sentences, the way you would explain it to a person',
+  technical: 'Precise technical terms and more depth, for senior or deep technical interviews',
+};
 
 const LANGUAGES = [
   { code: 'en-IN', label: 'English (India)' },
@@ -42,6 +55,8 @@ type Props = {
   busy: boolean;
   answerMode: AnswerMode;
   onAnswerModeChange: (mode: AnswerMode) => void;
+  answerStyle: AnswerStyle;
+  onAnswerStyleChange: (style: AnswerStyle) => void;
   language: string;
   onLanguageChange: (code: string) => void;
   autoSend: boolean;
@@ -76,6 +91,8 @@ export function Composer({
   busy,
   answerMode,
   onAnswerModeChange,
+  answerStyle,
+  onAnswerStyleChange,
   language,
   onLanguageChange,
   autoSend,
@@ -305,6 +322,24 @@ export function Composer({
               onClick={() => onAnswerModeChange(mode)}
             >
               {answerModeLabel(mode)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="answer-mode-wrap">
+        <label>Answer style</label>
+        <div className="answer-mode-options answer-style-options" role="group" aria-label="Answer style">
+          {ANSWER_STYLES.map(style => (
+            <button
+              type="button"
+              key={style}
+              className={`answer-mode-button ${answerStyle === style ? 'selected' : ''}`}
+              aria-pressed={answerStyle === style}
+              title={STYLE_HINTS[style]}
+              disabled={busy}
+              onClick={() => onAnswerStyleChange(style)}
+            >
+              {answerStyleLabel(style)}
             </button>
           ))}
         </div>

@@ -42,7 +42,7 @@ test('a question over 10,000 characters gets a clear error and is not sent', asy
 });
 
 test('the answer length chosen during an interview is remembered', async ({ page, request }) => {
-  const selected = page.locator('.answer-mode-button.selected');
+  const selected = page.getByRole('group', { name: 'Interview answer length' }).locator('.answer-mode-button.selected');
   await expect(selected).toHaveText('Balanced');
   await Promise.all([
     page.waitForResponse(response => response.request().method() === 'PATCH'),
@@ -56,12 +56,32 @@ test('the answer length chosen during an interview is remembered', async ({ page
   });
 });
 
+test('the answer style chosen during an interview is remembered and sent with questions', async ({ page, request }) => {
+  const selected = page.getByRole('group', { name: 'Answer style' }).locator('.answer-mode-button.selected');
+  await expect(selected).toHaveText('Simple');
+  await Promise.all([
+    page.waitForResponse(response => response.request().method() === 'PATCH'),
+    page.getByRole('button', { name: 'Technical', exact: true }).click(),
+  ]);
+  await page.evaluate(() => window.__streams(50, 3));
+  await page.getByLabel('Your message').fill('What is a service mesh?');
+  await page.getByRole('button', { name: /Send/ }).click();
+  await waitForAnswer(page);
+  expect(await page.evaluate(() => window.__chatBodies[0])).toMatchObject({ style: 'technical' });
+  await openInterview(page, 'Demo interview');
+  await expect(selected).toHaveText('Technical');
+  // Put it back for the other tests.
+  await request.patch(`${API}/api/conversations/${await interviewId(request, 'Demo interview')}`, {
+    data: { style: 'simple' },
+  });
+});
+
 test('Focus Mode hides the settings, widens the answers and fades older questions', async ({ page }) => {
   const answersWidth = async () => (await page.locator('.conversation-panel').boundingBox())!.width;
   const before = await answersWidth();
   await page.getByRole('button', { name: 'Focus Mode' }).click();
   await expect(page.getByRole('button', { name: 'Exit Focus' })).toHaveAttribute('aria-pressed', 'true');
-  await expect(page.locator('.answer-mode-wrap')).toBeHidden();
+  for (const settings of await page.locator('.answer-mode-wrap').all()) await expect(settings).toBeHidden();
   expect(await answersWidth()).toBeGreaterThan(before);
   await expect
     .poll(() => page.locator('.message').evaluateAll(messages => messages.map(m => getComputedStyle(m).opacity)))
