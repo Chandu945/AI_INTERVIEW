@@ -61,15 +61,15 @@ test('the answer style chosen during an interview is remembered and sent with qu
   await expect(selected).toHaveText('Simple');
   await Promise.all([
     page.waitForResponse(response => response.request().method() === 'PATCH'),
-    page.getByRole('button', { name: 'Technical', exact: true }).click(),
+    page.getByRole('group', { name: 'Answer style' }).getByRole('button', { name: 'Balanced' }).click(),
   ]);
   await page.evaluate(() => window.__streams(50, 3));
   await page.getByLabel('Your message').fill('What is a service mesh?');
   await page.getByRole('button', { name: /Send/ }).click();
   await waitForAnswer(page);
-  expect(await page.evaluate(() => window.__chatBodies[0])).toMatchObject({ style: 'technical' });
+  expect(await page.evaluate(() => window.__chatBodies[0])).toMatchObject({ style: 'balanced' });
   await openInterview(page, 'Demo interview');
-  await expect(selected).toHaveText('Technical');
+  await expect(selected).toHaveText('Balanced');
   // Put it back for the other tests.
   await request.patch(`${API}/api/conversations/${await interviewId(request, 'Demo interview')}`, {
     data: { style: 'simple' },

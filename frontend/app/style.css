@@ -1103,9 +1103,6 @@ textarea.text-field {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
 }
-.answer-style-options {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
 .answer-mode-button {
   border: 1px solid #354964;
   border-radius: 8px;

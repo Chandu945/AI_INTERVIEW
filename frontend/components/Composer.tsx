@@ -15,6 +15,7 @@ import {
 
 const STYLE_HINTS: Record<AnswerStyle, string> = {
   simple: 'Everyday words and short sentences, the way you would explain it to a person',
+  balanced: 'Plain, natural sentences with the right technical terms, a step deeper than Simple',
   technical: 'Precise technical terms and more depth, for senior or deep technical interviews',
 };
 
@@ -328,7 +329,7 @@ export function Composer({
       </div>
       <div className="answer-mode-wrap">
         <label>Answer style</label>
-        <div className="answer-mode-options answer-style-options" role="group" aria-label="Answer style">
+        <div className="answer-mode-options" role="group" aria-label="Answer style">
           {ANSWER_STYLES.map(style => (
             <button
               type="button"

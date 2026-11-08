@@ -136,24 +136,29 @@ def test_answer_style_is_saved_with_the_interview_and_copied_with_it(client):
     assert client.patch(f"/api/conversations/{cid}", json={"style": "fancy"}).status_code == 422
 
 
-def test_answers_are_simple_unless_technical_is_chosen(client, gemini):
-    """Simple: everyday words and short sentences. Technical: precise terms and depth."""
+def test_each_answer_style_sends_its_own_guidance(client, gemini):
+    """Simple: everyday words and short sentences. Balanced: the right terms, a step deeper.
+    Technical: precise terms and depth. Simple unless another is chosen, typed or recorded."""
     cid = new_interview(client)
     fake = gemini(("An answer.", "STOP"))
+
+    def sent_only(style):
+        prompt = fake.config.system_instruction
+        return all((main.STYLE_GUIDANCE[s] in prompt) == (s == style) for s in main.STYLE_GUIDANCE)
+
     ask(client, cid)
-    assert main.STYLE_GUIDANCE["simple"] in fake.config.system_instruction
-    assert main.STYLE_GUIDANCE["technical"] not in fake.config.system_instruction
-    body = {"message": QUESTION, "conversation_id": cid, "mode": "quick", "style": "technical"}
-    client.post("/api/chat/stream", json=body)
-    assert main.STYLE_GUIDANCE["technical"] in fake.config.system_instruction
-    assert main.STYLE_GUIDANCE["simple"] not in fake.config.system_instruction
-    client.post(
-        "/api/chat/stream-recording",
-        data={"conversation_id": cid, "mode": "quick", "style": "technical", "heard": "what is rag"},
-        files={"file": ("question.wav", silence_wav(), "audio/wav")},
-    )
-    assert main.STYLE_GUIDANCE["technical"] in fake.config.system_instruction
-    assert client.post("/api/chat/stream", json={**body, "style": "fancy"}).status_code == 422
+    assert sent_only("simple")
+    for style in ("balanced", "technical"):
+        client.post("/api/chat/stream", json={"message": QUESTION, "conversation_id": cid, "style": style})
+        assert sent_only(style)
+        client.post(
+            "/api/chat/stream-recording",
+            data={"conversation_id": cid, "mode": "quick", "style": style, "heard": "what is rag"},
+            files={"file": ("question.wav", silence_wav(), "audio/wav")},
+        )
+        assert sent_only(style)
+    body = {"message": QUESTION, "conversation_id": cid, "style": "fancy"}
+    assert client.post("/api/chat/stream", json=body).status_code == 422
 
 
 def test_update_rejects_bad_requests(client):

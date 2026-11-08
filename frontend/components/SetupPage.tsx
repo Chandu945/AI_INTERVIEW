@@ -48,6 +48,7 @@ const LENGTH_TEXT: Record<AnswerMode, string> = {
 
 const STYLE_TEXT: Record<AnswerStyle, string> = {
   simple: 'Everyday words and short sentences, the way you would explain it to a person',
+  balanced: 'Plain, natural sentences with the right technical terms, a step deeper than Simple',
   technical: 'Precise technical terms and more depth, for senior or deep technical interviews',
 };
 

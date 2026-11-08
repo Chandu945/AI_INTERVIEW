@@ -13,8 +13,9 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   filled in next time.
 - **Answer style:** Simple (the default) answers the way you'd explain it to a person: a plain
   first sentence, everyday words, short sentences, technical terms explained, an everyday
-  comparison where it helps. Technical uses precise terms and more depth, for senior
-  interviews. Both are written to be said out loud. Change it during an interview too, beside
+  comparison where it helps. Balanced uses the right technical terms in fairly short, plain
+  sentences, a step deeper. Technical uses precise terms and more depth, for senior
+  interviews. All are written to be said out loud. Change it during an interview too, beside
   the answer length.
   During an interview, the top bar shows only the way back to Interviews and the interview's
   title (click it to rename) and details.

@@ -1,8 +1,8 @@
 /** The Interviews page (the start page), the New interview form, or an interview. */
 export type View = 'home' | 'setup' | 'interview';
 export type AnswerMode = 'quick' | 'balanced' | 'detailed';
-/** How answers explain things: in everyday words, or with precise technical depth. */
-export type AnswerStyle = 'simple' | 'technical';
+/** How answers explain things: from everyday words (simple) to precise technical depth (technical). */
+export type AnswerStyle = 'simple' | 'balanced' | 'technical';
 export type InterviewType = 'Technical' | 'HR' | 'Mixed';
 /** What dictation listens to: the microphone, or the sound of a shared browser tab. */
 export type VoiceSource = 'mic' | 'tab';
@@ -42,7 +42,7 @@ export type StreamEvent = {
 export type StreamMetrics = { first: number | null; total: number };
 
 export const ANSWER_MODES: AnswerMode[] = ['quick', 'balanced', 'detailed'];
-export const ANSWER_STYLES: AnswerStyle[] = ['simple', 'technical'];
+export const ANSWER_STYLES: AnswerStyle[] = ['simple', 'balanced', 'technical'];
 export const INTERVIEW_TYPES: InterviewType[] = ['Technical', 'HR', 'Mixed'];
 
 /** "quick" is shown as "Short"; the other lengths are just capitalized. */
@@ -51,5 +51,5 @@ export function answerModeLabel(mode: AnswerMode) {
 }
 
 export function answerStyleLabel(style: AnswerStyle) {
-  return style === 'simple' ? 'Simple' : 'Technical';
+  return style[0].toUpperCase() + style.slice(1);
 }
