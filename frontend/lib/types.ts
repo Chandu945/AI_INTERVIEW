@@ -1,9 +1,12 @@
 /** The Interviews page (the start page), the New interview form, or an interview. */
 export type View = 'home' | 'setup' | 'interview';
+/** The answer length: shown as Short, Medium and Detailed. */
 export type AnswerMode = 'quick' | 'balanced' | 'detailed';
 /** How answers explain things: from everyday words (simple) to precise technical depth (technical). */
 export type AnswerStyle = 'simple' | 'balanced' | 'technical';
 export type InterviewType = 'Technical' | 'HR' | 'Mixed';
+/** Ways to say the latest answer again, from the buttons under it (see /api/chat/rewrite). */
+export type Rewrite = 'shorter' | 'simpler' | 'more_detail';
 /** What dictation listens to: the microphone, or the sound of a shared browser tab. */
 export type VoiceSource = 'mic' | 'tab';
 /** A question or answer. A question may come with images (their ids on the backend). */
@@ -44,10 +47,13 @@ export type StreamMetrics = { first: number | null; total: number };
 export const ANSWER_MODES: AnswerMode[] = ['quick', 'balanced', 'detailed'];
 export const ANSWER_STYLES: AnswerStyle[] = ['simple', 'balanced', 'technical'];
 export const INTERVIEW_TYPES: InterviewType[] = ['Technical', 'HR', 'Mixed'];
+export const REWRITES: Rewrite[] = ['shorter', 'simpler', 'more_detail'];
 
-/** "quick" is shown as "Short"; the other lengths are just capitalized. */
+// The API and the database call them by their first names, "quick", "balanced" and "detailed".
+const ANSWER_MODE_LABELS: Record<AnswerMode, string> = { quick: 'Short', balanced: 'Medium', detailed: 'Detailed' };
+
 export function answerModeLabel(mode: AnswerMode) {
-  return mode === 'quick' ? 'Short' : mode[0].toUpperCase() + mode.slice(1);
+  return ANSWER_MODE_LABELS[mode];
 }
 
 export function answerStyleLabel(style: AnswerStyle) {

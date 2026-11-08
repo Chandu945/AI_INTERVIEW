@@ -17,13 +17,21 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   sentences, a step deeper. Technical uses precise terms and more depth, for senior
   interviews. All are written to be said out loud. Change it during an interview too, beside
   the answer length.
-  During an interview, the top bar shows only the way back to Interviews and the interview's
-  title (click it to rename) and details.
-- **Interview:** type or dictate questions (in Chrome) and watch the answers
-  stream in. Enter sends a question (Shift+Enter starts a new line). Each question and its answer have a page of their own: a new question opens at the
-  top of the answers, alone, and scrolling up brings back earlier ones one at a time. Optional
-  auto-stop after a 2.2-second pause, with optional hands-free sending. Focus Mode, font sizes
-  and copy buttons.
+- **Answer length:** Short (two to four sentences, about 20 seconds to say), Medium (about 30 to
+  60 seconds) or Detailed (with an example and trade-offs). Each answer opens with its main idea
+  in a sentence of its own, shown in bold, then short paragraphs of two or three sentences, so
+  it's easy to keep your place while saying it. Answers say what you would do ("I'd start
+  by...") rather than claim experience or habits your resume doesn't show.
+- **Say it again:** under the latest answer, **Shorter** (about half the words), **Simpler**
+  (everyday words) and **More detail** (the reasoning, an example and a trade-off) rewrite it,
+  keeping its points. The new version takes the old one's place, on screen and in the saved
+  interview.
+- **Interview:** type or dictate questions (in Chrome) and watch the answers stream in. Enter
+  sends a question (Shift+Enter starts a new line). Each question and its answer have a page of
+  their own: a new question opens at the top of the answers, alone, and scrolling up brings back
+  earlier ones one at a time. Optional auto-stop after a 2.2-second pause, with optional
+  hands-free sending. Focus Mode, font sizes and copy buttons. The top bar shows only the way
+  back to Interviews and the interview's title (click it to rename) and details.
 - **Questions with images:** add a screenshot, a diagram or a photo to a question (Add image,
   paste it into the box, or drop it on the box), up to 4 per question; an image alone can be
   the question, such as a screenshot of a coding problem. Gemini reads the images with the

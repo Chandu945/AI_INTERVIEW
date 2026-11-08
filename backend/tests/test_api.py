@@ -296,7 +296,122 @@ def test_question_over_10000_characters_is_rejected(client):
     assert response.json()["detail"][0]["msg"] == "String should have at most 10000 characters"
 
 
+# Saying the last answer again (the Shorter, Simpler and More detail buttons)
+
+
+def rewrite(client, cid, how, style="simple"):
+    response = client.post("/api/chat/rewrite", json={"conversation_id": cid, "how": how, "style": style})
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+SIXTY_WORDS = " ".join(["word"] * 60)
+
+
+def test_an_answer_said_again_takes_its_place(client, gemini):
+    """In memory at once, so the next question has it as context, and in the database, so the
+    reopened interview shows it."""
+    cid = new_interview(client)
+    gemini((SIXTY_WORDS, "STOP"))
+    ask(client, cid, "What is RAG?")
+    fake = gemini(("RAG looks things up first.", "STOP"))
+    events = rewrite(client, cid, "shorter")
+    assert [e["type"] for e in events] == ["start", "delta", "done"]
+    # Gemini has the interview so far, ending with the answer, and is asked to say it again.
+    asked = [content.parts[-1].text for content in fake.contents]
+    assert asked[:2] == ["What is RAG?", SIXTY_WORDS]
+    assert asked[2].startswith("Say your last answer again, shorter, in about 30 words.")
+    fake = gemini(("An answer.", "STOP"))
+    ask(client, cid, "Why?")
+    assert [content.parts[-1].text for content in fake.contents[:2]] == ["What is RAG?", "RAG looks things up first."]
+    assert [m["content"] for m in saved_messages(client, cid)] == [
+        "What is RAG?",
+        "RAG looks things up first.",
+        "Why?",
+        "An answer.",
+    ]
+
+
+def test_each_way_of_saying_it_again_asks_for_its_own_length_and_style(client, gemini):
+    """Shorter: about half. Simpler: the same length, in the simple style. More detail: more.
+    In place of the answer length, and in the interview's style otherwise."""
+    cid = new_interview(client)
+    for how, words, style in (
+        ("shorter", 30, "technical"),
+        ("simpler", 60, "simple"),
+        ("more_detail", 150, "technical"),
+    ):
+        gemini((SIXTY_WORDS, "STOP"))
+        ask(client, cid)
+        fake = gemini(("Said again.", "STOP"))
+        assert rewrite(client, cid, how, style="technical")[-1]["type"] == "done"
+        prompt = fake.config.system_instruction
+        assert [main.STYLE_GUIDANCE[s] in prompt for s in main.STYLE_GUIDANCE] == [
+            s == style for s in main.STYLE_GUIDANCE
+        ]
+        assert f"Answer length: about {words} words" in prompt
+        assert not any(guidance in prompt for guidance in main.MODE_GUIDANCE.values())
+        assert fake.contents[-1].parts[-1].text.startswith(main.REWRITES[how].format(words=words))
+        assert fake.config.max_output_tokens == main.REWRITE_TOKENS
+
+
+def test_the_length_to_aim_for_leaves_out_code_and_stays_within_bounds():
+    answer = " ".join(["word"] * 80) + "\n\n```python\n" + "x = 1\n" * 50 + "```" + main.CUT_OFF_NOTE
+    assert [main.rewrite_words(how, answer) for how in ("shorter", "simpler", "more_detail")] == [40, 80, 150]
+    few, many = " ".join(["word"] * 10), " ".join(["word"] * 500)
+    assert [main.rewrite_words("shorter", few), main.rewrite_words("simpler", few)] == [25, 40]
+    assert [main.rewrite_words("simpler", many), main.rewrite_words("more_detail", many)] == [220, 300]
+
+
+def test_saying_it_again_needs_an_answer_and_a_known_way(client, gemini):
+    cid = new_interview(client)
+    assert client.post("/api/chat/rewrite", json={"conversation_id": cid, "how": "shorter"}).status_code == 503
+    gemini(("An answer.", "STOP"))
+    response = client.post("/api/chat/rewrite", json={"conversation_id": cid, "how": "shorter"})
+    assert (response.status_code, response.json()["detail"]) == (409, "There's no answer to say again yet")
+    assert client.post("/api/chat/rewrite", json={"conversation_id": "missing", "how": "shorter"}).status_code == 404
+    ask(client, cid)
+    assert client.post("/api/chat/rewrite", json={"conversation_id": cid, "how": "louder"}).status_code == 422
+
+
+def test_an_answer_said_again_after_another_question_is_not_kept(client, gemini, monkeypatch):
+    """Only the interview's last answer is said again: if another question was answered while it
+    was (the app doesn't allow that, but another tab could), the new version is dropped."""
+    cid = new_interview(client)
+    gemini(("An answer.", "STOP"))
+    ask(client, cid, "First?")
+    rewrite_request = main.rewrite_request
+
+    async def answered_meanwhile(*args):
+        request = await rewrite_request(*args)
+        main.interviews.add_turn(cid, "Second?", "Another answer.", ())
+        return request
+
+    monkeypatch.setattr(main, "rewrite_request", answered_meanwhile)
+    gemini(("Said again.", "STOP"))
+    events = rewrite(client, cid, "shorter")
+    assert events[-1] == {
+        "type": "error",
+        "message": "Another question was answered meanwhile, so this answer wasn't kept.",
+    }
+    assert main.interviews.get(cid).messages[-1]["content"] == "Another answer."
+    main.replace_answer(cid, "Not the last answer.", "Said again.")  # the database checks too
+    assert [m["content"] for m in saved_messages(client, cid)] == ["First?", "An answer."]
+
+
 # Prompt building
+
+
+def test_each_answer_length_sends_its_own_guidance_after_the_style(client, gemini):
+    """Short, medium or detailed: last in the instructions, before the interview's settings, so it
+    outranks the style."""
+    cid = new_interview(client)
+    fake = gemini(("An answer.", "STOP"))
+    for mode in ("quick", "balanced", "detailed"):
+        ask(client, cid, mode=mode)
+        prompt = fake.config.system_instruction
+        assert [main.MODE_GUIDANCE[m] in prompt for m in main.MODE_GUIDANCE] == [m == mode for m in main.MODE_GUIDANCE]
+        assert prompt.index(main.STYLE_GUIDANCE["simple"]) < prompt.index(main.MODE_GUIDANCE[mode])
+        assert fake.config.max_output_tokens == main.MODE_TOKENS[mode]
 
 
 def test_hr_interview_gets_behavioral_guidance(client, gemini):

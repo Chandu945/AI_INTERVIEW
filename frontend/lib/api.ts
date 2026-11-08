@@ -1,4 +1,4 @@
-import type { AnswerMode, AnswerStyle, InterviewType, StreamEvent } from './types';
+import type { AnswerMode, AnswerStyle, InterviewType, Rewrite, StreamEvent } from './types';
 
 export const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 // Must match ChatRequest.message max_length in backend/main.py.
@@ -75,6 +75,9 @@ export const api = {
     body.append('image_ids', fields.image_ids.join(','));
     return fetch(`${API}/api/chat/stream-recording`, { method: 'POST', body, signal });
   },
+  /** Says the interview's last answer again, streamed as an answer is. It takes the old one's place. */
+  rewriteAnswer: (body: { conversation_id: string; how: Rewrite; style: AnswerStyle }, signal: AbortSignal) =>
+    fetch(`${API}/api/chat/rewrite`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body), signal }),
 };
 
 /**

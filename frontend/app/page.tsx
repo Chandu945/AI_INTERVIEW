@@ -13,7 +13,16 @@ import { useQuestionPages } from '../hooks/useQuestionPages';
 import { useTabAudio } from '../hooks/useTabAudio';
 import { useTranscriptImprover, type HandOff } from '../hooks/useTranscriptImprover';
 import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
-import type { AnswerMode, AnswerStyle, Message, Session, StreamMetrics, View, VoiceSource } from '../lib/types';
+import type {
+  AnswerMode,
+  AnswerStyle,
+  Message,
+  Rewrite,
+  Session,
+  StreamMetrics,
+  View,
+  VoiceSource,
+} from '../lib/types';
 
 // Remembers in this browser whether dictation listens to the mic or a tab.
 const SOURCE_KEY = 'ai-interact.voice-source';
@@ -433,6 +442,61 @@ export default function Home() {
     updateInterim,
   ]);
 
+  // Says the latest answer again (shorter, more simply or in more detail), in its place. The
+  // backend puts the new version in the old one's place once it's complete; until then, and if it
+  // fails, the old one is still the saved one.
+  const rewriteAnswer = useCallback(
+    async (how: Rewrite) => {
+      const old = messages[messages.length - 1];
+      if (busyRef.current || !conversationId || old?.role !== 'assistant') return;
+      busyRef.current = true;
+      setBusy(true);
+      setError('');
+      setFailedDraft(null);
+      setStreamMetrics(null);
+      const showAnswer = (content: string) =>
+        setMessages(prev => prev.map((m, i) => (i === prev.length - 1 ? { ...m, content } : m)));
+      showAnswer('');
+      const controller = new AbortController();
+      chatRequestRef.current = controller;
+      let completed = false;
+      try {
+        const response = await api.rewriteAnswer(
+          { conversation_id: conversationId, how, style: answerStyle },
+          controller.signal,
+        );
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(errorMessage(data, `Request failed (${response.status})`));
+        }
+        if (!response.body) throw new Error('Streaming is not supported by this connection.');
+        let received = '';
+        await readEvents(response.body, event => {
+          if (event.type === 'restart') received = '';
+          if (event.type === 'delta' && event.text) received += event.text;
+          if (event.type === 'restart' || event.type === 'delta') showAnswer(received);
+          if (event.type === 'done') {
+            completed = true;
+            setStreamMetrics({ first: event.first_token_ms ?? null, total: event.total_ms ?? 0 });
+            void refreshSessions();
+          }
+          if (event.type === 'error') throw new Error(event.message || 'Gemini streaming failed');
+        });
+        if (!completed) throw new Error('The response ended before Gemini finished. Please retry.');
+      } catch (e) {
+        if (!controller.signal.aborted && mountedRef.current) {
+          setError(e instanceof Error ? e.message : 'Could not say the answer again');
+          showAnswer(old.content);
+        }
+      } finally {
+        busyRef.current = false;
+        if (mountedRef.current) setBusy(false);
+        if (chatRequestRef.current === controller) chatRequestRef.current = null;
+      }
+    },
+    [answerStyle, conversationId, messages, refreshSessions],
+  );
+
   const copyMessage = useCallback(async (content: string, key: string) => {
     try {
       await navigator.clipboard.writeText(content);
@@ -674,6 +738,7 @@ export default function Home() {
             onFontSizeChange={setFontSize}
             copiedKey={copiedKey}
             onCopy={copyMessage}
+            onRewrite={rewriteAnswer}
             streamMetrics={streamMetrics}
             sessionInfoOpen={sessionInfoOpen}
             onToggleSessionInfo={() => setSessionInfoOpen(open => !open)}

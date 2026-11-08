@@ -45,7 +45,7 @@ function pageFakes() {
   window.__heard = null;
   // The text so far sent with each piece.
   window.__contexts = [];
-  // What each faked question was sent with (its JSON, or its form's text fields).
+  // What each faked question (or answer said again) was sent with: its JSON, or its form's text fields.
   window.__chatBodies = [];
   // Pieces are cut only when a test says so (see cutPiece), and "stop after silence" goes by the
   // fake recognition alone (the fake mic beeps on and on).
@@ -65,7 +65,7 @@ function pageFakes() {
       const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
       return new Promise(resolve => setTimeout(() => resolve(response), delay));
     }
-    if (window.__fakeStream && url.includes('/api/chat/stream')) {
+    if (window.__fakeStream && url.includes('/api/chat/')) {
       window.__chatBodies.push(
         init?.body instanceof FormData
           ? Object.fromEntries([...init.body.entries()].filter(([, value]) => typeof value === 'string'))

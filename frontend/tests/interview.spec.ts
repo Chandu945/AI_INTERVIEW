@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import {
   API,
   chatRequests,
+  chatUrls,
   forgetRequests,
   interviewId,
   openApp,
@@ -87,7 +88,7 @@ test('a question over 10,000 characters gets a clear error and is not sent', asy
 
 test('the answer length chosen during an interview is remembered', async ({ page, request }) => {
   const selected = page.getByRole('group', { name: 'Interview answer length' }).locator('.answer-mode-button.selected');
-  await expect(selected).toHaveText('Balanced');
+  await expect(selected).toHaveText('Medium');
   await Promise.all([
     page.waitForResponse(response => response.request().method() === 'PATCH'),
     page.getByRole('button', { name: 'Detailed', exact: true }).click(),
@@ -159,4 +160,53 @@ test('an answer that Gemini restarts partway is shown afresh, without an error',
   await expect(page.locator('.message.assistant').last()).toHaveText(/The whole answer, from the start\./);
   await expect(page.locator('.message.assistant').last()).not.toContainText('half-written');
   await expect(page.locator('.error-banner')).toHaveCount(0);
+});
+
+test('the latest answer can be said again shorter, simpler or in more detail, in its place', async ({ page }) => {
+  const rewrites = page.getByRole('group', { name: 'Say this answer again' });
+  await expect(rewrites).toHaveCount(1); // under the latest answer only
+  await expect(page.locator('.message.assistant').last().getByRole('group')).toBeVisible();
+  await expect(rewrites.getByRole('button')).toHaveText(['Shorter', 'Simpler', 'More detail']);
+  const answers = page.locator('.message.assistant .message-text');
+  await page.evaluate(() =>
+    window.__replay(
+      [
+        { type: 'start' },
+        { type: 'delta', text: 'Dependency injection hands an endpoint ' },
+        { type: 'delta', text: 'what it needs.' },
+        { type: 'done', first_token_ms: 400, total_ms: 900 },
+      ],
+      150,
+    ),
+  );
+  await forgetRequests(page);
+  await rewrites.getByRole('button', { name: 'Shorter' }).click();
+  await expect(rewrites).toHaveCount(0); // not while it's being said again
+  await expect(answers.last()).toHaveText('Dependency injection hands an endpoint what it needs.');
+  await expect(rewrites).toHaveCount(1);
+  await expect(page.locator('.message')).toHaveCount(6); // in the old one's place
+  await expect(answers.nth(1)).toContainText('recall@k'); // the earlier answers as they were
+  expect(await chatUrls(page)).toEqual([`${API}/api/chat/rewrite`]);
+  expect(await page.evaluate(() => window.__chatBodies[0])).toEqual({
+    conversation_id: await interviewId(page.request, 'Demo interview'),
+    how: 'shorter',
+    style: 'simple',
+  });
+  await expect(page.locator('.conversation-bottom')).toContainText('First text 400 ms · Total 900 ms');
+});
+
+test('an answer that could not be said again is put back, with the reason', async ({ page }) => {
+  // No fake answer: the test backend has no Gemini key.
+  const last = page.locator('.message.assistant .message-text').last();
+  const before = await last.innerText();
+  await page.getByRole('button', { name: 'More detail' }).click();
+  await expect(page.locator('.error-banner')).toContainText('GEMINI_API_KEY is not configured');
+  await expect(last).toHaveText(before);
+  await expect(page.getByRole('group', { name: 'Say this answer again' })).toHaveCount(1);
+});
+
+test("an answer's opening sentence stands out", async ({ page }) => {
+  const paragraphs = page.locator('.message.assistant').first().locator('.message-text p');
+  const weight = (n: number) => paragraphs.nth(n).evaluate(p => getComputedStyle(p).fontWeight);
+  expect([await weight(0), await weight(1)]).toEqual(['650', '400']);
 });

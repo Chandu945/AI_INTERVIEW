@@ -41,8 +41,8 @@ const TYPE_TEXT: Record<InterviewType, string> = {
 };
 // How long each answer takes to say (see MODE_GUIDANCE in backend/main.py).
 const LENGTH_TEXT: Record<AnswerMode, string> = {
-  quick: 'A few sentences, about 15–30 seconds to say',
-  balanced: 'A short paragraph, about 30–60 seconds',
+  quick: 'Two to four sentences, about 20 seconds to say',
+  balanced: 'A few short paragraphs, about 30–60 seconds',
   detailed: 'With an example and tradeoffs, about a minute or more',
 };
 

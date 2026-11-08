@@ -1,5 +1,5 @@
 import type { Ref } from 'react';
-import type { Message, StreamMetrics } from '../lib/types';
+import type { Message, Rewrite, StreamMetrics } from '../lib/types';
 import { MessageItem } from './MessageItem';
 
 /** The messages as pages: a question with its answer (and the index of its first message). */
@@ -21,6 +21,8 @@ type Props = {
   onFontSizeChange: (size: number) => void;
   copiedKey: string | null;
   onCopy: (content: string, key: string) => void;
+  /** Says the latest answer again: shorter, more simply or in more detail. */
+  onRewrite: (how: Rewrite) => void;
   streamMetrics: StreamMetrics | null;
   sessionInfoOpen: boolean;
   onToggleSessionInfo: () => void;
@@ -38,6 +40,7 @@ export function ConversationPanel({
   onFontSizeChange,
   copiedKey,
   onCopy,
+  onRewrite,
   streamMetrics,
   sessionInfoOpen,
   onToggleSessionInfo,
@@ -97,6 +100,7 @@ export function ConversationPanel({
                   copied={copiedKey === String(i)}
                   fontSize={fontSize}
                   onCopy={onCopy}
+                  onRewrite={!busy && i === messages.length - 1 && message.role === 'assistant' ? onRewrite : undefined}
                 />
               );
             })}
