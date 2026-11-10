@@ -257,6 +257,12 @@ class Database:
         try:
             with connection:
                 yield connection
+        except sqlite3.OperationalError as exc:
+            # Another write held the file for longer than sqlite3 waits (5 s): out of reach for now,
+            # so the saver tries the write again instead of dropping it.
+            if "locked" in str(exc) or "busy" in str(exc):
+                raise DatabaseUnavailable(str(exc)) from exc
+            raise
         finally:
             connection.close()
 

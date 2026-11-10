@@ -128,6 +128,23 @@ test('with no interviews yet, the page invites you to start one', async ({ page 
   await expect(page.getByRole('heading', { name: 'New interview' })).toBeVisible();
 });
 
+test("when the database is out of reach, the page says so in the backend's words", async ({ page }) => {
+  const detail =
+    "Can't reach the database. Check your internet connection, or resume your Supabase project if it was paused.";
+  await page.route(`${API}/api/conversations`, route =>
+    route.request().method() === 'GET' ? route.fulfill({ status: 503, json: { detail } }) : route.fallback(),
+  );
+  await page.reload();
+  await expect(page.locator('.error-banner')).toHaveText(detail);
+  // With no response at all, it's the backend itself that can't be reached.
+  await page.unroute(`${API}/api/conversations`);
+  await page.route(`${API}/api/conversations`, route =>
+    route.request().method() === 'GET' ? route.abort() : route.fallback(),
+  );
+  await page.reload();
+  await expect(page.locator('.error-banner')).toHaveText("Couldn't load your interviews. Is the backend running?");
+});
+
 test('during an interview, the top bar has only the way back, and its title and details', async ({ page }) => {
   await openInterview(page, 'Demo interview');
   const bar = page.locator('.topbar');

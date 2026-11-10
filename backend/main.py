@@ -3,12 +3,16 @@ import io
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import uuid
+import wave
+from array import array
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google import genai
 from google.genai import errors, types
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from database import Database, DatabaseUnavailable
 
@@ -207,7 +211,7 @@ class Hedge:
 # Time to the first text of an answer, and time for a whole transcription. A second try goes out
 # once a request takes 1.5 times as long as a quick one: it costs little on the paid tier, and
 # saves seconds whenever Gemini stalls. An answer to a recording has its own timing, as hearing
-# the audio and writing the question down makes it start about a second later than a typed one.
+# the audio makes it start a little later than a typed one.
 ANSWER_HEDGE = Hedge("Gemini answer", minimum=1.5, maximum=6.0, factor=1.5)
 RECORDED_HEDGE = Hedge("Gemini answer to a recording", minimum=2.0, maximum=6.0, factor=1.5)
 # At most 4 s, so the second try still has time before the app gives up after 8 s.
@@ -498,7 +502,7 @@ AnswerStyle = Literal["simple", "balanced", "technical"]
 
 class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=10000)
-    conversation_id: Optional[str] = None
+    conversation_id: str
     mode: Literal["quick", "balanced", "detailed"] = "balanced"
     style: AnswerStyle = "simple"
     # Images the question was asked with, uploaded to /api/conversations/{id}/images first.
@@ -583,6 +587,13 @@ class NewInterviewRequest(BaseModel):
     instructions: str = Field(default="", max_length=2000)
     job_description: str = Field(default="", max_length=12000)
 
+    @field_validator("target_role")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("The role can't be blank")
+        return value.strip()
+
 
 @app.post("/api/conversations")
 def create_conversation(request: NewInterviewRequest):
@@ -632,17 +643,23 @@ class UpdateRequest(BaseModel):
     mode: Optional[Literal["quick", "balanced", "detailed"]] = None
     style: Optional[AnswerStyle] = None
 
+    @field_validator("title")
+    @classmethod
+    def not_blank(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("The title can't be blank")
+        return value.strip() if value is not None else None
+
 
 @app.patch("/api/conversations/{conversation_id}")
 def update_conversation(conversation_id: str, request: UpdateRequest):
     # Renames the interview and/or saves its answer length or style; fields left out stay as they are.
     if request.title is None and request.mode is None and request.style is None:
         raise HTTPException(422, "Nothing to update")
-    title = request.title.strip() if request.title is not None else None
     result = database.run(
         "UPDATE sessions SET title=COALESCE(?,title),mode=COALESCE(?,mode),style=COALESCE(?,style),"
         "updated_at=CURRENT_TIMESTAMP WHERE id=?",
-        (title, request.mode, request.style, conversation_id),
+        (request.title, request.mode, request.style, conversation_id),
     )
     if not result.rowcount:
         raise HTTPException(404, "Interview not found")
@@ -856,7 +873,10 @@ COMMON_TERMS = [
 ]  # fmt: skip
 TRANSCRIBE_PROMPT = (
     "Transcribe this recording. It is usually an interview question, said by the candidate or played from a video or call.\n"
-    "Write exactly the words spoken, in normal sentence case with punctuation.\n"
+    "Write the words spoken, in normal sentence case with punctuation. Leave out fillers (um, uh, hmm), a stray "
+    '"okay" or "so" before the question, and a false start that is then said again (so "okay, um, explain, explain '
+    'PySpark architecture" is written "Explain PySpark architecture."); otherwise don\'t change, add or leave out '
+    "words.\n"
     "The interview is for the role: {role} ({interview_type} interview). Spell technical terms the standard way; "
     "terms that may come up include: {terms}.\n"
     "Return only the transcript. Do not answer the question, add words or explain. If nothing is said, return nothing."
@@ -891,6 +911,46 @@ def vocabulary(*texts: str, limit: int = 40) -> list[str]:
             if technical and word.lower() not in found:
                 found[word.lower()] = word
     return list(found.values())[:limit]
+
+
+# Speech is loud for a syllable's length (64 ms) at a time, 0.1 s in all: louder than SPEECH_LEVEL
+# and twice the quietest fifth of the recording, which steady sounds (a fan, a hum) and clicks
+# aren't. The same rule as the app's for a piece of the recording (useAudioRecorder.ts).
+SPEECH_LEVEL = 0.01
+BLOCK = 128  # samples: 8 ms at 16 kHz
+SYLLABLE_BLOCKS = 8
+SPEECH_BLOCKS = 12
+
+
+def has_speech(audio: bytes) -> bool:
+    """Whether someone may be speaking in the recording (16 kHz 16-bit mono WAV), going by how its
+    loudness rises and falls. Given a recording with no one speaking in it, Gemini makes up a
+    question that fits the interview, however it's asked not to, so the sound is checked first.
+    True if the recording can't be read: then Gemini decides."""
+    try:
+        with wave.open(io.BytesIO(audio)) as recording:
+            if recording.getsampwidth() != 2 or recording.getnchannels() != 1:
+                return True
+            samples = array("h", recording.readframes(recording.getnframes()))
+    except (wave.Error, EOFError, ValueError):
+        return True
+    if sys.byteorder == "big":
+        samples.byteswap()
+    levels = [
+        math.sqrt(sum(s * s for s in samples[i : i + BLOCK]) / BLOCK) / 32768
+        for i in range(0, len(samples) - BLOCK + 1, BLOCK)
+    ]
+    if not levels:
+        return False
+    loud = max(SPEECH_LEVEL, 2 * sorted(levels)[len(levels) // 5])
+    run = voiced = 0
+    for level in levels:
+        run = run + 1 if level > loud else 0
+        if run == SYLLABLE_BLOCKS:
+            voiced += run
+        elif run > SYLLABLE_BLOCKS:
+            voiced += 1
+    return voiced >= SPEECH_BLOCKS
 
 
 async def read_recording(file: UploadFile) -> bytes:
@@ -946,17 +1006,10 @@ def spoken_words(reply: str) -> str:
     return reply[said.end() :].strip() if said.group(1).lower() == "yes" else ""
 
 
-@app.post("/api/conversations/{conversation_id}/transcribe")
-async def transcribe(conversation_id: str, file: UploadFile = File(...), context: str = Form("", max_length=2000)):
-    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as
-    hints. `context`: for a piece of a longer recording, the end of the text so far."""
-    client = app.state.chat_client
-    if client is None:
-        raise HTTPException(503, "GEMINI_API_KEY is not configured")
-    audio = await read_recording(file)
-    interview = await interview_in_memory(conversation_id)
-    if interview is None:
-        raise HTTPException(404, "Interview not found")
+async def transcribe_recording(client, interview: Interview, audio: bytes, context: str = "") -> tuple[str, str]:
+    """What's said in the recording, as Gemini writes it down with the interview's role and
+    vocabulary as hints ("" if no one speaks in it), and the model that wrote it. `context`: for a
+    piece of a longer recording, the end of the text so far."""
     settings = interview.settings
     prompt = TRANSCRIBE_PROMPT.format(
         role=settings["target_role"], interview_type=settings["interview_type"], terms=interview.terms()
@@ -966,12 +1019,14 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
     prompt += SPEECH_PROMPT
 
     async def attempt(model):
-        # A short limit: if Gemini is slow, the app tries the piece again, or uses Chrome's words.
-        # Writing down what was said needs no thinking, and skipping it makes replies quicker.
+        # Writing down what was said needs no thinking, and skipping it makes replies quicker. The
+        # deadline is the shortest Google allows: it refuses a shorter one with a 400, which once made
+        # every piece fail silently. The hedge sends a second try long before it, and the app gives
+        # a piece up after 8 s anyway, using Chrome's words.
         config = types.GenerateContentConfig(
             temperature=0,
             thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
-            http_options=types.HttpOptions(timeout=8000),
+            http_options=types.HttpOptions(timeout=10000),
         )
         config = settings_for(model, config)
         response = await client.aio.models.generate_content(
@@ -986,9 +1041,23 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
         )
         return spoken_words(response.text or ""), model
 
+    return await TRANSCRIBE_HEDGE.run(attempt)
+
+
+@app.post("/api/conversations/{conversation_id}/transcribe")
+async def transcribe(conversation_id: str, file: UploadFile = File(...), context: str = Form("", max_length=2000)):
+    """Transcribes a recorded question with Gemini, using the interview's role and vocabulary as
+    hints. `context`: for a piece of a longer recording, the end of the text so far."""
+    client = app.state.chat_client
+    if client is None:
+        raise HTTPException(503, "GEMINI_API_KEY is not configured")
+    audio = await read_recording(file)
+    interview = await interview_in_memory(conversation_id)
+    if interview is None:
+        raise HTTPException(404, "Interview not found")
     started = time.perf_counter()
     try:
-        text, model = await TRANSCRIBE_HEDGE.run(attempt)
+        text, model = await transcribe_recording(client, interview, audio, context)
     except Exception as exc:
         logger.exception("Gemini transcription failed")
         raise HTTPException(502, "Transcription failed") from exc
@@ -997,10 +1066,6 @@ async def transcribe(conversation_id: str, file: UploadFile = File(...), context
         model, len(audio), round((time.perf_counter() - started) * 1000), len(text),
     )  # fmt: skip
     return {"text": text}
-
-
-def ensure_session(cid: str):
-    database.run("INSERT INTO sessions(id) VALUES (?) ON CONFLICT (id) DO NOTHING", (cid,))
 
 
 def resume_context(settings, question: str):
@@ -1026,15 +1091,15 @@ def resume_context(settings, question: str):
 
 INTERVIEW_PROMPT = """You are helping a software engineer answer interview questions out loud.
 Write ONLY what the candidate would say to the interviewer, in the first person: not a lesson, an article or notes.
-Sound like a person talking: confident, warm and natural, the way a good engineer explains something across the table.
-Open with one short, plain sentence that gives the main idea, as a paragraph of its own. Then explain the reasoning, and add an example or a practical point when it helps.
+Sound like a person talking: confident, warm and natural, the way a good engineer explains something across the table. Use contractions (I'd, it's, that's), let sentences follow on from each other the way speech does ("so", "because", "which means", "the way I'd do it"), and speak from your own point of view ("what I'd watch out for", "the way I think about it") rather than stating facts about the topic one after another.
+Open with one short sentence that gives your main idea, as a paragraph of its own, said the way you'd say it ("Datadog is basically what I'd use to...", "The big difference is..."), never as a dictionary definition. Then talk the reasoning through, and add an example or a practical point when it helps.
 For a question with an exact answer that needs working out, such as what some code prints or the result of a calculation, walk through the steps briefly first and give the result at the end, checked. Never state a result and then correct it, and never think out loud ("wait", "let me re-check").
 Match the depth to the question: short for a definition, more for a design or a real-world scenario.
-After the opening sentence, write short paragraphs of two or three sentences each, never more, so the answer is easy to read while saying it. No headings, bullet lists, bold text or other formatting, and no openers like "Great question", unless the question really needs steps or code.
-For a "what is the difference" question, open with the idea that sets them apart, then say what each one is, each in its own short sentence, then when you would use each.
+After the opening sentence, use short paragraphs (two to four sentences), so the answer is easy to read while saying it, but keep each one flowing, not a list of facts. No headings, bullet lists, bold text or other formatting, and no openers like "Great question", unless the question really needs steps or code.
+For a "what is the difference" question, open with what sets them apart, then say what each one is and when you'd use each.
 For a troubleshooting or scenario question, walk through it in the order you would actually work: what you would check first, what that would tell you, and what you would do next.
 For a design question, describe the main pieces, how data moves between them, and one trade-off you would mention.
-When the question asks you to write something (code, a script, a query, a config file or a manifest), always write it in a code block, whatever the answer length and style: correct and minimal, then the approach (and its complexity, if it matters) in a few spoken sentences.
+Write code only when the question asks you to write something (code, a script, a query, a config file or a manifest): then always put it in a code block, whatever the answer length and style, correct and minimal, and follow it with the approach (and its complexity, if it matters) in a few spoken sentences. An explanation or design question gets no code block: at most a command or a line of code mentioned in passing.
 Be technically correct: plain words must never mean wrong facts.
 Never invent the candidate's employment history, achievements, projects or habits. Unless the resume shows it, don't claim experience ("in my last project", "I've found", "we had") or habits ("I always", "I usually"): say what you would do ("I'd...", "I would start by..."), or use a hypothetical example.
 For a follow-up question, use the earlier questions and answers to understand references such as "that project" or "why".
@@ -1046,26 +1111,25 @@ If a question is ambiguous, make a reasonable assumption and say it briefly.
 # Simple, balanced and technical go from everyday words to precise technical depth.
 STYLE_GUIDANCE = {
     "simple": (
-        "Answer style: simple. Explain it the way you would to a colleague, in everyday words. Keep sentences "
-        "short, mostly under 15 words, with one idea each: split a long sentence in two, and never define several "
-        'things in one sentence. Prefer plain words such as "use", "make sure" and "check" to stiff ones such as '
-        '"leverage", "utilize", "ensure" and "facilitate". When a technical term is needed, say what it means in '
-        "plain words the first time, and use no more than two or three in a sentence. For a concept, add an "
-        "everyday comparison only when it is simple and fits exactly, and never one whose words could be confused "
-        "with the terms you are explaining. End naturally: add a practical tip only when it really helps with this "
-        "question, in your own words, and don't end every answer the same way (for example, with \"A common "
-        'mistake is"). For example, asked the difference between a process and a thread: "Both run code, but they '
-        "share very different things. A process has its own memory. A thread lives inside a process and shares its "
-        "memory with the other threads. So threads are cheaper to start, but one bad thread can bring down the "
-        'whole process."'
+        "Answer style: simple. Explain it the way you would to a friend who's also an engineer, in everyday words. "
+        "Keep sentences short and clear, one idea each, but let each run on naturally into the next: it's talking, "
+        'not a list. Prefer plain words such as "use", "make sure" and "check" to stiff ones such as "leverage", '
+        '"utilize", "ensure" and "facilitate". When a technical term is needed, say what it means in plain words the '
+        "first time, and don't pile several into one sentence. For a concept, add an everyday comparison only when "
+        "it is simple and fits exactly, and never one whose words could be confused with the terms you are "
+        "explaining. End naturally: add a practical tip only when it really helps with this question, in your own "
+        'words, and don\'t end every answer the same way (for example, with "A common mistake is"). For example, '
+        'asked the difference between a process and a thread: "The big difference is what they share. A process has '
+        "its own memory, while a thread lives inside a process and shares that memory with the other threads, so "
+        'threads are cheaper to start, but one bad thread can bring the whole process down."'
     ),
     "balanced": (
         "Answer style: balanced. Talk like an experienced engineer explaining to another engineer. Keep sentences "
-        "fairly short, mostly under 20 words, with one idea each: split a long sentence in two, and give each thing "
-        "you compare its own sentence. Use the right technical terms, and explain only the less common ones, "
-        'briefly. Prefer plain verbs such as "use", "check" and "make sure" to stiff ones. Go one step below the '
-        "basics: name the key mechanism, tool or trade-off, without the deep internals. Skip everyday comparisons "
-        "unless one really helps, and don't end every answer the same way."
+        "fairly short and clear, one idea each, flowing on naturally rather than chopped up, and give each thing you "
+        "compare its own sentence. Use the right technical terms, and explain only the less common ones, briefly. "
+        'Prefer plain verbs such as "use", "check" and "make sure" to stiff ones. Go one step below the basics: name '
+        "the key mechanism, tool or trade-off, without the deep internals. Skip everyday comparisons unless one "
+        "really helps, and don't end every answer the same way."
     ),
     "technical": (
         "Answer style: technical. The interviewer expects depth: use precise technical terms without explaining the "
@@ -1079,9 +1143,9 @@ STYLE_GUIDANCE = {
 MODE_GUIDANCE = {
     "quick": (
         "Answer length: short, 40-60 words, about 20 seconds to say, whatever the answer style: two to four "
-        "sentences. Give the main point and the one detail that matters most, and leave everything else out. If the "
-        "question asks you to write something, still write the key part of it in a small code block, then one or two "
-        "sentences about it."
+        "sentences. Give the main point and the one detail that matters most, said naturally, and leave everything "
+        "else out. If the question asks you to write something, still write the key part of it in a small code "
+        "block, then one or two sentences about it."
     ),
     "balanced": (
         "Answer length: medium, roughly 70-130 words, about 30-60 seconds to say, whatever the answer style; "
@@ -1214,7 +1278,8 @@ def answer_config(style: str, length: str, tokens: int, context: str = ""):
     kwargs = dict(
         system_instruction=INTERVIEW_PROMPT + "\n" + STYLE_GUIDANCE[style] + "\n" + length + context,
         max_output_tokens=tokens,
-        temperature=0.35,
+        # Some variety in wording, as speech has; at 0.35 every answer read as the same formula.
+        temperature=0.6,
     )
     if THINKING_LEVEL:
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel[THINKING_LEVEL])
@@ -1285,7 +1350,7 @@ async def chained(head, stream):
 
 @app.post("/api/chat/stream")
 async def stream_chat(request: ChatRequest):
-    cid = request.conversation_id or str(uuid.uuid4())
+    cid = request.conversation_id
     client = app.state.chat_client
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
@@ -1301,11 +1366,8 @@ async def typed_question(cid: str, message: str, image_ids: tuple[str, ...], mod
     """What an answer to a typed question is asked with: the interview so far and the question
     (with its images), and the interview's settings."""
     interview, previous, images = await read_for_question(cid, image_ids)
-    if interview is None:  # an interview the app didn't make beforehand, as older versions didn't
-        if image_ids:
-            raise HTTPException(404, "Image not found")
-        await asyncio.to_thread(ensure_session, cid)
-        interview = await interview_in_memory(cid)
+    if interview is None:  # deleted meanwhile, say, from another tab that still showed it
+        raise HTTPException(404, "Interview not found")
     settings = interview.settings
     question = [*images, images_prompt(len(images))] if images else []
     question.append(types.Part.from_text(text=message if message.strip() else IMAGE_ONLY_QUESTION))
@@ -1361,11 +1423,50 @@ async def rewrite_request(cid: str, how: str, style: str):
     return [*previous, asked], config, old, question
 
 
-RECORDED_QUESTION_PROMPT = (
-    'The interview question is in this recording. First, on one line starting with "Q: ", write the question '
-    "exactly as spoken, in normal sentence case with punctuation, spelling technical terms the standard way "
-    "(terms that may come up include: {terms}). Then leave a blank line and answer the question as you normally would."
+RECORDED_QUESTION_PROMPT = "The interview question is in this recording. Answer it as you normally would."
+LIVE_WORDS_NOTE = ' A rough live transcript of it heard: "{heard}"; go by the recording where they differ.'
+# The sound is checked before a recording is sent (has_speech), so Gemini is told that someone
+# speaks in it: given a silent one, it makes up a question that fits the resume, and given one with
+# a word or two unclear, it gives up on the whole question. It's to give up only on a recording with
+# no question in it at all, in set words, which the app tells apart from an answer (gave_up) so
+# that it can answer the question as written down instead.
+CANT_MAKE_OUT = "I couldn't make out the question."
+SPEAKS_NOTE = (
+    " Someone speaks in the recording, so take the question as you hear it, going by{hints} the interview for a "
+    "word that's unclear. Only if it holds no question at all (a word or two cut off, noise, speech you can't "
+    'make out){either}, reply with exactly "{cant}" and nothing else: never guess one.'
 )
+NOTHING_HEARD = "Nothing was heard in the recording. Check that the microphone is working, and try again."
+# A reply that gives up on the question instead of answering it, however Gemini words that.
+GAVE_UP = re.compile(
+    r"\b(?:couldn[\u2019']t|could not|can[\u2019']t|cannot|didn[\u2019']t|did not|unable to)\s+(?:quite\s+)?"
+    r"(?:make out|catch|hear|understand|get|follow)\b.{0,60}\bquestion\b",
+    re.IGNORECASE,
+)
+
+
+def recorded_question_prompt(heard: str) -> str:
+    """What to do with a recorded question, with its live words to go by when it's unclear."""
+    if heard:
+        return (
+            RECORDED_QUESTION_PROMPT
+            + LIVE_WORDS_NOTE.format(heard=heard)
+            + SPEAKS_NOTE.format(
+                hints=" the live transcript and",
+                either=" and the live transcript holds none either",
+                cant=CANT_MAKE_OUT,
+            )
+        )
+    return (
+        RECORDED_QUESTION_PROMPT
+        + " The live transcript heard nothing in it."
+        + SPEAKS_NOTE.format(hints="", either="", cant=CANT_MAKE_OUT)
+    )
+
+
+def gave_up(answer: str) -> bool:
+    """Whether the answer says that the question couldn't be made out, rather than answering it."""
+    return len(answer) <= 200 and bool(GAVE_UP.search(answer))
 
 
 @app.post("/api/chat/stream-recording")
@@ -1378,9 +1479,11 @@ async def stream_chat_from_recording(
     image_ids: str = Form("", max_length=1000),
 ):
     """Answers a question sent as its recording, with `heard` its live words and `image_ids` (comma
-    separated) the images it was asked with. One Gemini request does it all: Gemini writes the
-    question down, which goes out as a "question" event and is saved as the question, then answers
-    it. Quicker than transcribing the recording and then asking."""
+    separated) the images it was asked with. Two Gemini requests go out at once: one writes the
+    whole question down, which goes out as a "question" event as soon as it's in and is saved as the
+    question, and one answers it. The question is written down as a whole, not pieced together, and
+    the answer doesn't wait for that. If Gemini can't make the question out from the recording but
+    has written it down, the question as written down is answered instead (see answer_events)."""
     client = app.state.chat_client
     if client is None:
         raise HTTPException(503, "GEMINI_API_KEY is not configured")
@@ -1389,14 +1492,26 @@ async def stream_chat_from_recording(
     if len(ids) > MAX_QUESTION_IMAGES:
         raise HTTPException(422, f"Send at most {MAX_QUESTION_IMAGES} images with a question")
     heard = heard.strip()
-    contents, config = await recorded_question(conversation_id, audio, ids, heard, mode, style)
-    events = answer_events(client, conversation_id, mode, contents, config, heard, True, ids, style=style)
+    if not await asyncio.to_thread(has_speech, audio):
+        # No one speaks in the recording (the candidate spoke before the microphone had opened, say):
+        # given it, Gemini would make a question up. The live words are the question, if there are any.
+        if not heard:
+            raise HTTPException(422, NOTHING_HEARD)
+        logger.info("No one speaks in the recording; answering its live words as text")
+        contents, config = await typed_question(conversation_id, heard, ids, mode, style)
+        return answer_response(
+            answer_events(client, conversation_id, mode, contents, config, heard, image_ids=ids, style=style)
+        )
+    contents, config, interview = await recorded_question(conversation_id, audio, ids, heard, mode, style)
+    transcription = asyncio.create_task(question_written_down(client, interview, audio))
+    events = answer_events(client, conversation_id, mode, contents, config, heard, transcription, ids, style=style)
     return answer_response(events)
 
 
 async def recorded_question(cid: str, audio: bytes, image_ids: tuple[str, ...], heard: str, mode: str, style: str):
     """What an answer to a recorded question is asked with: the interview so far, the recording
-    (with the question's images) and what to do with it, and the interview's settings."""
+    (with the question's images) and what to do with it, and the interview's settings. Also the
+    interview, as kept in memory."""
     interview, previous, images = await read_for_question(cid, image_ids)
     if interview is None:
         raise HTTPException(404, "Interview not found")
@@ -1404,79 +1519,66 @@ async def recorded_question(cid: str, audio: bytes, image_ids: tuple[str, ...], 
     question = [
         types.Part.from_bytes(data=audio, mime_type="audio/wav"),
         *([*images, images_prompt(len(images))] if images else []),
-        types.Part.from_text(text=RECORDED_QUESTION_PROMPT.format(terms=interview.terms())),
+        types.Part.from_text(text=recorded_question_prompt(heard)),
     ]
     contents = [*previous, types.Content(role="user", parts=question)]
     config = chat_config(mode, style, session_context(settings) + resume_context(settings, heard))
-    # Room for the question's line on top of the answer.
-    return contents, config.model_copy(update={"max_output_tokens": config.max_output_tokens + 200})
+    return contents, config, interview
 
 
-QUESTION_LINE = re.compile(r"\s*(?:\*\*)?Q(?:uestion)?(?:\*\*)?\s*:\s*(?:\*\*)?\s*", re.IGNORECASE)
-
-
-class QuestionLine:
-    """For a recorded question, Gemini first writes the question down on a line starting "Q: ".
-    feed() takes the streamed text, holds it back until that line is complete, then lets the answer
-    through. `question` is the question once known ("" if Gemini didn't write one)."""
-
-    def __init__(self):
-        self.question = None
-        self.held = ""
-        self.answering = False
-
-    def feed(self, text: str) -> str:
-        """The part of `text` that belongs to the answer."""
-        if self.question is None:
-            self.held += text
-            if "\n" not in self.held.lstrip() and len(self.held) < 500:
-                return ""
-            text = self._split()
-        return self._answer(text)
-
-    def finish(self) -> str:
-        """At the end of the stream: any answer text still held back."""
-        return "" if self.question is not None else self._answer(self._split())
-
-    def _split(self) -> str:
-        text, self.held = self.held.lstrip(), ""
-        match = QUESTION_LINE.match(text)
-        if not match:
-            self.question = ""
-            return text
-        line, _, rest = text[match.end() :].partition("\n")
-        self.question = line.strip().strip("*").strip()
-        return rest
-
-    def _answer(self, text: str) -> str:
-        if not self.answering:  # the blank line between the question and the answer
-            text = text.lstrip()
-            self.answering = bool(text)
-        return text
+async def question_written_down(client, interview: Interview, audio: bytes) -> Optional[str]:
+    """A recorded question as Gemini writes it down: "" if no one speaks in the recording, or None if
+    Gemini couldn't write it down (its live words are kept then)."""
+    started = time.perf_counter()
+    try:
+        text, model = await transcribe_recording(client, interview, audio)
+    except Exception as exc:
+        logger.warning("Couldn't write the recorded question down (%s); keeping its live words", exc)
+        return None
+    logger.info(
+        "question written down model=%s bytes=%s total_ms=%s chars=%s",
+        model, len(audio), round((time.perf_counter() - started) * 1000), len(text),
+    )  # fmt: skip
+    return text
 
 
 async def answer_events(
-    client, cid, mode, contents, config, question, from_recording=False, image_ids=(), style="simple", replacing=None
+    client, cid, mode, contents, config, question, transcription=None, image_ids=(), style="simple", replacing=None
 ):
     """The answer, streamed as NDJSON events, then saved with its question (and the ids of the
-    images it was asked with). For a recorded question, Gemini writes the question down first: it is
-    sent as a "question" event and saved in place of `question` (the live words, kept if Gemini
-    doesn't write one). With `replacing` (the interview's last answer), the answer is that one said
+    images it was asked with). For a recorded question, `transcription` is the task writing it down
+    meanwhile: its text goes out as a "question" event as soon as it's in, and is saved as the
+    question (`question`, the live words, is kept if Gemini can't write one; if no one speaks in the
+    recording and there are no live words either, the answer is dropped and an error says so). If
+    Gemini couldn't make the question out from the recording but has written it down, the question
+    as written down is answered instead, as text, in place of that reply (a "restart" event has the
+    app clear it). With `replacing` (the interview's last answer), the answer is that one said
     again, and takes its place; `mode` is then how it's said again, for the log."""
-    splitter = QuestionLine() if from_recording else None
+    question_sent = False
+    live_words = question
+
+    def nothing_heard():
+        """No one speaks in the recording, and the live recognition heard nothing either."""
+        return transcription.result() == "" and not live_words
 
     def question_event():
-        nonlocal question
-        question = splitter.question or question or "(spoken question)"
+        nonlocal question, question_sent
+        question_sent = True
+        question = transcription.result() or question or "(spoken question)"
         return json.dumps({"type": "question", "text": question}, ensure_ascii=False) + "\n"
 
     started = time.perf_counter()
     first_token = None
-    chunks = []
+    chunks: list[str] = []
     finish_reason = None
-    yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
-    try:
-        hedge = RECORDED_HEDGE if from_recording else ANSWER_HEDGE
+    answered_by = MODEL
+    heard_nothing = False  # the answer was dropped, and an error event said so
+
+    async def answer(contents, config, hedge):
+        """Streams the answer's events, keeping its text in `chunks`. If Gemini breaks off partway
+        (for example, "high demand"), the answer starts again, once, and a "restart" event has the
+        app clear what it showed of it."""
+        nonlocal first_token, finish_reason, answered_by, heard_nothing
         for attempt in range(2):
             stream, head, answered_by = await hedge.run(
                 lambda model: start_answer(client, contents, config, model), discard=close_answer
@@ -1490,35 +1592,56 @@ async def answer_events(
                         continue
                     if first_token is None:
                         first_token = time.perf_counter()
-                    if splitter:
-                        waiting = splitter.question is None
-                        delta = splitter.feed(delta)
-                        if waiting and splitter.question is not None:
-                            yield question_event()
-                        if not delta:
-                            continue
+                    if transcription and not question_sent and transcription.done():
+                        if nothing_heard():
+                            heard_nothing = True
+                            yield json.dumps({"type": "error", "message": NOTHING_HEARD}) + "\n"
+                            return
+                        yield question_event()
                     chunks.append(delta)
                     yield json.dumps({"type": "delta", "text": delta}, ensure_ascii=False) + "\n"
-                break
+                return
             except (errors.ServerError, httpx.HTTPError) as exc:
-                # Gemini broke off partway (for example, "high demand"). Start the answer again,
-                # once, and have the app clear what it showed of this one.
                 if attempt:
                     raise
                 logger.warning("Gemini answer broke off (%s); starting it again", exc)
                 chunks.clear()
                 finish_reason = None
-                if splitter:
-                    splitter = QuestionLine()
                 yield json.dumps({"type": "restart"}) + "\n"
             finally:
                 await stream.aclose()
-        if splitter and splitter.question is None:  # the stream ended within the first line
-            rest = splitter.finish()
+
+    yield json.dumps({"type": "start", "conversation_id": cid}) + "\n"
+    try:
+        events = answer(contents, config, RECORDED_HEDGE if transcription else ANSWER_HEDGE)
+        try:
+            async for event in events:
+                yield event
+        finally:
+            await events.aclose()  # closes Gemini's stream if the app stopped listening partway
+        if heard_nothing:
+            return
+        if transcription and not question_sent:
+            # Usually in by now: writing the question down takes about as long as the answer's first words.
+            await transcription
+            if nothing_heard():
+                yield json.dumps({"type": "error", "message": NOTHING_HEARD}) + "\n"
+                return
             yield question_event()
-            if rest:
-                chunks.append(rest)
-                yield json.dumps({"type": "delta", "text": rest}, ensure_ascii=False) + "\n"
+        if transcription and transcription.result() and gave_up("".join(chunks)):
+            # Gemini couldn't make the question out from the recording, but could write it down:
+            # the question as written down is answered instead, as text.
+            logger.info("Gemini couldn't make out the recorded question; answering it as written down")
+            yield json.dumps({"type": "restart"}) + "\n"
+            chunks.clear()
+            finish_reason = None
+            contents, config = await typed_question(cid, question, tuple(image_ids), mode, style)
+            events = answer(contents, config, ANSWER_HEDGE)
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
         if finish_reason == types.FinishReason.MAX_TOKENS:
             logger.warning("Answer hit the %s-token limit (mode=%s)", config.max_output_tokens, mode)
             if not "".join(chunks).strip():
@@ -1535,17 +1658,17 @@ async def answer_events(
                 return
             chunks.append(CUT_OFF_NOTE)
             yield json.dumps({"type": "delta", "text": CUT_OFF_NOTE}, ensure_ascii=False) + "\n"
-        answer = "".join(chunks).strip()
-        if not answer:
+        answer_text = "".join(chunks).strip()
+        if not answer_text:
             raise ValueError("Gemini returned an empty answer")
         # Only a complete answer is kept (failed or interrupted ones aren't): in memory at once, as
         # context for the next question, and in the database in the background, so the next
         # question needn't wait for that.
         if replacing is None:
-            interviews.add_turn(cid, question, answer, tuple(image_ids))
-            saver.add(cid, save_turn, cid, question, answer, tuple(image_ids))
-        elif interviews.replace_last_answer(cid, replacing, answer):
-            saver.add(cid, replace_answer, cid, replacing["content"], answer)
+            interviews.add_turn(cid, question, answer_text, tuple(image_ids))
+            saver.add(cid, save_turn, cid, question, answer_text, tuple(image_ids))
+        elif interviews.replace_last_answer(cid, replacing, answer_text):
+            saver.add(cid, replace_answer, cid, replacing["content"], answer_text)
         else:
             message = "Another question was answered meanwhile, so this answer wasn't kept."
             yield json.dumps({"type": "error", "message": message}) + "\n"
@@ -1559,8 +1682,8 @@ async def answer_events(
             style,
             first_ms,
             total_ms,
-            len(answer),
-            bool(splitter),
+            len(answer_text),
+            transcription is not None,
             replacing is not None,
         )
         yield (
@@ -1573,6 +1696,9 @@ async def answer_events(
     except Exception:
         logger.exception("Gemini streaming chat failed")
         yield json.dumps({"type": "error", "message": "Gemini request failed; check backend logs"}) + "\n"
+    finally:
+        if transcription and not transcription.done():
+            transcription.cancel()
 
 
 def answer_response(events):

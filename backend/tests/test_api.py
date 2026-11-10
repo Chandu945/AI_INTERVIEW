@@ -3,7 +3,10 @@
 import asyncio
 import io
 import json
+import math
 import os
+import random
+import struct
 import subprocess
 import sys
 import time
@@ -143,7 +146,7 @@ def test_each_answer_style_sends_its_own_guidance(client, gemini):
     fake = gemini(("An answer.", "STOP"))
 
     def sent_only(style):
-        prompt = fake.config.system_instruction
+        prompt = [r for r in fake.requests if r.kind == "answer"][-1].config.system_instruction
         return all((main.STYLE_GUIDANCE[s] in prompt) == (s == style) for s in main.STYLE_GUIDANCE)
 
     ask(client, cid)
@@ -154,7 +157,7 @@ def test_each_answer_style_sends_its_own_guidance(client, gemini):
         client.post(
             "/api/chat/stream-recording",
             data={"conversation_id": cid, "mode": "quick", "style": style, "heard": "what is rag"},
-            files={"file": ("question.wav", silence_wav(), "audio/wav")},
+            files={"file": ("question.wav", speech_wav(), "audio/wav")},
         )
         assert sent_only(style)
     body = {"message": QUESTION, "conversation_id": cid, "style": "fancy"}
@@ -164,6 +167,8 @@ def test_each_answer_style_sends_its_own_guidance(client, gemini):
 def test_update_rejects_bad_requests(client):
     cid = new_interview(client)
     assert client.patch(f"/api/conversations/{cid}", json={}).status_code == 422
+    assert client.patch(f"/api/conversations/{cid}", json={"title": "   "}).status_code == 422  # not saved as ""
+    assert client.post("/api/conversations", json={"target_role": "   "}).status_code == 422
     assert client.patch(f"/api/conversations/{cid}", json={"mode": "bogus"}).status_code == 422
     assert client.patch("/api/conversations/missing", json={"mode": "quick"}).status_code == 404
 
@@ -291,9 +296,23 @@ def test_chat_without_an_api_key_is_503(client):
 
 
 def test_question_over_10000_characters_is_rejected(client):
-    response = client.post("/api/chat/stream", json={"message": "x" * 10001})
+    body = {"message": "x" * 10001, "conversation_id": new_interview(client)}
+    response = client.post("/api/chat/stream", json=body)
     assert response.status_code == 422
     assert response.json()["detail"][0]["msg"] == "String should have at most 10000 characters"
+
+
+def test_a_question_for_an_interview_that_is_gone_is_turned_away(client, gemini):
+    """A tab that still shows a deleted interview can't bring it back by asking a question: the
+    interview isn't made again. A question needs an interview to belong to."""
+    cid = new_interview(client)
+    gemini(("An answer.", "STOP"))
+    ask(client, cid)
+    client.delete(f"/api/conversations/{cid}")
+    response = client.post("/api/chat/stream", json={"message": "Still there?", "conversation_id": cid})
+    assert (response.status_code, response.json()["detail"]) == (404, "Interview not found")
+    assert client.get("/api/conversations").json()["sessions"] == []
+    assert client.post("/api/chat/stream", json={"message": "Hi"}).status_code == 422
 
 
 # Saying the last answer again (the Shorter, Simpler and More detail buttons)
@@ -762,6 +781,30 @@ def silence_wav(seconds=0.1):
     return buffer.getvalue()
 
 
+def sound_wav(seconds, sample):
+    """A 16 kHz mono recording `seconds` long, with sample(n) its nth sample."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(16000)
+        recording.writeframes(b"".join(struct.pack("<h", sample(n)) for n in range(int(16000 * seconds))))
+    return buffer.getvalue()
+
+
+def speech_wav(seconds=0.6):
+    """Something like speech: sound that comes and goes, 0.1 s at a time."""
+    return sound_wav(
+        seconds, lambda n: int(8000 * math.sin(n * 2 * math.pi * 300 / 16000)) if (n // 1600) % 2 == 0 else 0
+    )
+
+
+def noise_wav(seconds=0.6):
+    """A faint, steady noise, as a fan makes."""
+    steady = random.Random(1)
+    return sound_wav(seconds, lambda n: int(steady.gauss(0, 150)))
+
+
 def send_recording(client, cid, data=None, content_type="audio/wav"):
     audio = silence_wav() if data is None else data
     return client.post(f"/api/conversations/{cid}/transcribe", files={"file": ("question.wav", audio, content_type)})
@@ -776,6 +819,7 @@ def test_transcription_uses_the_interview_as_hints(client, gemini):
     assert send_recording(client, cid).json() == {"text": "What is a DAG in Airflow?"}
     prompt, audio = fake.contents[0].parts
     assert fake.config.thinking_config.thinking_level == types.ThinkingLevel.MINIMAL  # quicker
+    assert fake.config.http_options.timeout >= 10_000  # Google refuses a shorter deadline with a 400
     assert "Data Engineer (Mixed interview)" in prompt.text
     for term in ("LangChain", "PostgreSQL", "PySpark", "TensorFlow", "S3", "AWS"):
         assert term in prompt.text
@@ -836,11 +880,11 @@ def test_transcription_problems_are_reported(client, gemini):
     assert send_recording(client, cid).status_code == 502
 
 
-# Questions sent as their recording: Gemini writes the question down and answers it in one go.
+# Questions sent as their recording: Gemini writes the question down and answers it, at the same time.
 
 
 def ask_recording(client, cid, heard="what is rag", data=None, content_type="audio/wav"):
-    audio = silence_wav() if data is None else data
+    audio = speech_wav() if data is None else data
     return client.post(
         "/api/chat/stream-recording",
         data={"conversation_id": cid, "mode": "quick", "heard": heard},
@@ -852,60 +896,109 @@ def events_of(response):
     return [json.loads(line) for line in response.text.splitlines() if line.strip()]
 
 
-def test_a_recorded_question_is_written_down_and_answered_in_one_go(client, gemini):
+def answer_request(fake):
+    """The last request for an answer (the other kind writes a recording down)."""
+    return [request for request in fake.requests if request.kind == "answer"][-1]
+
+
+def test_a_recorded_question_is_written_down_and_answered_at_the_same_time(client, gemini):
     cid = new_interview(client, job_description="We use PostgreSQL.")
-    # The question's line arrives in pieces, as it would from Gemini.
-    fake = gemini(("Q", None), (": What is RAG", None), ("?\n", None), ("\nRAG pairs a retriever", None), (" with a model.", "STOP"))  # fmt: skip
+    fake = gemini(("RAG pairs a retriever", None), (" with a model.", "STOP"))
+    fake.transcript = "SPEECH: yes\nWhat is RAG?"
+    fake.delays = [0, 0.05]  # the question is written down before the answer's first words come
     events = events_of(ask_recording(client, cid))
     assert [e["type"] for e in events] == ["start", "question", "delta", "delta", "done"]
     assert events[1]["text"] == "What is RAG?"
     assert "".join(e["text"] for e in events if e["type"] == "delta") == "RAG pairs a retriever with a model."
-    audio, prompt = fake.contents[-1].parts
+    # Two requests, both with the recording: one writes the question down, the other answers it.
+    written, answered = fake.requests
+    assert (written.kind, answered.kind) == ("transcription", "answer")
+    hints, recording = written.contents[0].parts
+    assert hints.text.startswith("Transcribe this recording") and "PostgreSQL" in hints.text
+    assert recording.inline_data.mime_type == "audio/wav"
+    audio, prompt = answered.contents[-1].parts
     assert audio.inline_data.mime_type == "audio/wav"
-    assert 'starting with "Q: "' in prompt.text and "PostgreSQL" in prompt.text
+    assert "Answer it as you normally would" in prompt.text
+    assert 'heard: "what is rag"' in prompt.text and "never guess one" in prompt.text  # not made up if unclear
+    assert "Someone speaks in the recording" in prompt.text  # the sound was checked, so it's not to give up lightly
     assert [m["content"] for m in saved_messages(client, cid)] == [
         "What is RAG?",
         "RAG pairs a retriever with a model.",
     ]
 
 
+def test_speech_is_told_from_silence_and_steady_noise():
+    """Given a recording with no one speaking in it, Gemini makes up a question that fits the
+    interview, however it's asked not to, so the sound is checked first: speech rises and falls."""
+    assert main.has_speech(speech_wav())
+    assert not main.has_speech(silence_wav(2))
+    assert not main.has_speech(noise_wav())
+    assert main.has_speech(b"not a wav")  # can't tell: Gemini decides
+
+
+def test_a_recording_with_no_one_speaking_in_it_never_reaches_gemini(client, gemini):
+    """The candidate spoke before the microphone had opened, say. With no live words either, the app
+    says nothing was heard; with live words, they are the question, sent as text."""
+    cid = new_interview(client)
+    fake = gemini(("I'm a software developer who builds RAG pipelines.", "STOP"))
+    response = ask_recording(client, cid, heard="", data=silence_wav(2))
+    assert (response.status_code, response.json()["detail"]) == (422, main.NOTHING_HEARD)
+    assert fake.calls == 0 and saved_messages(client, cid) == []
+    events = events_of(ask_recording(client, cid, heard="explain about yourself", data=noise_wav()))
+    assert [e["type"] for e in events] == ["start", "delta", "done"]
+    assert [r.kind for r in fake.requests] == ["answer"]  # the recording itself went nowhere
+    assert fake.contents[-1].parts[-1].text == "explain about yourself"
+    assert [m["content"] for m in saved_messages(client, cid)] == [
+        "explain about yourself",
+        "I'm a software developer who builds RAG pipelines.",
+    ]
+
+
+def test_the_answer_doesnt_wait_for_the_question_to_be_written_down(client, gemini):
+    """If its text is in later, it comes later, and is still the one saved."""
+    cid = new_interview(client)
+    fake = gemini(("Retrieval first.", "STOP"))
+    fake.transcript = "What is RAG?"
+    fake.delays = [0.3, 0]  # writing the question down (the first request) takes longer than the answer
+    events = events_of(ask_recording(client, cid))
+    assert [e["type"] for e in events] == ["start", "delta", "question", "done"]
+    assert events[2]["text"] == "What is RAG?"
+    assert [m["content"] for m in saved_messages(client, cid)] == ["What is RAG?", "Retrieval first."]
+
+
 def test_a_recorded_question_goes_with_its_images(client, gemini):
     cid = new_interview(client)
     image_id = add_image(client, cid).json()["image_id"]
-    fake = gemini(("Q: What does this print?\n\nIt prints 3.", "STOP"))
+    fake = gemini(("It prints 3.", "STOP"))
+    fake.transcript = "What does this print?"
     response = client.post(
         "/api/chat/stream-recording",
         data={"conversation_id": cid, "mode": "quick", "heard": "what does this print", "image_ids": image_id},
-        files={"file": ("question.wav", silence_wav(), "audio/wav")},
+        files={"file": ("question.wav", speech_wav(), "audio/wav")},
     )
     assert events_of(response)[-1]["type"] == "done"
-    audio, image, about_images, prompt = fake.contents[-1].parts
+    audio, image, about_images, prompt = answer_request(fake).contents[-1].parts
     assert (audio.inline_data.mime_type, image.inline_data.mime_type) == ("audio/wav", "image/png")
     assert about_images.text.startswith("The candidate shared an image with this question")
-    assert 'starting with "Q: "' in prompt.text
+    assert "Answer it as you normally would" in prompt.text
     assert saved_messages(client, cid)[0] == {"role": "user", "content": "What does this print?", "images": [image_id]}
 
 
-def test_without_a_question_line_the_live_words_are_kept_as_the_question(client, gemini):
+def test_if_the_question_cant_be_written_down_its_live_words_are_kept(client, gemini):
     cid = new_interview(client)
-    gemini(("RAG pairs a retriever with a model.", "STOP"))
+    fake = gemini(("RAG pairs a retriever with a model.", "STOP"))
+    fake.transcript = RuntimeError("Gemini is busy")
     events = events_of(ask_recording(client, cid, heard="what is rag"))
-    assert events[1] == {"type": "question", "text": "what is rag"}
-    assert events[2] == {"type": "delta", "text": "RAG pairs a retriever with a model."}
+    assert events[-1]["type"] == "done"
+    assert [e for e in events if e["type"] == "question"] == [{"type": "question", "text": "what is rag"}]
+    assert "".join(e["text"] for e in events if e["type"] == "delta") == "RAG pairs a retriever with a model."
     assert saved_messages(client, cid)[0]["content"] == "what is rag"
-
-
-def test_the_question_line_is_found_however_it_is_written():
-    for first in ("Q: What is RAG?", "**Q:** What is RAG?", "Question: What is RAG?"):
-        splitter = main.QuestionLine()
-        answer = splitter.feed(first + "\n\n") + splitter.feed("Retrieval first.")
-        assert (splitter.question, answer) == ("What is RAG?", "Retrieval first.")
 
 
 def test_recorded_questions_are_checked(client, gemini):
     cid = new_interview(client)
     assert ask_recording(client, cid).status_code == 503  # no API key
-    gemini(("Q: Hi?\n\nHello.", "STOP"))
+    gemini(("Hello.", "STOP"))
     assert ask_recording(client, cid, content_type="audio/webm").status_code == 415
     assert ask_recording(client, cid, data=b"").status_code == 400
     assert ask_recording(client, "missing").status_code == 404
@@ -1049,13 +1142,59 @@ def test_an_answer_that_breaks_off_twice_reports_an_error(client, gemini):
     assert saved_messages(client, cid) == []
 
 
-def test_a_recorded_question_that_breaks_off_is_written_down_again(client, gemini):
+def test_a_recorded_question_that_breaks_off_keeps_its_question(client, gemini):
     cid = new_interview(client)
-    fake = gemini(("Q: What is RAG?\n\n", None), ("Retrieval first.", "STOP"))
-    fake.breaks = [SERVER_ERROR]
+    fake = gemini(("Retrieval first. ", None), ("Then generation.", "STOP"))
+    fake.transcript = "What is RAG?"
+    fake.delays = [0, 0.05]
+    fake.breaks = [None, SERVER_ERROR]  # the first answer (the second request) breaks off after its first words
     events = events_of(ask_recording(client, cid))
-    assert [e["type"] for e in events] == ["start", "question", "restart", "question", "delta", "done"]
-    assert [m["content"] for m in saved_messages(client, cid)] == ["What is RAG?", "Retrieval first."]
+    assert [e["type"] for e in events] == ["start", "question", "delta", "restart", "delta", "delta", "done"]
+    assert [m["content"] for m in saved_messages(client, cid)] == ["What is RAG?", "Retrieval first. Then generation."]
+
+
+def test_if_the_question_cant_be_made_out_from_the_recording_the_one_written_down_is_answered(client, gemini):
+    """Gemini gives up on a recording with a word or two unclear in it, while writing it down well
+    enough: the question as written down is answered instead, as text, in place of that reply."""
+    cid = new_interview(client)
+    fake = gemini(("RAG pairs a retriever", None), (" with a model.", "STOP"))
+    fake.answers = [(("I couldn't quite catch that question, could you please repeat it?", "STOP"),)]
+    fake.transcript = "SPEECH: yes\nWhat is RAG?"
+    fake.delays = [0, 0.05]
+    events = events_of(ask_recording(client, cid))
+    assert [e["type"] for e in events] == ["start", "question", "delta", "restart", "delta", "delta", "done"]
+    assert events[1]["text"] == "What is RAG?"
+    assert "".join(e["text"] for e in events[4:6]) == "RAG pairs a retriever with a model."
+    written, from_recording, from_text = fake.requests
+    assert [r.kind for r in fake.requests] == ["transcription", "answer", "answer"]
+    assert from_recording.contents[-1].parts[0].inline_data.mime_type == "audio/wav"
+    (asked,) = from_text.contents[-1].parts  # the question as written down, as text
+    assert asked.text == "What is RAG?" and asked.inline_data is None
+    assert [m["content"] for m in saved_messages(client, cid)] == [
+        "What is RAG?",
+        "RAG pairs a retriever with a model.",
+    ]
+
+
+def test_a_question_that_cant_be_made_out_or_written_down_keeps_the_reply(client, gemini):
+    cid = new_interview(client)
+    fake = gemini((main.CANT_MAKE_OUT, "STOP"))
+    fake.transcript = RuntimeError("Gemini is down")
+    fake.delays = [0.05, 0]  # the answer is in before writing the question down fails
+    events = events_of(ask_recording(client, cid, heard="what is"))
+    assert [e["type"] for e in events] == ["start", "delta", "question", "done"]
+    assert events[2]["text"] == "what is"  # the live words
+    assert [r.kind for r in fake.requests if r.kind == "answer"] == ["answer"]  # not answered again as text
+    assert [m["content"] for m in saved_messages(client, cid)] == ["what is", main.CANT_MAKE_OUT]
+
+
+def test_a_reply_that_gives_up_on_the_question_is_told_from_an_answer():
+    assert main.gave_up(main.CANT_MAKE_OUT)
+    assert main.gave_up("I couldn't quite catch that question, could you please repeat it?")
+    assert main.gave_up("Sorry, I didn\u2019t catch the question. Could you say it again?")
+    assert main.gave_up("I'm unable to make out a question in that recording.")
+    assert not main.gave_up("RAG pairs a retriever with a model, so the model can answer the question from your data.")
+    assert not main.gave_up("I couldn't make out the question at first, but " + "the gist is this. " * 20)
 
 
 def test_a_slow_transcription_is_requested_again(client, gemini, monkeypatch):
@@ -1076,13 +1215,14 @@ def test_a_slow_answer_to_a_recording_is_requested_again_on_its_own_timing(clien
     # An answer to a recording starts later than a typed one, so it has its own retry timing.
     monkeypatch.setattr(main.RECORDED_HEDGE, "minimum", 0.3)
     cid = new_interview(client)
-    fake = gemini(("Q: What is RAG?\n\nRetrieval first.", "STOP"))
-    fake.delays = [10, 0]
+    fake = gemini(("Retrieval first.", "STOP"))
+    fake.transcript = "What is RAG?"
+    fake.delays = [0, 10, 0]  # the question is written down at once; the first answer hangs
     started = time.perf_counter()
     events = events_of(ask_recording(client, cid))
     assert time.perf_counter() - started < 1.2  # retried after 0.3 s, not a typed answer's 1.5 s
     assert events[1] == {"type": "question", "text": "What is RAG?"} and events[-1]["type"] == "done"
-    assert fake.models == [main.MODEL, "backup-model"]
+    assert fake.models == [main.MODEL, main.MODEL, "backup-model"]
 
 
 def test_the_retry_waits_twice_a_quick_reply():
@@ -1100,6 +1240,8 @@ def test_the_retry_waits_twice_a_quick_reply():
 
 
 def test_the_app_retries_after_one_and_a_half_quick_replies():
+    for hedge in (main.ANSWER_HEDGE, main.RECORDED_HEDGE, main.TRANSCRIBE_HEDGE):
+        hedge.recent.clear()  # timings the tests before left behind
     main.ANSWER_HEDGE.recent.extend([1.0, 1.1, 1.2, 1.3])
     assert main.ANSWER_HEDGE.delay() == 1.5 * 1.1
     main.TRANSCRIBE_HEDGE.recent.extend([1.8, 1.9, 2.0, 2.2])

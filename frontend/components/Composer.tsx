@@ -321,6 +321,17 @@ export function Composer({
           {busy ? 'Sending…' : 'Send ↗'}
         </button>
       </div>
+      {/* Right under the buttons, where it's seen: at the bottom of the panel it was off the screen. */}
+      {error && (
+        <div className="error-banner" role="alert">
+          {error}{' '}
+          {failedDraft !== null && (
+            <button className="btn subtle" onClick={onSend} disabled={busy}>
+              Retry question
+            </button>
+          )}
+        </div>
+      )}
       <div className="answer-mode-wrap">
         <label htmlFor="answer-mode">Interview answer length</label>
         <div className="answer-mode-options" role="group" aria-label="Interview answer length">
@@ -419,16 +430,6 @@ export function Composer({
         <br />
         Shortcut: <kbd>Enter</kbd> to send, <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line.
       </div>
-      {error && (
-        <div className="error-banner" role="alert">
-          {error}{' '}
-          {failedDraft !== null && (
-            <button className="btn subtle" onClick={onSend} disabled={busy}>
-              Retry question
-            </button>
-          )}
-        </div>
-      )}
     </section>
   );
 }

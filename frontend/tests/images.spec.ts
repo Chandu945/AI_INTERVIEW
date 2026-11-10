@@ -1,5 +1,14 @@
 import { expect, test, type Page } from '@playwright/test';
-import { API, openApp, openInterview, waitForAnswer } from './helpers';
+import {
+  API,
+  chatRequests,
+  chatUrls,
+  cutPiece,
+  forgetRequests,
+  openApp,
+  openInterview,
+  waitForAnswer,
+} from './helpers';
 
 // Images with a question: added from the picker, pasted or dropped, uploaded at once, and sent
 // with the question. Answers are faked (see helpers.ts); images go to the test backend.
@@ -147,6 +156,39 @@ test("if the question can't be answered, its images come back to send again", as
   await expect(page.locator('.attachment.ready')).toHaveCount(1);
   await expect(page.getByLabel('Your message')).toHaveValue('What does this print?');
   await expect(page.getByRole('button', { name: 'Retry question' })).toBeVisible();
+});
+
+test("if an image can't be uploaded at Send, the dictated words stay, and Retry sends the recording", async ({
+  page,
+}) => {
+  // Sent while words are still being heard, so the question goes with its recording.
+  await page.route(`${API}/api/conversations/*/images`, route =>
+    route.fulfill({ status: 500, json: { detail: 'Boom' } }),
+  );
+  await page.evaluate(() => {
+    window.__streams(50, 3);
+    window.__transcripts = ['What is RAG?'];
+    window.__transcript = 'What is RAG?';
+  });
+  await page.locator('.mic-btn').click();
+  await page.evaluate(() => window.__say('what is rag'));
+  await page.waitForTimeout(500);
+  await cutPiece(page);
+  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG?');
+  await picker(page).setInputFiles(png('code.png'));
+  await expect(page.locator('.attachment.failed')).toHaveCount(1);
+  await forgetRequests(page);
+  await page.evaluate(() => window.__sayInterim('and why')); // not written down yet
+  await page.getByRole('button', { name: /Send/ }).click();
+  await expect(page.locator('.error-banner')).toContainText("An image couldn't be uploaded");
+  await expect(page.getByLabel('Your message')).toHaveValue('What is RAG? and why'); // the words aren't lost
+  await expect(page.locator('.mic-btn')).toContainText('Start speaking');
+  expect(await chatRequests(page)).toBe(0);
+  await page.getByRole('button', { name: 'Remove code.png' }).click();
+  await page.getByRole('button', { name: 'Retry question' }).click();
+  await expect(page.locator('.message.user').last()).toContainText('What is RAG?');
+  await waitForAnswer(page);
+  expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]); // the recording, kept
 });
 
 test('Clear takes the images off too', async ({ page }) => {

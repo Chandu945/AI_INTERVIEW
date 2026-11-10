@@ -85,7 +85,9 @@ async function transcribe(id: string, piece: Waiting, context: string): Promise<
  * text is added to the draft when it is back, 1 to 2 seconds later. Meanwhile the words Chrome
  * heard in it are shown in gray (`waiting`). Pieces are written down one at a time, in order. A
  * piece Gemini can't write down goes again with the next one (or on its own, once listening has
- * stopped); if that fails too, Chrome's words for it are used.
+ * stopped); if that fails too, Chrome's words for it are used. Once all of that text is in, it's
+ * the question; sent sooner, the question goes with its recording (see handOver), for Gemini to
+ * write down as a whole.
  */
 export function useTranscriptImprover({ draftRef, updateDraft, conversationId }: Options) {
   const [enabled, setEnabledState] = useState(true);
@@ -251,8 +253,8 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
   }, [changed]);
 
   /**
-   * Whether the question may go as the dictation's recording: the draft is the dictation's text
-   * alone, and no earlier dictation's text is still to come, so the recording has all of it.
+   * Whether the question may go as the dictation's recording: the box holds the dictation's text
+   * alone (nothing typed in or there before), and no earlier dictation's text is still to come.
    */
   const mayHandOver = useCallback(
     (dictation: Dictation | null): dictation is Dictation =>
@@ -268,38 +270,45 @@ export function useTranscriptImprover({ draftRef, updateDraft, conversationId }:
     [draftRef],
   );
 
+  /** Whether the box holds the whole dictation as Gemini wrote it, so there's nothing more to write down. */
+  const written = (dictation: Dictation) =>
+    !dictation.usedChrome && !queueRef.current.some(piece => piece.dictation === dictation);
+
   /**
-   * Call when Send is pressed while listening, saying whether words are still being recognized.
-   * Returns true if the question should go at once with its recording, because its text isn't
-   * all in yet; its pieces are then dropped. False if all its text is in, or the box has more than
-   * its text (typed, or there before), or it's too long to go with the question: then listening
-   * is stopped as usual and the text sent.
+   * Call when Send is pressed while listening, with whether words were said that aren't in the box
+   * yet (`unwritten`). Returns how the question goes, at once: as its 'text', if the box holds the
+   * whole dictation as Gemini wrote it, or with its 'recording', for Gemini to write down as a
+   * whole, if words are still to be written down or some of the text is Chrome's. Its pieces are
+   * then dropped. Null if the box has more than this dictation's text (typed, or there before), or
+   * the recording is too long to go with the question: then listening is stopped as usual and the
+   * text sent.
    */
   const handOverNow = useCallback(
-    (wordsPending: boolean) => {
+    (unwritten: boolean): 'text' | 'recording' | null => {
       const dictation = dictationRef.current;
-      if (!mayHandOver(dictation) || dictation.stopped || dictation.seconds > 110) return false;
-      if (!wordsPending && !pendingFor(dictation)) return false;
+      if (!mayHandOver(dictation) || dictation.stopped) return null;
+      const asText = !unwritten && written(dictation);
+      if (!asText && dictation.seconds > 110) return null;
       dictation.dropped = true;
       changed();
       setStatus('idle');
-      return true;
+      return asText ? 'text' : 'recording';
     },
     [changed, mayHandOver],
   );
 
   /**
-   * Call when sending after listening stopped (say, while its last words are being written down).
-   * If its text isn't all in yet, returns its recording and its words so far, so the question can
-   * go at once, and drops its pieces. Null if all its text is in, or the above rules out sending
-   * the recording: then its text is sent.
+   * Call when sending after listening stopped. Returns the dictation's recording and its words so
+   * far (the box's text, and any still in gray), so the question can go with it, and drops its
+   * pieces. Null if the above rules out sending the recording, or the box holds the whole
+   * dictation as Gemini wrote it: then the text is sent.
    */
   const handOver = useCallback(async (): Promise<HandOff | null> => {
     const dictation = dictationRef.current;
-    if (!mayHandOver(dictation) || !dictation.audio || !pendingFor(dictation)) return null;
+    if (!mayHandOver(dictation) || !dictation.audio || written(dictation)) return null;
     const audio = await dictation.audio;
     // Checked again, as things may have changed meanwhile.
-    if (!audio || audio.size > TWO_MINUTES || !mayHandOver(dictation) || !pendingFor(dictation)) return null;
+    if (!audio || audio.size > TWO_MINUTES || !mayHandOver(dictation)) return null;
     const heard = join(draftRef.current, waitingWords());
     dictation.dropped = true;
     changed();

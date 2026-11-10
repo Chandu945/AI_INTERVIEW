@@ -392,11 +392,13 @@ test('Send while words are still being heard goes at once, without waiting for t
   expect(await transcribeRequests(page)).toBe(0);
 });
 
-test('Send once all the text is in sends the text', async ({ page }) => {
+test('Send once all the text is in sends it as Gemini wrote it, without writing the recording down again', async ({
+  page,
+}) => {
   await page.evaluate(() => {
     window.__streams(50, 5);
-    window.__transcripts = ['What is RAG in LangChain?'];
-    window.__transcript = '';
+    window.__transcripts = ['What is RAG in LangChain?']; // the piece: the whole question, written down
+    window.__transcript = 'What is RAG in LangChain, and why?'; // what the recording would be written down as
   });
   await forgetRequests(page);
   await page.locator('.mic-btn').click();
@@ -407,7 +409,35 @@ test('Send once all the text is in sends the text', async ({ page }) => {
   await page.getByRole('button', { name: /Send/ }).click();
   await expect(page.locator('.message.user').last()).toContainText('What is RAG in LangChain?');
   await waitForAnswer(page);
-  expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]);
+  expect(await chatUrls(page)).toEqual([expect.stringMatching(/\/api\/chat\/stream$/)]); // as text
+  expect(await page.evaluate(() => window.__heard)).toBeNull();
+  await expect(page.locator('.message.user').last()).toContainText('What is RAG in LangChain?'); // and so it stays
+  await expect(page.locator('.mic-btn')).toContainText('Start speaking');
+});
+
+test('the microphone stays open for a while after you stop, so the next dictation starts at once', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__micHoldMs = 1_500;
+  });
+  const mic = page.locator('.mic-btn');
+  const states = () => page.evaluate(() => window.__micTracks.map(track => track.readyState));
+  await mic.click();
+  await expect(page.locator('.status-text')).toHaveText('Listening live');
+  await mic.click(); // Stop
+  await expect(mic).toContainText('Start speaking');
+  expect(await page.evaluate(() => window.__micOpens)).toBe(1);
+  expect(await states()).toEqual(['live']); // kept open
+  await mic.click(); // again, from the mic kept open
+  await expect(page.locator('.status-text')).toHaveText('Listening live');
+  expect(await page.evaluate(() => window.__micOpens)).toBe(1);
+  await mic.click();
+  await expect(mic).toContainText('Start speaking');
+  await expect.poll(states, { timeout: 5_000 }).toEqual(['ended']); // let go once the hold is over
+  await mic.click(); // opened afresh
+  await expect(page.locator('.status-text')).toHaveText('Listening live');
+  expect(await page.evaluate(() => window.__micOpens)).toBe(2);
+  await mic.click();
+  await expect(mic).toContainText('Start speaking');
 });
 
 test('a dictated question that was typed in is sent as its text', async ({ page }) => {
@@ -443,6 +473,21 @@ test("if a recorded question can't be answered, its words come back to the box",
   expect(await chatUrls(page)).toEqual([expect.stringContaining('/api/chat/stream-recording')]);
   await expect(page.getByLabel('Your message')).toHaveValue('what is a pod');
   await expect(page.getByRole('button', { name: 'Retry question' })).toBeVisible();
+  // The error is right under the buttons, not at the bottom of the panel where it was off the screen.
+  const banner = (await page.locator('.error-banner').boundingBox())!;
+  const send = (await page.getByRole('button', { name: /Send/ }).boundingBox())!;
+  const lengths = (await page.getByRole('group', { name: 'Interview answer length' }).boundingBox())!;
+  expect(banner.y).toBeGreaterThan(send.y + send.height);
+  expect(banner.y + banner.height).toBeLessThanOrEqual(lengths.y);
+  // Retry sends the recording again, so Gemini can still write the question down; edited, it goes as its text.
+  await page.getByRole('button', { name: 'Retry question' }).click();
+  await expect.poll(() => chatUrls(page)).toHaveLength(2);
+  expect((await chatUrls(page))[1]).toContain('/api/chat/stream-recording');
+  await expect(page.locator('.error-banner')).toContainText('GEMINI_API_KEY');
+  await page.getByLabel('Your message').fill('what is a pod in kubernetes');
+  await page.getByRole('button', { name: 'Retry question' }).click();
+  await expect.poll(() => chatUrls(page)).toHaveLength(3);
+  expect((await chatUrls(page))[2]).toMatch(/\/api\/chat\/stream$/);
 });
 
 test('Gemini writing the text down can be turned off', async ({ page }) => {

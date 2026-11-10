@@ -47,7 +47,7 @@ export const api = {
   askQuestion: (
     body: {
       message: string;
-      conversation_id: string | null;
+      conversation_id: string;
       mode: AnswerMode;
       style: AnswerStyle;
       image_ids: string[];
@@ -92,6 +92,11 @@ export function errorMessage(data: unknown, fallback: string): string {
     if (messages.length) return messages.join('; ');
   }
   return fallback;
+}
+
+/** The error to show for a response that isn't ok: the backend's own message, when it sent one. */
+export async function responseError(response: Response, fallback: string): Promise<Error> {
+  return new Error(errorMessage(await response.json().catch(() => null), fallback));
 }
 
 /** Reads a streamed answer (one JSON event per line) and calls onEvent for each event. */

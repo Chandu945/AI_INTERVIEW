@@ -3,13 +3,16 @@ PostgreSQL too), and what's particular to PostgreSQL."""
 
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import database
 import main
 from copy_to_postgres import copy_interviews
-from database import Database, client_url
+from database import Database, DatabaseUnavailable, client_url
 
 POSTGRES = os.environ.get("TEST_POSTGRES") == "1"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
@@ -33,6 +36,31 @@ def test_a_block_that_fails_is_undone(client):
             db.execute("UPDATE sessions SET title=? WHERE id=?", ("Changed", cid))
             raise ValueError("something went wrong")
     assert client.get(f"/api/conversations/{cid}").json()["session"]["title"] == "New Interview"
+
+
+@pytest.mark.skipif(POSTGRES, reason="SQLite only")
+def test_a_locked_sqlite_file_is_said_to_be_out_of_reach(client, monkeypatch):
+    """So the saver tries the write again (see test_saving_is_tried_again_until_the_database_is_back)
+    instead of dropping it. sqlite3 waits 5 s for the lock by default; here, 50 ms."""
+    real_connect = database.sqlite3.connect
+    monkeypatch.setattr(database.sqlite3, "connect", lambda path, **kw: real_connect(path, timeout=0.05, **kw))
+
+    def hold_the_file(seconds):
+        holder = real_connect(main.database.path, isolation_level=None)
+        holder.execute("BEGIN EXCLUSIVE")
+        time.sleep(seconds)
+        holder.execute("COMMIT")
+        holder.close()
+
+    other_writer = threading.Thread(target=hold_the_file, args=(0.6,))
+    other_writer.start()
+    time.sleep(0.15)
+    try:
+        with pytest.raises(DatabaseUnavailable):
+            with main.connect() as db:
+                db.execute("UPDATE sessions SET title=? WHERE id=?", ("x", "none"))
+    finally:
+        other_writer.join()
 
 
 def test_settings_for_other_tools_are_left_out_of_a_database_url():

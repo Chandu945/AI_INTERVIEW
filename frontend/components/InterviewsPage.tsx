@@ -86,7 +86,7 @@ export function InterviewsPage({
       <div className="page-head">
         <div>
           <h2>Interviews</h2>
-          <p>Your practice interviews, saved on this computer.</p>
+          <p>Your practice interviews, latest first.</p>
         </div>
         <button type="button" className="btn primary" onClick={onNewInterview}>
           + New interview

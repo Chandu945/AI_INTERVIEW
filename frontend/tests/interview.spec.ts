@@ -205,6 +205,19 @@ test('an answer that could not be said again is put back, with the reason', asyn
   await expect(page.getByRole('group', { name: 'Say this answer again' })).toHaveCount(1);
 });
 
+test('the Retry button belongs to a failed send only', async ({ page }) => {
+  // No fake answer: the test backend has no Gemini key, so the send fails.
+  await sendQuestion(page, 'This one fails');
+  await expect(page.locator('.error-banner')).toContainText('GEMINI_API_KEY');
+  await expect(page.getByRole('button', { name: 'Retry question' })).toBeVisible();
+  // Another kind of error takes its place, without a Retry button for the old send.
+  await page
+    .getByLabel('Images to add')
+    .setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hi') });
+  await expect(page.locator('.error-banner')).toContainText('Only images can be added');
+  await expect(page.getByRole('button', { name: 'Retry question' })).toHaveCount(0);
+});
+
 test("an answer's opening sentence stands out", async ({ page }) => {
   const paragraphs = page.locator('.message.assistant').first().locator('.message-text p');
   const weight = (n: number) => paragraphs.nth(n).evaluate(p => getComputedStyle(p).fontWeight);

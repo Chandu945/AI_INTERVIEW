@@ -62,17 +62,19 @@ def client(tmp_path, monkeypatch):
 
 
 class FakeGemini:
-    """Streams the given (text, finish_reason) chunks for answers, returns `transcript` for
+    """Streams the given (text, finish_reason) chunks for answers (`answers`, if set, gives the
+    chunks of the next answers, request by request, first), returns `transcript` for
     transcriptions (or raises it, if it's an exception), and keeps what it was sent. To act slow
     or broken, `delays` and `errors` give, call by call, how many seconds to wait before replying
     and an exception to raise instead, and `breaks` an exception to raise after an answer's first
-    chunk. `calls` and `cancelled` count the requests, and `models` and `configs` record what each
-    was sent with."""
+    chunk. `calls` and `cancelled` count the requests, and `models`, `configs` and `requests` (each
+    with its kind: an "answer", streamed, or a "transcription") record what each was sent with."""
 
     def __init__(self, chunks):
         self.config = None
         self.contents = None
         self.transcript = ""
+        self.answers: list[tuple] = []
         self.delays: list[float] = []
         self.errors: list[Exception | None] = []
         self.breaks: list[Exception | None] = []
@@ -80,6 +82,7 @@ class FakeGemini:
         self.cancelled = 0
         self.models: list[str] = []
         self.configs: list = []
+        self.requests: list[SimpleNamespace] = []
 
         async def wait_and_check():
             call = self.calls
@@ -96,11 +99,13 @@ class FakeGemini:
             self.config, self.contents = config, contents
             self.models.append(model)
             self.configs.append(config)
+            self.requests.append(SimpleNamespace(kind="answer", model=model, contents=contents, config=config))
+            reply = self.answers.pop(0) if self.answers else chunks
 
             async def stream():
                 call = self.calls
                 await wait_and_check()
-                for i, (text, finish) in enumerate(chunks):
+                for i, (text, finish) in enumerate(reply):
                     if i == 1 and call < len(self.breaks) and self.breaks[call]:
                         raise self.breaks[call]
                     yield SimpleNamespace(text=text, candidates=[SimpleNamespace(finish_reason=finish)])
@@ -111,6 +116,7 @@ class FakeGemini:
             self.config, self.contents = config, contents
             self.models.append(model)
             self.configs.append(config)
+            self.requests.append(SimpleNamespace(kind="transcription", model=model, contents=contents, config=config))
             await wait_and_check()
             if isinstance(self.transcript, Exception):
                 raise self.transcript

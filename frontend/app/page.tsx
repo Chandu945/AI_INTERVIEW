@@ -12,7 +12,7 @@ import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useQuestionPages } from '../hooks/useQuestionPages';
 import { useTabAudio } from '../hooks/useTabAudio';
 import { useTranscriptImprover, type HandOff } from '../hooks/useTranscriptImprover';
-import { api, errorMessage, MAX_QUESTION_CHARS, readEvents } from '../lib/api';
+import { api, MAX_QUESTION_CHARS, readEvents, responseError } from '../lib/api';
 import type {
   AnswerMode,
   AnswerStyle,
@@ -62,6 +62,14 @@ export default function Home() {
   const chatRequestRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // A recorded question that couldn't be answered, so that Retry can send its recording again.
+  const failedRecordingRef = useRef<HandOff | null>(null);
+
+  // Shows an error that isn't a failed send: the Retry button goes with a failed send's error only.
+  const showError = useCallback((message: string) => {
+    setError(message);
+    setFailedDraft(null);
+  }, []);
 
   const { draft, draftRef, updateDraft, appendWords } = useDraft();
   const improver = useTranscriptImprover({ draftRef, updateDraft, conversationId });
@@ -78,7 +86,7 @@ export default function Home() {
     waitingWords,
   } = improver;
   // Images to ask the question with, uploaded as they are attached.
-  const images = useImageAttachments(conversationId, setError);
+  const images = useImageAttachments(conversationId, showError);
   const {
     add: addImages,
     remove: removeImage,
@@ -99,6 +107,7 @@ export default function Home() {
     (value: string) => {
       updateDraft(value);
       noteTyped();
+      failedRecordingRef.current = null; // edited, it goes as its text
     },
     [noteTyped, updateDraft],
   );
@@ -106,7 +115,7 @@ export default function Home() {
     language,
     appendWords: appendDictated,
     busyRef,
-    setError,
+    setError: showError,
     record: improver.enabled,
     onPiece: addPiece,
     onRecordingEnd: prepare,
@@ -116,8 +125,16 @@ export default function Home() {
       if (autoSend) void sendMessage(); // it waits for the last words itself
     },
   });
-  const { haltRecognition, startListening, stopListening, updateInterim, isListening, pendingWords, stopForSending } =
-    speech;
+  const {
+    haltRecognition,
+    startListening,
+    stopListening,
+    updateInterim,
+    isListening,
+    pendingWords,
+    tailHasSpeech,
+    stopForSending,
+  } = speech;
   const { bodyRef, showNewest } = useQuestionPages(messages);
   // Stop sharing, pressed in Chrome's sharing bar, stops listening as if Stop was pressed.
   const tabAudio = useTabAudio(() => {
@@ -137,12 +154,12 @@ export default function Home() {
       try {
         track = await connectTab(); // the first time, Chrome asks which tab to share
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Couldn't share the tab.");
+        showError(e instanceof Error ? e.message : "Couldn't share the tab.");
         return;
       }
     }
     if (startListening(track)) beginDictation();
-  }, [beginDictation, connectTab, fromTab, startListening]);
+  }, [beginDictation, connectTab, fromTab, showError, startListening]);
 
   const changeSource = useCallback(
     (next: VoiceSource) => {
@@ -184,10 +201,11 @@ export default function Home() {
 
   const clearDraft = useCallback(() => {
     discard(); // words still being written down must not come back
+    failedRecordingRef.current = null;
     clearImages();
     updateDraft('');
     updateInterim('');
-    setError('');
+    showError('');
     if (isListening()) {
       // Invalidate old callbacks so previous words cannot reappear after Clear.
       haltRecognition(false);
@@ -197,17 +215,20 @@ export default function Home() {
       }, 80);
     }
     textareaRef.current?.focus();
-  }, [clearImages, discard, haltRecognition, isListening, startDictation, updateDraft, updateInterim]);
+  }, [clearImages, discard, haltRecognition, isListening, showError, startDictation, updateDraft, updateInterim]);
 
   const refreshSessions = useCallback(async () => {
     try {
-      const r = await api.listInterviews();
-      if (!r.ok) throw new Error(`status ${r.status}`);
+      // No response at all: the backend isn't running, or can't be reached.
+      const r = await api.listInterviews().catch(() => null);
+      if (!r) throw new Error("Couldn't load your interviews. Is the backend running?");
+      // An error response: in the backend's own words (say, that the database is out of reach).
+      if (!r.ok) throw await responseError(r, `Couldn't load your interviews (${r.status}).`);
       setSessions((await r.json()).sessions);
       setSessionsLoaded(true);
       setSessionsError('');
-    } catch {
-      setSessionsError("Couldn't load your interviews. Is the backend running?");
+    } catch (e) {
+      setSessionsError(e instanceof Error ? e.message : "Couldn't load your interviews.");
     }
   }, []);
 
@@ -219,7 +240,7 @@ export default function Home() {
       clearImages(); // ones not sent belong to the interview being left
       try {
         const r = await api.getInterview(id);
-        if (!r.ok) throw new Error('Could not open interview');
+        if (!r.ok) throw await responseError(r, 'Could not open the interview');
         const data = await r.json();
         showNewest();
         setCurrentSession(data.session);
@@ -229,32 +250,35 @@ export default function Home() {
         setAnswerStyle(data.session.style || 'simple');
         setView('interview');
         updateDraft('');
-        setError('');
+        showError('');
         setStreamMetrics(null);
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not open the interview');
+        showError(e instanceof Error ? e.message : 'Could not open the interview');
       }
     },
-    [clearImages, discard, haltRecognition, showNewest, updateDraft],
+    [clearImages, discard, haltRecognition, showError, showNewest, updateDraft],
   );
 
-  const renameSession = useCallback(async (id: string, title: string) => {
-    try {
-      const r = await api.updateInterview(id, { title });
-      if (!r.ok) throw new Error('Could not rename the interview');
-      setSessions(list => list.map(session => (session.id === id ? { ...session, title } : session)));
-      setCurrentSession(current => (current?.id === id ? { ...current, title } : current));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not rename the interview');
-    }
-  }, []);
+  const renameSession = useCallback(
+    async (id: string, title: string) => {
+      try {
+        const r = await api.updateInterview(id, { title });
+        if (!r.ok) throw await responseError(r, 'Could not rename the interview');
+        setSessions(list => list.map(session => (session.id === id ? { ...session, title } : session)));
+        setCurrentSession(current => (current?.id === id ? { ...current, title } : current));
+      } catch (e) {
+        showError(e instanceof Error ? e.message : 'Could not rename the interview');
+      }
+    },
+    [showError],
+  );
 
   const deleteSession = useCallback(
     async (id: string) => {
       if (busyRef.current) return;
       try {
         const r = await api.deleteInterview(id);
-        if (!r.ok) throw new Error('Could not delete the interview');
+        if (!r.ok) throw await responseError(r, 'Could not delete the interview');
         setSessions(list => list.filter(session => session.id !== id));
         if (conversationId === id) {
           setConversationId(null);
@@ -263,10 +287,10 @@ export default function Home() {
         }
         void refreshSessions();
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not delete the interview');
+        showError(e instanceof Error ? e.message : 'Could not delete the interview');
       }
     },
-    [conversationId, refreshSessions],
+    [conversationId, refreshSessions, showError],
   );
 
   // A new interview with the same setup as another, opened straight away.
@@ -275,51 +299,59 @@ export default function Home() {
       if (busyRef.current) return;
       try {
         const r = await api.copyInterview(id);
-        if (!r.ok) throw new Error('Could not start a new interview');
+        if (!r.ok) throw await responseError(r, 'Could not start a new interview');
         await openSession((await r.json()).conversation_id);
         void refreshSessions();
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not start a new interview');
+        showError(e instanceof Error ? e.message : 'Could not start a new interview');
       }
     },
-    [openSession, refreshSessions],
+    [openSession, refreshSessions, showError],
   );
 
   const sendMessage = useCallback(async () => {
-    if (busyRef.current) return;
-    // Wait for dictation's last words. Then, if its transcript isn't final yet, send the question
-    // with its recording: one Gemini request writes it down and answers it, which is quicker than
-    // waiting for the transcript first. Otherwise wait for the transcript, if any, and send the
-    // text. Other sends (a second click, ⌘+Enter) are ignored meanwhile.
+    if (busyRef.current || !conversationId) return;
+    // A dictated question goes as its text once Gemini has written all of it down. Sent sooner, it
+    // goes with its recording: Gemini writes the whole question down while it answers, and the
+    // box's text is only a preview. A question typed in or edited, or one the box held more than,
+    // goes as its text once dictation's last words are in. Other sends (a second click, Enter)
+    // are ignored meanwhile.
     busyRef.current = true;
     let recording: HandOff | null = null;
-    let spoken: string | null = null; // the live words, when the question goes straight from listening
+    let spoken: string | null = null; // the words so far, when the question goes straight from listening
     try {
-      const pending = pendingWords();
       // The words so far: those in the box, then those shown in gray.
-      const words = [draftRef.current.trim(), waitingWords(), pending].filter(Boolean).join(' ');
-      if (isListening() && handOverNow(Boolean(pending))) {
-        // At once, with no waiting for the words not in the box yet: the recording has them.
+      const words = [draftRef.current.trim(), waitingWords(), pendingWords()].filter(Boolean).join(' ');
+      // Words said that aren't in the box yet: shown in gray, or not even heard by Chrome yet.
+      const unwritten = Boolean(waitingWords() || pendingWords()) || tailHasSpeech();
+      const now = isListening() ? handOverNow(unwritten) : null;
+      if (now) {
+        // At once, with no waiting for words not in the box yet: the recording has them, or there
+        // are none and the text is the whole question as Gemini wrote it.
         spoken = words;
         const audio = await stopForSending();
-        if (audio) recording = { audio, heard: spoken };
+        if (now === 'recording' && audio) recording = { audio, heard: spoken };
       } else {
         const finishing = finishDictation();
         await stoppedRef.current;
-        recording = conversationId ? await handOver() : null;
+        recording = await handOver();
         if (!recording) await finishing;
       }
     } finally {
       busyRef.current = false;
     }
     const text = recording ? recording.heard : (spoken ?? draftRef.current.trim());
-    if ((!text && !recording && !hasImages()) || busyRef.current) {
-      if (!text && !recording && !hasImages()) setError('Type or speak a question, or add an image.');
+    // Retry, for a recorded question that couldn't be answered: its recording goes again, so that
+    // Gemini still writes the question down, as long as the box holds its words as they were (and
+    // no new dictation was just handed over, which would be the question instead).
+    const failed = failedRecordingRef.current;
+    if (!recording && spoken === null && failed && text === failed.heard) recording = failed;
+    if (!text && !recording && !hasImages()) {
+      showError('Type or speak a question, or add an image.');
       return;
     }
     if (text.length > MAX_QUESTION_CHARS) {
-      setFailedDraft(null);
-      setError(
+      showError(
         `Your question is ${text.length.toLocaleString()} characters. The limit is ${MAX_QUESTION_CHARS.toLocaleString()}.`,
       );
       return;
@@ -329,12 +361,17 @@ export default function Home() {
     // The question's images, once uploaded (usually they are by now).
     const imageIds = await takeImages();
     if (!imageIds) {
+      // An image couldn't be uploaded (takeImages said so). Dictation has stopped by now, so its
+      // words go back in the box, and its recording waits for Retry, as after a failed send.
+      updateDraft(text);
+      updateInterim('');
+      setFailedDraft(text);
+      failedRecordingRef.current = recording;
       busyRef.current = false;
       setBusy(false);
       return;
     }
-    setError('');
-    setFailedDraft(null);
+    showError('');
     updateDraft('');
     updateInterim('');
     showNewest(); // the new question at the top of the panel, its answer under it
@@ -352,33 +389,29 @@ export default function Home() {
     // The question as shown: for a recording, its live words until Gemini has written it down.
     let question = text;
     try {
-      const response =
-        recording && conversationId
-          ? await api.askRecordedQuestion(
-              {
-                audio: recording.audio,
-                heard: text,
-                conversation_id: conversationId,
-                mode: answerMode,
-                style: answerStyle,
-                image_ids: imageIds,
-              },
-              controller.signal,
-            )
-          : await api.askQuestion(
-              {
-                message: text,
-                conversation_id: conversationId,
-                mode: answerMode,
-                style: answerStyle,
-                image_ids: imageIds,
-              },
-              controller.signal,
-            );
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(errorMessage(data, `Chat request failed (${response.status})`));
-      }
+      const response = recording
+        ? await api.askRecordedQuestion(
+            {
+              audio: recording.audio,
+              heard: text,
+              conversation_id: conversationId,
+              mode: answerMode,
+              style: answerStyle,
+              image_ids: imageIds,
+            },
+            controller.signal,
+          )
+        : await api.askQuestion(
+            {
+              message: text,
+              conversation_id: conversationId,
+              mode: answerMode,
+              style: answerStyle,
+              image_ids: imageIds,
+            },
+            controller.signal,
+          );
+      if (!response.ok) throw await responseError(response, `Chat request failed (${response.status})`);
       if (!response.body) throw new Error('Streaming is not supported by this connection.');
       let received = '';
       await readEvents(response.body, event => {
@@ -406,11 +439,13 @@ export default function Home() {
         if (event.type === 'error') throw new Error(event.message || 'Gemini streaming failed');
       });
       if (!completed) throw new Error('The response ended before Gemini finished. Please retry.');
+      failedRecordingRef.current = null;
     } catch (e) {
       if (!controller.signal.aborted && mountedRef.current) {
         setError(e instanceof Error ? e.message : 'Could not send message');
         updateDraft(question);
         setFailedDraft(question);
+        failedRecordingRef.current = recording;
         restoreImages(imageIds);
         // Drop the uncompleted answer and unsaved question, and show the question before.
         setMessages(prev => prev.slice(0, -2));
@@ -435,9 +470,11 @@ export default function Home() {
     isListening,
     pendingWords,
     stopForSending,
+    tailHasSpeech,
     waitingWords,
     showNewest,
     refreshSessions,
+    showError,
     updateDraft,
     updateInterim,
   ]);
@@ -451,8 +488,7 @@ export default function Home() {
       if (busyRef.current || !conversationId || old?.role !== 'assistant') return;
       busyRef.current = true;
       setBusy(true);
-      setError('');
-      setFailedDraft(null);
+      showError('');
       setStreamMetrics(null);
       const showAnswer = (content: string) =>
         setMessages(prev => prev.map((m, i) => (i === prev.length - 1 ? { ...m, content } : m)));
@@ -465,10 +501,7 @@ export default function Home() {
           { conversation_id: conversationId, how, style: answerStyle },
           controller.signal,
         );
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(errorMessage(data, `Request failed (${response.status})`));
-        }
+        if (!response.ok) throw await responseError(response, `Request failed (${response.status})`);
         if (!response.body) throw new Error('Streaming is not supported by this connection.');
         let received = '';
         await readEvents(response.body, event => {
@@ -485,7 +518,7 @@ export default function Home() {
         if (!completed) throw new Error('The response ended before Gemini finished. Please retry.');
       } catch (e) {
         if (!controller.signal.aborted && mountedRef.current) {
-          setError(e instanceof Error ? e.message : 'Could not say the answer again');
+          showError(e instanceof Error ? e.message : 'Could not say the answer again');
           showAnswer(old.content);
         }
       } finally {
@@ -494,20 +527,23 @@ export default function Home() {
         if (chatRequestRef.current === controller) chatRequestRef.current = null;
       }
     },
-    [answerStyle, conversationId, messages, refreshSessions],
+    [answerStyle, conversationId, messages, refreshSessions, showError],
   );
 
-  const copyMessage = useCallback(async (content: string, key: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
-      if (!mountedRef.current) return;
-      setCopiedKey(key);
-      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
-      copiedTimerRef.current = setTimeout(() => setCopiedKey(null), 1800);
-    } catch {
-      setError('Unable to copy. Check browser clipboard permissions.');
-    }
-  }, []);
+  const copyMessage = useCallback(
+    async (content: string, key: string) => {
+      try {
+        await navigator.clipboard.writeText(content);
+        if (!mountedRef.current) return;
+        setCopiedKey(key);
+        if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = setTimeout(() => setCopiedKey(null), 1800);
+      } catch {
+        showError('Unable to copy. Check browser clipboard permissions.');
+      }
+    },
+    [showError],
+  );
 
   // Saves the answer length on the interview, so reopening it keeps the choice.
   const changeAnswerMode = useCallback(
@@ -544,10 +580,10 @@ export default function Home() {
     setConversationId(null);
     setCurrentSession(null);
     setSetupKey(key => key + 1);
-    setError('');
+    showError('');
     setStreamMetrics(null);
     setView('setup');
-  }, [clearImages, discard, haltRecognition, updateDraft, updateInterim]);
+  }, [clearImages, discard, haltRecognition, showError, updateDraft, updateInterim]);
 
   // Back to the Interviews page, from an interview or the New interview form.
   const goHome = useCallback(() => {
@@ -555,16 +591,16 @@ export default function Home() {
     haltRecognition(false);
     discard();
     clearImages();
-    setError('');
+    showError('');
     setView('home');
     void refreshSessions();
-  }, [clearImages, discard, haltRecognition, refreshSessions]);
+  }, [clearImages, discard, haltRecognition, refreshSessions, showError]);
 
   const startInterview = useCallback(
     async (form: NewInterview) => {
       if (starting || !form.targetRole.trim()) return;
       setStarting(true);
-      setError('');
+      showError('');
       // Holds the new interview's id until setup finishes, so a failed resume upload can remove it.
       let unfinishedId: string | null = null;
       try {
@@ -576,15 +612,12 @@ export default function Home() {
           instructions: form.instructions,
           job_description: form.jobDescription,
         });
-        if (!r.ok) throw new Error('Could not create interview');
+        if (!r.ok) throw await responseError(r, 'Could not create the interview');
         const id = (await r.json()).conversation_id as string;
         unfinishedId = id;
         if (form.resume) {
           const uploaded = await api.uploadResume(id, form.resume);
-          if (!uploaded.ok) {
-            const data = await uploaded.json().catch(() => ({}));
-            throw new Error(errorMessage(data, 'Resume upload failed'));
-          }
+          if (!uploaded.ok) throw await responseError(uploaded, 'Resume upload failed');
         }
         unfinishedId = null;
         setCurrentSession({
@@ -609,12 +642,12 @@ export default function Home() {
       } catch (e) {
         // Remove the half-made interview so retrying doesn't leave empty ones on the Interviews page.
         if (unfinishedId) await api.deleteInterview(unfinishedId).catch(() => {});
-        setError(e instanceof Error ? e.message : 'Could not start interview');
+        showError(e instanceof Error ? e.message : 'Could not start interview');
       } finally {
         setStarting(false);
       }
     },
-    [refreshSessions, starting],
+    [refreshSessions, showError, starting],
   );
 
   useEffect(() => {
@@ -626,6 +659,11 @@ export default function Home() {
       chatRequestRef.current?.abort();
     };
   }, [refreshSessions]);
+
+  // A failed question's recording belongs to the interview it was asked in.
+  useEffect(() => {
+    failedRecordingRef.current = null;
+  }, [conversationId]);
 
   useEffect(() => {
     try {

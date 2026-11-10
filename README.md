@@ -19,9 +19,10 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   the answer length.
 - **Answer length:** Short (two to four sentences, about 20 seconds to say), Medium (about 30 to
   60 seconds) or Detailed (with an example and trade-offs). Each answer opens with its main idea
-  in a sentence of its own, shown in bold, then short paragraphs of two or three sentences, so
-  it's easy to keep your place while saying it. Answers say what you would do ("I'd start
-  by...") rather than claim experience or habits your resume doesn't show.
+  in a sentence of its own, shown in bold, then short paragraphs, so it's easy to keep your place
+  while saying it. Answers are written as speech, with contractions and sentences that follow on
+  from each other, and say what you would do ("I'd start by...") rather than claim experience
+  or habits your resume doesn't show.
 - **Say it again:** under the latest answer, **Shorter** (about half the words), **Simpler**
   (everyday words) and **More detail** (the reasoning, an example and a trade-off) rewrite it,
   keeping its points. The new version takes the old one's place, on screen and in the saved
@@ -45,17 +46,25 @@ give out loud. Next.js frontend, FastAPI backend, Google Gemini.
   behind and drops words. The recording is cut into pieces at short pauses, every 3 to 8 seconds
   (in nonstop speech, at its quietest moment), and each piece goes to Gemini with the end of the
   text so far, so that it carries on from it. Its text joins the box about 1 to 2 seconds later,
-  while you keep speaking, and when you stop, only the last piece is left to write down. If you
-  press Send while some of the text is still on its way, the question goes with its recording
-  instead: one Gemini request writes it down and answers it, so the answer starts about 2 to 3
-  seconds after Send. (To check the text before sending, press Stop and wait for the gray words
-  to turn black.) Anything you type meanwhile is kept, and a question you typed in is sent as its
-  text. If Gemini can't write a piece down (it's unavailable, or it returns more words than anyone
-  could say in that time), the piece is tried again with the next one, and then Chrome's words
-  for it are used. Given a piece with no one speaking in it (a pause with a fan, typing or music
-  in it), Gemini makes up a likely question, so such pieces aren't sent: only those Chrome heard
-  words in, or whose sound rises and falls as speech does, and Gemini is asked first whether
-  anyone speaks. Turn it off with "Improve the transcript with Gemini as it listens" to use
+  while you keep speaking, and when you stop, only the last piece is left to write down. Once all
+  of that text is in, Send sends it as it stands. Press Send sooner, while words are still gray or
+  not even heard yet, and the question goes with its recording instead: Gemini writes the whole
+  question down in one go (leaving out fillers and false starts) while it answers, so the answer
+  starts about 1 to 2 seconds after Send and the question shows its text as soon as it's in. If
+  Gemini can't make the question out from the recording but has written it down, it answers the
+  question as written down rather than giving up on it. If no one can be heard in the recording
+  (you spoke before the microphone had opened, say), the live words are sent as the question
+  instead, and with none of those the app says nothing was heard, rather than answering a question
+  Gemini made up to fit your resume. After you stop, the microphone stays open for a minute
+  without recording (Chrome shows the tab as using it, and the status says so), so the next
+  question starts the moment you press the button and no first words are lost. Anything you type
+  meanwhile is kept, and a question you typed in or edited is sent as its text, as is a dictation
+  of over 2 minutes, once its text is in. If Gemini can't write a piece down (it's unavailable, or it returns more words
+  than anyone could say in that time), the piece is tried again with the next one, and then
+  Chrome's words for it are used. Given a piece with no one speaking in it (a pause with a fan,
+  typing or music in it), Gemini makes up a likely question, so such pieces aren't sent: only those
+  Chrome heard words in, or whose sound rises and falls as speech does, and Gemini is asked first
+  whether anyone speaks. Turn it off with "Improve the transcript with Gemini as it listens" to use
   Chrome's words alone.
 - **Listen to a browser tab:** instead of the microphone, the app can listen to another Chrome
   tab, such as a YouTube video or a Google Meet call. Set "Listen to" to "A browser tab", press
@@ -208,7 +217,8 @@ not. Do not put secrets in `NEXT_PUBLIC_` environment variables.
 Live dictation needs the browser's SpeechRecognition (Chrome), so availability varies by
 browser. With transcript improvement on, everything you dictate is recorded and sent to Gemini
 (Chrome's live recognition also sends audio to Google): one request per piece, every 3 to 8
-seconds while you speak, and slow requests are sent twice. These count toward your API key's
+seconds while you speak, two at Send (one writes the question down, one answers it), and slow
+requests are sent twice. These count toward your API key's
 rate limits and bill. Model names in `.env.example` may need updating to models available to
 your API key.
 

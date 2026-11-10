@@ -26,6 +26,9 @@ declare global {
     __pieceTimings: { min: number; max: number; quiet: number; silence: number };
     __cutPiece?: () => boolean;
     __tabPauses: boolean;
+    __micOpens: number;
+    __micTracks: MediaStreamTrack[];
+    __micHoldMs?: number;
   }
 }
 
@@ -51,6 +54,16 @@ function pageFakes() {
   // fake recognition alone (the fake mic beeps on and on).
   window.__pieceTimings = { min: 1e9, max: 1e9, quiet: 1e9, silence: 0 };
   window.__transcriptDelays = [];
+  // How often the mic was opened, and its tracks: it's kept open for a while after listening stops.
+  window.__micOpens = 0;
+  window.__micTracks = [];
+  const realGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  navigator.mediaDevices.getUserMedia = async constraints => {
+    window.__micOpens += 1;
+    const stream = await realGetUserMedia(constraints);
+    window.__micTracks.push(...stream.getAudioTracks());
+    return stream;
+  };
   const realFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const url = String(input);

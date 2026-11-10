@@ -103,7 +103,14 @@ export function useSpeechRecognition({
   useEffect(() => {
     optionsRef.current = { record, onPiece, onRecordingEnd, onSilenceStop };
   });
-  const { start: startRecording, stop: stopRecording, cancel: cancelRecording, isQuiet } = useAudioRecorder();
+  const {
+    start: startRecording,
+    stop: stopRecording,
+    cancel: cancelRecording,
+    isQuiet,
+    tailHasSpeech,
+    held: micHeld,
+  } = useAudioRecorder();
 
   const updateInterim = useCallback((value: string) => {
     interimRef.current = value;
@@ -198,6 +205,9 @@ export function useSpeechRecognition({
       // Once a shared tab stops being shared, its track ends; the page then stops listening.
       const tabGone = () => track?.readyState === 'ended';
       const listeningText = track ? 'Listening to the tab' : 'Listening live';
+      // When Gemini writes the text, it's listening once the recording has started (opening the
+      // mic takes a moment): until then the status doesn't say so, as words said now aren't recorded.
+      let recorderOpen = !recordingRef.current;
       recognitionFinalRef.current = '';
       updateInterim('');
       setElapsed(0);
@@ -281,7 +291,7 @@ export function useSpeechRecognition({
         try {
           if (track) rec.start(track);
           else rec.start();
-          setStatus(listeningText);
+          if (recorderOpen) setStatus(listeningText);
         } catch {
           setError(
             track
@@ -308,8 +318,11 @@ export function useSpeechRecognition({
       };
       if (recordingRef.current)
         void startRecording(track, handOn).then(started => {
+          if (sessionRef.current !== token) return;
           // Without a recording, Gemini has nothing to write from: Chrome's words are the text after all.
-          if (!started && sessionRef.current === token) recordingRef.current = false;
+          if (!started) recordingRef.current = false;
+          recorderOpen = true;
+          if (shouldListenRef.current && !stoppingRef.current) setStatus(listeningText);
         });
       openRecognition();
       return true;
@@ -383,7 +396,10 @@ export function useSpeechRecognition({
   );
 
   const isListening = useCallback(() => shouldListenRef.current, []);
-  /** The words shown but not yet in the text: still being recognized, or waiting for Gemini. */
+  /**
+   * The words shown but not yet in the text: still being recognized, or waiting for Gemini. Words
+   * said since the last piece was cut may not show yet, either: tailHasSpeech() says if any were.
+   */
   const pendingWords = useCallback(() => interimRef.current.trim(), []);
 
   /**
@@ -405,7 +421,9 @@ export function useSpeechRecognition({
   return {
     listening,
     supported,
-    status,
+    // While the mic is kept open after listening (so the next dictation starts at once), the
+    // status says so, as Chrome shows the tab as using it.
+    status: status === 'Microphone off' && micHeld ? 'Microphone open, not recording' : status,
     elapsed,
     interim,
     autoPause,
@@ -416,6 +434,7 @@ export function useSpeechRecognition({
     updateInterim,
     isListening,
     pendingWords,
+    tailHasSpeech,
     stopForSending,
   };
 }
